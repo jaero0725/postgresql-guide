@@ -11,11 +11,17 @@
 
 ```
 postgresql-guide/
-├── chapters/        ← 개념 학습 (1~14장)
-├── examples/        ← 실무 도메인 예제 (E-commerce, SaaS, 시계열 등)
-├── troubleshooting/ ← 실수 케이스 스터디 (13개 케이스)
-└── cheatsheets/     ← 빠른 참조 (psql, EXPLAIN, 인덱스, 설정 등)
+├── chapters/        ← 개념 학습 (1~14장)         → 목차: chapters/README.md
+├── examples/        ← 실무 도메인 예제 (5개)     → 목차: examples/README.md
+├── troubleshooting/ ← 장애 케이스 스터디 (13개)  → 목차: troubleshooting/README.md
+└── cheatsheets/     ← 빠른 참조 (9개)            → 목차: cheatsheets/README.md
 ```
+
+> 각 폴더의 `README.md`는 그 영역의 목차·학습 경로·상황별 선택 가이드를 담고 있다.
+> - [chapters/](chapters/README.md) — 14장 목차 + 초/중/고급 학습 경로
+> - [examples/](examples/README.md) — 5개 도메인 + 도메인 선택 플로우
+> - [troubleshooting/](troubleshooting/README.md) — 증상으로 빠르게 찾기
+> - [cheatsheets/](cheatsheets/README.md) — 상황별 치트시트 선택 + 자주 쓰는 쿼리 Top 5
 
 ### 전체 지식 지도
 

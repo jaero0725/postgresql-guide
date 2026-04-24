@@ -50,11 +50,13 @@ flowchart LR
         E4[JSONB 문서]
         E5[PostGIS 지리]
     end
-    subgraph TS[troubleshooting 장애]
-        TA[A. Autovacuum/Bloat]
-        TB[B. 쿼리]
-        TC[C. Lock]
-        TD[D. 운영]
+    subgraph TS[troubleshooting 27 cases]
+        TA[A. Autovacuum·Bloat·Wraparound 6]
+        TB[B. 쿼리 7]
+        TC[C. Lock 5]
+        TD[D. 운영 5]
+        TE[E. 보안/권한 2]
+        TF[F. 업그레이드/클라우드 2]
     end
     subgraph CS[cheatsheets 빠른 참조]
         CS1[psql]
@@ -204,40 +206,66 @@ cheatsheets/pg_stat_queries.md         (진단 쿼리 모음)
 
 ---
 
-## 🔥 troubleshooting — 케이스 스터디
+## 🔥 troubleshooting — 케이스 스터디 (27개 · 6 카테고리)
 
-### A. Autovacuum / Bloat
+> 증상 → 원인 → 진단 → 해결 → 예방 5단계. 전체 목차·증상 인덱스는 [troubleshooting/README.md](troubleshooting/README.md) 참고.
+
+### A. Autovacuum / Bloat / Wraparound (6건)
 
 | 케이스 | 핵심 증상 |
 |--------|---------|
 | [A1. Bloat 누적](troubleshooting/A1_bloat_accumulation.md) | 테이블 용량 급증, SELECT 느려짐 |
 | [A2. XID Wraparound 경고](troubleshooting/A2_xid_wraparound.md) | `database is not accepting commands` 직전 경고 |
 | [A3. 긴 트랜잭션이 VACUUM을 막는다](troubleshooting/A3_long_tx_blocks_vacuum.md) | Dead Tuple 계속 증가 |
+| [A4. Multixact Wraparound](troubleshooting/A4_multixact_wraparound.md) | `multixact members limit exceeded`, FK row-lock 워크로드 |
+| [A5. 인덱스 단독 Bloat](troubleshooting/A5_index_bloat.md) | 테이블은 멀쩡한데 인덱스만 비대, `REINDEX CONCURRENTLY` |
+| [A6. Temp File 디스크 풀](troubleshooting/A6_temp_file_disk_full.md) | `base/pgsql_tmp/` 급증, work_mem 초과 |
 
-### B. 쿼리 실수
+### B. 쿼리 (7건)
 
 | 케이스 | 핵심 증상 |
 |--------|---------|
 | [B1. 인덱스 누락](troubleshooting/B1_missing_index.md) | 갑자기 Seq Scan 폭주 |
-| [B2. 인덱스가 있어도 Seq Scan](troubleshooting/B2_seq_scan_with_index.md) | 통계 오차, 함수 래핑 |
+| [B2. 인덱스가 있어도 Seq Scan](troubleshooting/B2_seq_scan_with_index.md) | 통계 오차, 함수 래핑, 타입 불일치 |
 | [B3. 잘못된 조인 순서](troubleshooting/B3_bad_join_order.md) | 중간 결과 폭발 |
 | [B4. N+1 쿼리](troubleshooting/B4_n_plus_one.md) | ORM 기본값 주의 |
+| [B5. 플랜 회귀](troubleshooting/B5_plan_regression.md) | 코드 변경 없이 갑자기 느려짐 |
+| [B6. work_mem 부족 / 디스크 정렬](troubleshooting/B6_work_mem_disk_sort.md) | external merge sort, Hash batch 분할 |
+| [B7. Prepared Statement 함정](troubleshooting/B7_prepared_statement_trap.md) | 앱에서만 특정 값이 느림, pgBouncer 함정 |
 
-### C. Lock
+### C. Lock (5건)
 
 | 케이스 | 핵심 증상 |
 |--------|---------|
 | [C1. 데드락](troubleshooting/C1_deadlock.md) | `deadlock detected` |
 | [C2. idle in transaction](troubleshooting/C2_idle_in_transaction.md) | VACUUM·DDL 블록 |
 | [C3. DDL이 쿼리를 막는다](troubleshooting/C3_ddl_blocking.md) | AccessExclusiveLock |
+| [C4. FK 숨은 Share Lock](troubleshooting/C4_fk_share_lock.md) | 자식 INSERT/UPDATE가 부모 행을 잠금 |
+| [C5. Advisory Lock 누수](troubleshooting/C5_advisory_lock_leak.md) | 세션 Lock이 종료 후에도 남음 |
 
-### D. 운영 장애
+### D. 운영 장애 (5건)
 
 | 케이스 | 핵심 증상 |
 |--------|---------|
 | [D1. Connection 고갈](troubleshooting/D1_connection_exhaustion.md) | `too many connections`, pgBouncer |
 | [D2. Replication Lag](troubleshooting/D2_replication_lag.md) | 스탠바이 지연 누적 |
 | [D3. WAL로 인한 디스크 풀](troubleshooting/D3_wal_disk_full.md) | pg_wal 급증, 슬롯 미회수 |
+| [D4. Recovery Conflict](troubleshooting/D4_recovery_conflict.md) | Standby 쿼리 `canceling statement due to conflict` |
+| [D5. Logical Replication 장애](troubleshooting/D5_logical_replication_issues.md) | apply lag, UNIQUE 충돌, DDL drift |
+
+### E. 보안 / 권한 (2건)
+
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [E1. 권한 오류 (GRANT/Default Privileges)](troubleshooting/E1_permission_errors.md) | 새 테이블마다 권한 누락, v15+ `public` 스키마 |
+| [E2. RLS 정책 함정](troubleshooting/E2_rls_policy_trap.md) | 소유자 우회, pgBouncer `SET` 상속, `pg_dump` 누락 |
+
+### F. 업그레이드 / 클라우드 (2건)
+
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [F1. pg_upgrade 실패 시나리오](troubleshooting/F1_pg_upgrade_failures.md) | `--check` 누락, extension 라이브러리, ANALYZE 회귀 |
+| [F2. 관리형 PG 제약](troubleshooting/F2_managed_pg_limitations.md) | SUPERUSER 부재, 파일시스템 차단, extension 허용 목록 |
 
 ---
 

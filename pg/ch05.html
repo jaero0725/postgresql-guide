@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5장. 인덱스 완전 정복 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch05">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>5장. 인덱스 완전 정복</h1>
+<p class="lead">PostgreSQL엔 인덱스가 6종류나 있습니다. B-tree가 왜 기본이고, 언제 GIN·BRIN을 꺼내야 하며, 인덱스가 공짜가 아닌 이유까지 — 선택의 기준을 세웁니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Storage</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 인덱스가 heap 접근을 우회하는 원리 ② B-tree의 탐색 경로와 INCLUDE·opclass·복합 인덱스 ③ Seq Scan vs Index Scan vs Bitmap Scan의 선택 기준 ④ GIN·GiST·BRIN 등 특수 인덱스와 유지 비용(Bloat·Write Amplification)</p>
+  </div>
+</div>
+
+<h2 id="s1">5.1 인덱스는 "찾아가는 지도"다</h2>
+
+<p>PostgreSQL의 테이블(heap)은 <strong>정렬되지 않은 튜플 무더기</strong>입니다(4장). 조건에 맞는 행을 찾으려면 원칙적으로 모든 페이지를 읽어야 하죠(Seq Scan). 인덱스는 <strong>키 → TID(<code>(블록, 오프셋)</code>)</strong> 매핑을 정렬·구조화해 유지함으로써, heap의 필요한 위치만 찍어 읽게 해줍니다.</p>
+
+<p>공짜는 아닙니다. INSERT/UPDATE/DELETE마다 <strong>모든 관련 인덱스도 갱신</strong>해야 하고(write amplification), MVCC 특성상 인덱스에도 bloat가 쌓입니다. 그리고 <strong>많이 읽어야 하는 조건(관행적으로 5~10% 이상)은 Seq Scan이 오히려 빠릅니다</strong> — 플래너가 이 판단을 대신해 줍니다(6장).</p>
+
+<h2 id="s2">5.2 B-tree — 기본값이자 만능에 가까운 선택</h2>
+
+<p><code>USING</code> 절 없이 <code>CREATE INDEX</code>를 하면 B-tree입니다. <code>=</code>·범위(<code>&lt;</code>, <code>&gt;</code>, <code>BETWEEN</code>)·정렬·전방 일치 <code>LIKE 'abc%'</code>를 모두 처리합니다. 수백만 행에서 원하는 키를 찾는 데 페이지 몇 번이면 충분한 이유를 눈으로 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="B-tree 탐색 — root에서 heap까지, key=42를 찾아서" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <!-- root -->
+      <g data-active="1-1">
+        <rect x="310" y="30" width="140" height="40" rx="8" class="sv-box"/>
+        <text x="380" y="55" text-anchor="middle" class="sv-label sv-mono" font-size="12">[100 | 500]</text>
+      </g>
+      <text x="290" y="55" text-anchor="end" class="sv-label-sm">Root</text>
+
+      <!-- internal -->
+      <rect x="90" y="110" width="140" height="40" rx="8" class="sv-box"/>
+      <text x="160" y="135" text-anchor="middle" class="sv-label sv-mono" font-size="12">[10 | 42 | 77]</text>
+      <rect x="440" y="110" width="140" height="40" rx="8" class="sv-box"/>
+      <text x="510" y="135" text-anchor="middle" class="sv-label sv-mono" font-size="12">[500 | 800]</text>
+      <text x="70" y="135" text-anchor="end" class="sv-label-sm">Internal</text>
+      <path d="M 350 70 Q 260 85 180 108" class="sv-line"/>
+      <path d="M 410 70 Q 470 85 500 108" class="sv-line"/>
+
+      <!-- leaves -->
+      <rect x="40" y="190" width="150" height="44" rx="8" class="sv-box"/>
+      <text x="115" y="209" text-anchor="middle" class="sv-label-sm sv-mono">10→(2,1) 23→(0,4)</text>
+      <text x="115" y="225" text-anchor="middle" class="sv-label-sm sv-mono">31→(5,2)</text>
+      <g data-active="3-5">
+        <rect x="210" y="190" width="150" height="44" rx="8" class="sv-box"/>
+        <text x="285" y="209" text-anchor="middle" class="sv-label-sm sv-mono">42→(7,3) 55→(1,8)</text>
+        <text x="285" y="225" text-anchor="middle" class="sv-label-sm sv-mono">61→(3,1)</text>
+      </g>
+      <rect x="380" y="190" width="150" height="44" rx="8" class="sv-box"/>
+      <text x="455" y="209" text-anchor="middle" class="sv-label-sm sv-mono">77→(4,2) 90→(2,6)</text>
+      <text x="455" y="225" text-anchor="middle" class="sv-label-sm sv-mono">95→(0,9)</text>
+      <text x="30" y="215" text-anchor="end" class="sv-label-sm">Leaf</text>
+      <path d="M 130 150 Q 118 165 115 188" class="sv-line"/>
+      <path d="M 160 150 Q 230 165 275 188" class="sv-line"/>
+      <path d="M 200 150 Q 330 160 435 188" class="sv-line"/>
+      <!-- leaf 양방향 링크 -->
+      <path d="M 190 212 L 210 212" class="sv-line" stroke-dasharray="3 3"/>
+      <path d="M 360 212 L 380 212" class="sv-line" stroke-dasharray="3 3"/>
+
+      <!-- heap -->
+      <rect x="580" y="250" width="160" height="60" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+      <text x="660" y="275" text-anchor="middle" class="sv-label">heap block 7</text>
+      <text x="660" y="294" text-anchor="middle" class="sv-label-sm sv-mono">(7,3) = id 42의 행</text>
+
+      <!-- step1: 쿼리 -->
+      <g data-show="1">
+        <rect x="40" y="24" width="220" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="150" y="46" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE id = 42</text>
+      </g>
+
+      <!-- step2: root→internal -->
+      <g data-show="2">
+        <path d="M 350 70 Q 260 85 180 108" stroke="var(--accent)" stroke-width="3" fill="none" class="flow-line"/>
+        <text x="228" y="92" class="sv-label-sm" fill="var(--accent)">42 &lt; 100 → 왼쪽</text>
+      </g>
+
+      <!-- step3: internal→leaf -->
+      <g data-show="3">
+        <path d="M 160 150 Q 230 165 275 188" stroke="var(--accent)" stroke-width="3" fill="none" class="flow-line"/>
+        <text x="240" y="172" class="sv-label-sm" fill="var(--accent)">42 발견 구간 → leaf</text>
+      </g>
+
+      <!-- step4: leaf→heap -->
+      <g data-show="4">
+        <rect x="216" y="196" width="76" height="16" rx="4" fill="color-mix(in srgb, var(--ok) 25%, transparent)" stroke="var(--ok)"/>
+        <path d="M 292 220 Q 440 260 576 278" stroke="var(--ok)" stroke-width="3" fill="none" class="flow-line"/>
+        <text x="400" y="262" class="sv-label-sm" fill="var(--ok)">TID (7,3)로 heap 직행</text>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <text x="380" y="330" text-anchor="middle" class="sv-label">📖 페이지 읽기 3~4번으로 끝 — 수백만 행이어도 트리 깊이는 3~4 수준</text>
+        <text x="285" y="255" text-anchor="middle" class="sv-label-sm" fill="var(--purple)" >leaf끼리 양방향 링크 → 범위 스캔·ORDER BY는 옆으로 쭉</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>WHERE id = 42</code> 쿼리가 도착했습니다. B-tree 탐색은 항상 <b>Root 페이지</b>에서 시작합니다.</p>
+    <p>Root에서 "42는 100보다 작다" → 왼쪽 자식으로. 페이지 한 번 읽고 검색 범위가 확 줄었습니다.</p>
+    <p>Internal 노드에서 42가 속한 구간을 찾아 <b>Leaf 페이지</b>로 내려갑니다.</p>
+    <p>Leaf에서 <code>42 → (7,3)</code> 엔트리 발견! 이 <b>TID(물리 주소)</b>로 heap의 block 7만 콕 집어 읽습니다. 전체 스캔이 필요 없죠.</p>
+    <p>총 페이지 읽기 3~4번. 그리고 leaf들은 <b style="color:var(--purple)">양방향 링크</b>로 연결되어 있어 <code>BETWEEN</code>·<code>ORDER BY … LIMIT</code>은 진입점만 찾고 옆으로 순차 읽기 하면 됩니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 범위 + 정렬 모두 인덱스 하나로</span>
+<span class="k">CREATE INDEX</span> idx_orders_created <span class="k">ON</span> orders(created_at);
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">ORDER BY</span> created_at <span class="k">DESC LIMIT</span> <span class="n">100</span>;  <span class="c">-- Sort 노드 불필요</span>
+
+<span class="c">-- INCLUDE(11+): 키가 아닌 컬럼을 leaf에 실어 Index-Only Scan 확장</span>
+<span class="k">CREATE INDEX</span> idx_orders_user_inc
+  <span class="k">ON</span> orders(user_id) <span class="k">INCLUDE</span> (amount, status);
+
+<span class="c">-- LIKE 'abc%' 전방 일치를 안정적으로: pattern opclass</span>
+<span class="k">CREATE INDEX</span> idx_users_email <span class="k">ON</span> users(email text_pattern_ops);</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">복합 인덱스의 좌측 접두사 원칙</div>
+    <p><code>CREATE INDEX ON t(a, b, c)</code>는 <code>WHERE a=?</code>, <code>a=? AND b=?</code>, <code>a=? AND b=? AND c=?</code>에 효율적입니다. 반면 <code>WHERE b=?</code>만으로는 사실상 못 씁니다 — <strong>정렬의 첫 기준(a)을 건너뛸 수 없기 때문</strong>입니다. 전화번호부에서 "이름은 모르고 번호 뒷자리만" 찾는 상황과 같습니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">5.3 Seq Scan vs Index Scan — 언제나 인덱스가 이기는 건 아니다</h2>
+
+<p>"인덱스를 만들었는데 왜 안 써요?"의 답은 대부분 <strong>선택도(selectivity)</strong>에 있습니다. 같은 테이블, 두 가지 쿼리를 나란히 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="Seq Scan vs Index Scan — 선택도가 승부를 가른다" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- 좌: Seq Scan -->
+      <text x="190" y="28" text-anchor="middle" class="sv-label" font-size="14">🚜 Seq Scan</text>
+      <g>
+        <rect x="60" y="44" width="260" height="30" rx="6" class="sv-box"/>
+        <rect x="60" y="80" width="260" height="30" rx="6" class="sv-box"/>
+        <rect x="60" y="116" width="260" height="30" rx="6" class="sv-box"/>
+        <rect x="60" y="152" width="260" height="30" rx="6" class="sv-box"/>
+        <text x="190" y="64" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 0</text>
+        <text x="190" y="100" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 1</text>
+        <text x="190" y="136" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 2</text>
+        <text x="190" y="172" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 3 … 전부</text>
+      </g>
+
+      <!-- 우: Index Scan -->
+      <text x="570" y="28" text-anchor="middle" class="sv-label" font-size="14">🎯 Index Scan</text>
+      <rect x="500" y="44" width="140" height="34" rx="8" class="sv-box"/>
+      <text x="570" y="66" text-anchor="middle" class="sv-label-sm sv-mono">B-tree</text>
+      <rect x="440" y="110" width="260" height="30" rx="6" class="sv-box"/>
+      <rect x="440" y="146" width="260" height="30" rx="6" class="sv-box"/>
+      <rect x="440" y="182" width="260" height="30" rx="6" class="sv-box"/>
+      <text x="570" y="130" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 0</text>
+      <text x="570" y="166" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 1</text>
+      <text x="570" y="202" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">page 2</text>
+
+      <!-- step1: 조건 -->
+      <g data-show="1">
+        <text x="380" y="250" text-anchor="middle" class="sv-label sv-mono" font-size="13">WHERE id = 42  (100만 행 중 1행, 선택도 0.0001%)</text>
+      </g>
+
+      <!-- step2: seq 훑기 -->
+      <g data-show="2">
+        <path d="M 46 59 L 46 167" stroke="var(--danger)" stroke-width="3" class="flow-line"/>
+        <text x="190" y="212" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">모든 페이지를 읽고 1행만 건짐 — 낭비 💸</text>
+      </g>
+
+      <!-- step3: index 핀셋 -->
+      <g data-show="3">
+        <path d="M 570 78 Q 600 95 620 108" stroke="var(--ok)" stroke-width="2.6" fill="none" class="flow-line"/>
+        <rect x="608" y="116" width="60" height="18" rx="4" fill="color-mix(in srgb, var(--ok) 25%, transparent)" stroke="var(--ok)"/>
+        <text x="570" y="232" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">트리 타고 내려가 딱 1페이지만 읽음 ✓</text>
+      </g>
+
+      <!-- step4: 반대 조건 -->
+      <g data-show="4">
+        <text x="380" y="250" text-anchor="middle" class="sv-label sv-mono" font-size="13" fill="var(--warn)">WHERE status = 'paid'  (전체의 60% = 60만 행이면?)</text>
+        <text x="380" y="278" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">인덱스로 60만 번 무작위 heap 접근 ≫ 순차로 전부 읽기 — 이젠 Seq Scan이 승자</text>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <rect x="90" y="262" width="580" height="46" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="380" y="282" text-anchor="middle" class="sv-label">핀셋(소량)은 Index Scan · 쓰레받기(중간)는 Bitmap Scan · 대량은 Seq Scan</text>
+        <text x="380" y="300" text-anchor="middle" class="sv-label-sm">이 판단을 플래너가 통계 기반으로 자동 수행 — 6장에서 계속</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>100만 행에서 <b>단 1행</b>을 찾는 쿼리입니다. 두 스캔 방식이 각각 어떻게 움직일까요?</p>
+    <p><b style="color:var(--danger)">Seq Scan</b>은 처음부터 끝까지 모든 페이지를 순차로 읽으며 조건 검사 — 1행 찾자고 수만 페이지를 읽는 낭비입니다.</p>
+    <p><b style="color:var(--ok)">Index Scan</b>은 B-tree를 3~4번 타고 내려가 TID를 얻고 heap 1페이지만 콕. 압승입니다.</p>
+    <p>그런데 조건이 "전체의 60%"라면? 인덱스를 쓰면 <b>60만 번의 무작위 heap 접근</b>이 발생합니다. 순차 I/O로 전체를 쭉 읽는 Seq Scan이 오히려 빠릅니다.</p>
+    <p>정리: 소량은 Index Scan, 애매한 중간(수천~수만 행)은 Bitmap Heap Scan, 대량은 Seq Scan. 이 선택은 여러분이 아니라 <b>플래너가 통계로</b> 합니다 — 통계가 낡으면 오판하고요(6장).</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>읽는 비율(선택도)</th><th>플래너의 선택</th></tr></thead>
+  <tbody>
+    <tr><td>~ 0.01% (수십 행)</td><td>Index Scan</td></tr>
+    <tr><td>0.01 ~ 5%</td><td>Bitmap Heap Scan (페이지 비트맵 → 순차 방문)</td></tr>
+    <tr><td>&gt; 5~10%</td><td>Seq Scan (필요 시 Parallel)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s4">5.4 특수 인덱스 — Hash · GIN · GiST · SP-GiST</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>타입</th><th>구조</th><th>주 용도</th><th>대표 연산자</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Hash</strong></td><td>해시 버킷</td><td><code>=</code> 전용(초장문자열 등). PG10+부터 WAL 지원으로 실전 가능</td><td><code>=</code></td></tr>
+    <tr><td><strong>GIN</strong></td><td>역색인</td><td>jsonb·배열·전문 검색·<code>%abc%</code>(pg_trgm)</td><td><code>@&gt;</code> <code>?</code> <code>&amp;&amp;</code></td></tr>
+    <tr><td><strong>GiST</strong></td><td>일반화 균형 트리</td><td>공간(PostGIS)·범위 타입·KNN(<code>&lt;-&gt;</code>)·배타 제약</td><td><code>&amp;&amp;</code> <code>@&gt;</code> <code>&lt;-&gt;</code></td></tr>
+    <tr><td><strong>SP-GiST</strong></td><td>비균형 분할 트리</td><td>IP/CIDR, 접두사 많은 문자열, quadtree</td><td><code>&lt;&lt;</code> <code>@&gt;</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>GIN은 "하나의 값이 여러 요소로 쪼개지는" 컬럼의 해결사입니다. 각 요소(단어, 배열 원소, JSON 키)마다 "어느 행에 있는지" 목록(posting list)을 유지합니다.</p>
+
+<pre><code><span class="c">-- jsonb 포함 검색</span>
+<span class="k">CREATE INDEX</span> idx_events_payload <span class="k">ON</span> events <span class="k">USING</span> gin(payload);
+<span class="k">SELECT</span> * <span class="k">FROM</span> events <span class="k">WHERE</span> payload @&gt; <span class="s">'{"level":"error"}'</span>;
+
+<span class="c">-- 부분 문자열 매칭: B-tree로는 불가능한 %kim%</span>
+<span class="k">CREATE EXTENSION</span> pg_trgm;
+<span class="k">CREATE INDEX</span> idx_users_name_trgm <span class="k">ON</span> users <span class="k">USING</span> gin(name gin_trgm_ops);
+<span class="k">SELECT</span> * <span class="k">FROM</span> users <span class="k">WHERE</span> name <span class="k">ILIKE</span> <span class="s">'%kim%'</span>;
+
+<span class="c">-- GiST 배타 제약: 회의실 이중 예약 원천 차단</span>
+<span class="k">CREATE TABLE</span> bookings (
+    room_id int,
+    period tstzrange,
+    <span class="k">EXCLUDE USING</span> gist (room_id <span class="k">WITH</span> =, period <span class="k">WITH</span> &amp;&amp;)
+);</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">GIN은 쓰기가 비쌉니다 — FASTUPDATE와 pending list</div>
+    <p>요소마다 인덱스 페이지를 건드려야 해서 GIN의 삽입 비용은 큽니다. 그래서 새 엔트리를 <strong>pending list</strong>에 모아뒀다 나중에 병합하는 <code>fastupdate</code>(기본 on)가 있는데, 이 리스트가 커지면 <strong>SELECT 지연이 튈 수</strong> 있습니다. 읽기 지연에 민감하면 <code>fastupdate=off</code>도 고려하세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">5.5 BRIN — 초소형 요약 인덱스</h2>
+
+<p>BRIN(Block Range Index)은 개별 행이 아니라 <strong>페이지 묶음(기본 128페이지=1MB)의 min/max 요약만</strong> 저장합니다. 시계열 로그처럼 <strong>물리 순서와 값 순서가 일치</strong>하는 데이터에서, GB급 B-tree 대신 몇 MB로 비슷한 효과를 냅니다.</p>
+
+<div class="anim" data-steps="4" data-title="BRIN — min/max 요약으로 범위를 통째로 건너뛰기" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 280">
+      <!-- 테이블 레인지들 -->
+      <g data-active="1-1">
+        <rect x="40" y="60" width="160" height="70" rx="8" class="sv-box"/>
+        <text x="120" y="88" text-anchor="middle" class="sv-label-sm sv-mono">range 0 (1MB)</text>
+        <text x="120" y="108" text-anchor="middle" class="sv-label-sm sv-mono">min 1/01 max 1/03</text>
+      </g>
+      <rect x="220" y="60" width="160" height="70" rx="8" class="sv-box"/>
+      <text x="300" y="88" text-anchor="middle" class="sv-label-sm sv-mono">range 1</text>
+      <text x="300" y="108" text-anchor="middle" class="sv-label-sm sv-mono">min 1/03 max 1/06</text>
+      <rect x="400" y="60" width="160" height="70" rx="8" class="sv-box"/>
+      <text x="480" y="88" text-anchor="middle" class="sv-label-sm sv-mono">range 2</text>
+      <text x="480" y="108" text-anchor="middle" class="sv-label-sm sv-mono">min 1/06 max 1/09</text>
+      <rect x="580" y="60" width="160" height="70" rx="8" class="sv-box"/>
+      <text x="660" y="88" text-anchor="middle" class="sv-label-sm sv-mono">range 3</text>
+  <text x="660" y="108" text-anchor="middle" class="sv-label-sm sv-mono">min 1/09 max 1/12</text>
+      <text x="40" y="46" class="sv-label">logs 테이블 — ts 순서로 INSERT된 시계열</text>
+
+      <!-- step1: 쿼리 -->
+      <g data-show="1">
+        <rect x="180" y="170" width="400" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="380" y="192" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE ts BETWEEN '1/07' AND '1/08'</text>
+      </g>
+
+      <!-- step2: skip -->
+      <g data-show="2">
+        <text x="120" y="150" text-anchor="middle" class="sv-label" fill="var(--danger)">✂ skip</text>
+        <text x="300" y="150" text-anchor="middle" class="sv-label" fill="var(--danger)">✂ skip</text>
+        <text x="660" y="150" text-anchor="middle" class="sv-label" fill="var(--danger)">✂ skip</text>
+      </g>
+
+      <!-- step3: 히트 레인지만 스캔 -->
+      <g data-show="3">
+        <rect x="400" y="60" width="160" height="70" rx="8" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="480" y="150" text-anchor="middle" class="sv-label" fill="var(--ok)">✓ 이 1MB만 스캔</text>
+      </g>
+
+      <!-- step4: 주의 -->
+      <g data-show="4">
+        <rect x="60" y="220" width="640" height="46" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+        <text x="380" y="240" text-anchor="middle" class="sv-label">⚠ 전제: 물리 순서 ≈ 값 순서. 무작위로 삽입된 컬럼이면 모든 range의 min/max가 겹쳐 무용지물</text>
+        <text x="380" y="258" text-anchor="middle" class="sv-label-sm">인덱스 크기: B-tree 수 GB vs BRIN 수 MB — 시계열·로그의 특효약</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>시간 순서로 쌓인 logs 테이블. BRIN은 1MB 단위 range마다 <b>min/max 요약</b>만 갖고 있습니다. 1월 7~8일 데이터를 찾아봅시다.</p>
+    <p>range 0(1/01~1/03), range 1(1/03~1/06), range 3(1/09~)은 min/max가 조건과 겹치지 않음 → <b style="color:var(--danger)">통째로 건너뜁니다</b>.</p>
+    <p>조건과 겹치는 <b style="color:var(--ok)">range 2만 실제로 스캔</b>합니다. 몇 MB짜리 인덱스로 테이블의 대부분을 안 읽게 된 것이죠.</p>
+    <p>단, 데이터가 <b>물리적으로 정렬돼 있을 때만</b> 효과가 있습니다. 무작위 삽입 컬럼이면 모든 range의 min/max가 비슷해져 스킵할 게 없어집니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">CREATE INDEX</span> idx_logs_ts_brin <span class="k">ON</span> logs <span class="k">USING</span> brin(ts);
+
+<span class="c">-- 정밀도 조절: 범위를 좁히면 스킵 정밀도↑, 인덱스 크기↑</span>
+<span class="k">CREATE INDEX</span> idx_logs_ts_brin2
+  <span class="k">ON</span> logs <span class="k">USING</span> brin(ts) <span class="k">WITH</span> (pages_per_range = <span class="n">32</span>);</code></pre>
+
+<h2 id="s6">5.6 Partial · Expression · Unique — 인덱스를 더 얇고 똑똑하게</h2>
+
+<pre><code><span class="c">-- Partial: 전체의 3%인 활성 행만 인덱싱 → 크기·쓰기 비용 급감</span>
+<span class="k">CREATE INDEX</span> idx_users_active_email
+  <span class="k">ON</span> users(email) <span class="k">WHERE</span> is_active = true;
+
+<span class="c">-- Expression: 함수 결과를 인덱싱 (쿼리 표현식과 문법적으로 일치해야 사용됨)</span>
+<span class="k">CREATE INDEX</span> idx_users_email_lower <span class="k">ON</span> users(<span class="f">lower</span>(email));
+<span class="k">SELECT</span> * <span class="k">FROM</span> users <span class="k">WHERE</span> <span class="f">lower</span>(email) = <span class="s">'kim@example.com'</span>;
+
+<span class="c">-- Partial Unique: 소프트 삭제 환경에서 "살아있는 행 중에만" 중복 방지</span>
+<span class="k">CREATE UNIQUE INDEX</span> idx_users_email_alive
+  <span class="k">ON</span> users(email) <span class="k">WHERE</span> deleted_at <span class="k">IS NULL</span>;</code></pre>
+
+<h2 id="s7">5.7 유지 비용 — 인덱스는 만들 때보다 기를 때가 어렵다</h2>
+
+<p>인덱스가 N개면 쓰기 I/O도 대략 N배(write amplification). MVCC UPDATE는 인덱스에도 새 엔트리를 만들고, 페이지 분할(split)은 원상 복구되지 않아 <strong>index bloat</strong>가 됩니다. 관리 루틴:</p>
+
+<pre><code><span class="c">-- 사용되지 않는 인덱스 찾기 (idx_scan=0이 오래 지속되면 삭제 후보)</span>
+<span class="k">SELECT</span> s.relname, s.indexrelname, s.idx_scan,
+       <span class="f">pg_size_pretty</span>(<span class="f">pg_relation_size</span>(s.indexrelid)) <span class="k">AS</span> size
+<span class="k">FROM</span> pg_stat_user_indexes s
+<span class="k">JOIN</span> pg_index i <span class="k">ON</span> i.indexrelid = s.indexrelid
+<span class="k">WHERE NOT</span> i.indisunique <span class="k">AND NOT</span> i.indisprimary <span class="k">AND</span> s.idx_scan &lt; <span class="n">50</span>
+<span class="k">ORDER BY</span> <span class="f">pg_relation_size</span>(s.indexrelid) <span class="k">DESC</span>;
+
+<span class="c">-- 12+: 쿼리를 막지 않는 재구축</span>
+<span class="k">REINDEX INDEX CONCURRENTLY</span> idx_orders_created;
+<span class="c">-- 실패 시 INVALID 고아 인덱스가 남을 수 있음: 확인 필수</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> pg_index <span class="k">WHERE NOT</span> indisvalid;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">자주 하는 실수 Top 3</div>
+    <p>① <code>LIKE '%abc'</code>를 B-tree에 기대 — 후방 일치는 안 됩니다. pg_trgm+GIN이 정답. ② 타입 불일치 — <code>WHERE code = 12345</code>(code가 text)는 캐스트 때문에 인덱스를 우회할 수 있습니다. ③ 함수 래핑 — <code>WHERE to_char(created_at, …) = …</code>은 Expression Index를 만들거나 범위 조건으로 바꾸세요.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">인덱스가 있는데도 플래너가 Seq Scan을 선택하는 가장 흔한 정당한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">Seq Scan이 항상 인덱스보다 빠르기 때문</button>
+    <button type="button" data-correct>조건이 테이블의 큰 비율을 읽어야 해서, 무작위 접근보다 순차 전체 읽기가 싸기 때문</button>
+    <button type="button">인덱스는 SELECT에는 사용할 수 없기 때문</button>
+    <button type="button">B-tree는 등호 조건만 지원하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 선택도가 낮은(많이 읽는) 조건에서는 Index Scan의 무작위 heap 접근 비용이 순차 전체 읽기를 넘어섭니다. 관행적으로 5~10% 이상이면 Seq Scan이 유리하고, 그 판단은 플래너가 통계와 <code>random_page_cost</code>로 합니다. 물론 통계가 낡아 "오판"하는 경우도 있으니 6장에서 감별법을 배웁니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q"><code>WHERE name ILIKE '%kim%'</code> (중간 문자열 매칭)을 인덱스로 가속하는 올바른 방법은?</div>
+  <div class="quiz-opts">
+    <button type="button">B-tree 인덱스를 name 컬럼에 만든다</button>
+    <button type="button">Hash 인덱스를 만든다</button>
+    <button type="button" data-correct>pg_trgm 확장 + GIN 인덱스(gin_trgm_ops)를 만든다</button>
+  </div>
+  <div class="quiz-expl">✅ B-tree는 정렬 기반이라 전방 일치(<code>'abc%'</code>)만 처리할 수 있습니다. 중간/후방 일치는 문자열을 3글자 조각(trigram)으로 쪼개 역색인하는 <strong>pg_trgm + GIN</strong>이 정답입니다. Hash는 완전 동등 비교 전용입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch05_indexes.md" target="_blank" rel="noopener">chapters/ch05_indexes.md</a> — opclass 상세, GIN vs GiST 선택표, 인덱스 선택 플로우차트, 운영 체크리스트 전체가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch04.html"><span class="dir">← 이전</span><br><span class="title">4장. Storage · Tuple · TOAST</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch06.html"><span class="dir">다음 →</span><br><span class="title">6장. 쿼리 플래너와 EXPLAIN</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

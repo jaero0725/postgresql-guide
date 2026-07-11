@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4장. Storage · Tuple · TOAST — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch04">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>4장. Storage · Tuple · TOAST</h1>
+<p class="lead">3장이 MVCC의 논리였다면, 이 장은 그 논리가 디스크 위에 실제로 놓이는 모습입니다. 모든 것의 단위는 8KB 페이지 — 그 안에 튜플이 쌓이는 법, 큰 값이 밀려나는 법(TOAST)을 그림으로 봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 3장 MVCC</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 8KB 페이지의 다섯 영역과 튜플이 쌓이는 방식 ② 튜플 헤더와 컬럼 정렬(alignment)의 비용 ③ fillfactor와 HOT update의 관계 ④ 2KB를 넘는 값이 TOAST로 밀려나는 과정과 VM·FSM·CTID</p>
+  </div>
+</div>
+
+<h2 id="s1">4.1 8KB 페이지의 해부 — 양 끝에서 자라는 구조</h2>
+
+<p>PostgreSQL의 모든 heap·인덱스 파일은 <strong>8KB 고정 크기 페이지(block)</strong>로 구성됩니다. 테이블 파일은 1GB 단위 세그먼트로 쪼개지고요. 페이지 내부는 다섯 영역입니다: <strong>PageHeader(24B) → ItemId 배열 → Free Space → Tuples → Special</strong>. 재미있는 점은 <strong>ItemId는 앞에서, 튜플은 뒤에서 자라 가운데 빈 공간을 좁혀 간다</strong>는 것. INSERT가 반복될 때 무슨 일이 벌어지는지 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="8KB 페이지에 튜플이 쌓이는 과정 — 양 끝에서 가운데로" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 페이지 틀 -->
+      <rect x="40" y="60" width="680" height="90" rx="8" fill="none" stroke="var(--border)" stroke-width="1.6"/>
+      <text x="40" y="46" class="sv-label">heap page (8KB, block 0)</text>
+
+      <!-- header -->
+      <rect x="40" y="60" width="70" height="90" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="75" y="100" text-anchor="middle" class="sv-label-sm">Header</text>
+      <text x="75" y="116" text-anchor="middle" class="sv-label-sm sv-mono">24B</text>
+
+      <!-- step1: 튜플1 -->
+      <g data-show="1">
+        <rect x="110" y="60" width="26" height="90" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.2"/>
+        <text x="123" y="110" text-anchor="middle" class="sv-label-sm sv-mono" font-size="9">I1</text>
+        <rect x="620" y="60" width="100" height="90" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.2"/>
+        <text x="670" y="100" text-anchor="middle" class="sv-label-sm">Tuple 1</text>
+        <text x="670" y="116" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">(0,1)</text>
+        <path d="M 123 156 Q 300 200 668 156" stroke="var(--warn)" stroke-width="1.4" fill="none" stroke-dasharray="4 4"/>
+      </g>
+
+      <!-- step2: 튜플2,3 -->
+      <g data-show="2">
+        <rect x="136" y="60" width="26" height="90" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.2"/>
+        <text x="149" y="110" text-anchor="middle" class="sv-label-sm sv-mono" font-size="9">I2</text>
+        <rect x="162" y="60" width="26" height="90" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.2"/>
+        <text x="175" y="110" text-anchor="middle" class="sv-label-sm sv-mono" font-size="9">I3</text>
+        <rect x="520" y="60" width="100" height="90" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.2"/>
+        <text x="570" y="100" text-anchor="middle" class="sv-label-sm">Tuple 2</text>
+        <text x="570" y="116" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">(0,2)</text>
+        <rect x="420" y="60" width="100" height="90" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.2"/>
+        <text x="470" y="100" text-anchor="middle" class="sv-label-sm">Tuple 3</text>
+        <text x="470" y="116" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">(0,3)</text>
+      </g>
+
+      <!-- free space 라벨 -->
+      <g data-show="1-3">
+        <text x="300" y="100" text-anchor="middle" class="sv-label-sm">Free Space</text>
+        <text x="300" y="118" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">pd_lower → ← pd_upper</text>
+      </g>
+
+      <!-- step3: 화살표 -->
+      <g data-show="3">
+        <path d="M 195 176 L 260 176" stroke="var(--warn)" stroke-width="2.4" fill="none"/>
+        <text x="228" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">ItemId는 앞→뒤</text>
+        <path d="M 410 176 L 345 176" stroke="var(--ok)" stroke-width="2.4" fill="none"/>
+        <text x="378" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">튜플은 뒤→앞</text>
+      </g>
+
+      <!-- step4: 페이지 풀 -->
+      <g data-show="4">
+        <rect x="188" y="60" width="26" height="90" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.2"/>
+        <text x="201" y="110" text-anchor="middle" class="sv-label-sm sv-mono" font-size="9">I4</text>
+        <rect x="214" y="60" width="26" height="90" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.2"/>
+        <text x="227" y="110" text-anchor="middle" class="sv-label-sm sv-mono" font-size="9">I5</text>
+        <rect x="320" y="60" width="100" height="90" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.2"/>
+        <text x="370" y="100" text-anchor="middle" class="sv-label-sm">Tuple 4</text>
+        <rect x="240" y="60" width="80" height="90" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.2"/>
+        <text x="280" y="100" text-anchor="middle" class="sv-label-sm" font-size="11">Tuple 5</text>
+        <text x="380" y="230" text-anchor="middle" class="sv-label" fill="var(--danger)">pd_lower가 pd_upper에 닿음 → 페이지 풀(full)!</text>
+      </g>
+
+      <!-- step5: 새 페이지 -->
+      <g data-show="5">
+        <rect x="40" y="248" width="330" height="40" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="6 5"/>
+        <text x="205" y="273" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">새 튜플은 다음 페이지(block 1)로 — FSM이 빈 페이지를 찾아줌</text>
+        <path d="M 380 230 Q 390 250 375 262" stroke="var(--accent)" stroke-width="1.8" fill="none" class="flow-line"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>첫 INSERT. 페이지 <b>앞쪽</b>에 4바이트 <b style="color:var(--warn)">ItemId(line pointer)</b>가, 페이지 <b>맨 뒤</b>에 튜플 본체가 기록됩니다. ItemId가 튜플의 위치(offset)와 길이를 가리킵니다.</p>
+    <p>INSERT가 이어지면 ItemId는 앞에서 뒤로, 튜플은 뒤에서 앞으로 쌓입니다. 튜플의 주소 <code>ctid=(0,3)</code>의 3이 바로 ItemId 번호입니다.</p>
+    <p>왜 양 끝에서? ItemId 배열은 <b>번호 순서를 유지</b>해야 하고, 가변 길이인 튜플 본체는 뒤쪽에서 붙이는 게 쉽기 때문입니다. 가운데 Free Space가 점점 좁아집니다.</p>
+    <p><code>pd_lower</code>(ItemId 끝)와 <code>pd_upper</code>(튜플 시작)가 만나면 <b style="color:var(--danger)">페이지 풀</b> — 이 페이지엔 더 못 넣습니다.</p>
+    <p>새 튜플은 다음 페이지로 갑니다. 어느 페이지에 자리가 있는지는 <b>FSM(Free Space Map)</b>이 알려줍니다(4.5절).</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>영역</th><th>크기</th><th>설명</th></tr></thead>
+  <tbody>
+    <tr><td><strong>PageHeader</strong></td><td>24B</td><td>LSN·checksum·<code>pd_lower</code>/<code>pd_upper</code>(빈 공간 포인터)</td></tr>
+    <tr><td><strong>ItemId</strong></td><td>4B 각</td><td>튜플의 offset+length. 앞에서 자람</td></tr>
+    <tr><td><strong>Free Space</strong></td><td>가변</td><td>튜플이 찰수록 줄어듦</td></tr>
+    <tr><td><strong>Tuples</strong></td><td>가변</td><td>페이지 끝에서 앞으로 쌓임</td></tr>
+    <tr><td><strong>Special</strong></td><td>가변</td><td>heap은 0, B-tree 등 인덱스가 메타 저장</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s2">4.2 튜플의 실제 크기 — 헤더 23B + 정렬(padding)의 비용</h2>
+
+<p>모든 튜플 앞에는 3장에서 본 <strong>23바이트 헤더</strong>(xmin·xmax·ctid·infomask…)가 붙고, 그 뒤에 사용자 데이터가 옵니다. 여기서 초보자가 자주 놓치는 비용이 <strong>alignment(정렬)</strong>입니다. <code>bigint</code>는 8바이트 경계, <code>integer</code>는 4바이트 경계에 놓여야 해서, 컬럼 순서가 나쁘면 빈틈(padding)이 생깁니다.</p>
+
+<pre><code><span class="c">-- 나쁜 순서: smallint → bigint → smallint</span>
+<span class="k">CREATE TABLE</span> bad  (a smallint, b bigint, c smallint);
+<span class="c">-- 2B + (6B padding!) + 8B + 2B + (6B padding) = 24B</span>
+
+<span class="c">-- 좋은 순서: 큰 정렬 타입 먼저</span>
+<span class="k">CREATE TABLE</span> good (b bigint, a smallint, c smallint);
+<span class="c">-- 8B + 2B + 2B + (4B padding) = 16B  ← 행마다 8B 절약</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">컬럼 순서 운영 팁</div>
+    <p><strong>8바이트 정렬 타입(bigint, timestamptz) → 4바이트(int) → 2바이트(smallint) → 가변 타입(text, jsonb)</strong> 순으로 선언하세요. 수억 행 테이블에서는 컬럼 재배치만으로 수 GB를 절약한 사례가 흔합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">4.3 fillfactor와 HOT Update — 일부러 비워두는 지혜</h2>
+
+<p>기본 fillfactor는 100 — 페이지를 꽉 채웁니다. 그런데 UPDATE가 잦은 테이블이라면? 새 버전 튜플이 <strong>같은 페이지에</strong> 들어갈 자리가 없어 다른 페이지로 가고, 그러면 <strong>인덱스에도 새 엔트리를 추가</strong>해야 합니다(Non-HOT). fillfactor를 80~90으로 낮춰 여유를 남기면, 새 버전이 같은 페이지에 들어가는 <strong>HOT(Heap-Only Tuple) update</strong>가 가능해집니다.</p>
+
+<div class="anim" data-steps="4" data-title="fillfactor 100 vs 80 — HOT update가 되고 안 되고" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 왼쪽: ff=100 -->
+      <text x="190" y="30" text-anchor="middle" class="sv-label" font-size="14">fillfactor = 100 (기본)</text>
+      <rect x="40" y="44" width="300" height="70" rx="8" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+      <rect x="44" y="48" width="292" height="62" rx="6" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1"/>
+      <text x="190" y="84" text-anchor="middle" class="sv-label-sm">튜플로 꽉 참 (여유 0%)</text>
+
+      <!-- 오른쪽: ff=80 -->
+      <text x="570" y="30" text-anchor="middle" class="sv-label" font-size="14">fillfactor = 80</text>
+      <rect x="420" y="44" width="300" height="70" rx="8" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+      <rect x="424" y="48" width="232" height="62" rx="6" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1"/>
+      <rect x="660" y="48" width="56" height="62" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="540" y="84" text-anchor="middle" class="sv-label-sm">80%만 채움</text>
+      <text x="688" y="84" text-anchor="middle" class="sv-label-sm" font-size="9" fill="var(--accent)">여유</text>
+
+      <!-- step2: UPDATE 발생 -->
+      <g data-show="2">
+        <text x="380" y="146" text-anchor="middle" class="sv-label" fill="var(--warn)">⚡ UPDATE users SET score = score + 1 (인덱스 컬럼은 그대로)</text>
+      </g>
+
+      <!-- step3: 좌측 결과 -->
+      <g data-show="3">
+        <rect x="40" y="170" width="300" height="56" rx="8" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+        <text x="190" y="192" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">자리 없음 → 새 버전은 다른 페이지로</text>
+        <text x="190" y="212" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">인덱스에도 새 엔트리 추가 (Non-HOT) 💸</text>
+      </g>
+
+      <!-- step4: 우측 결과 -->
+      <g data-show="4">
+        <rect x="420" y="170" width="300" height="56" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="570" y="192" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">같은 페이지의 여유 공간에 새 버전 ✓</text>
+        <text x="570" y="212" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">인덱스 갱신 없음 = HOT update 🎉</text>
+        <text x="380" y="270" text-anchor="middle" class="sv-label-sm">HOT: 인덱스 WAL 없음 · HOT pruning으로 페이지 내 dead tuple 즉시 회수 가능</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>같은 테이블, 다른 fillfactor. 왼쪽은 기본값 100으로 페이지가 꽉 찼고, 오른쪽은 80이라 20%의 여유가 있습니다.</p>
+    <p>인덱스에 걸리지 않은 컬럼만 바꾸는 UPDATE가 발생합니다. MVCC이므로 <b>새 버전 튜플</b>을 어딘가에 넣어야 하죠.</p>
+    <p>fillfactor 100: 같은 페이지에 자리가 없어 <b style="color:var(--danger)">다른 페이지로</b> 갑니다. 그러면 인덱스도 새 위치를 가리키는 엔트리를 추가해야 합니다 — 쓰기 비용과 인덱스 bloat 증가.</p>
+    <p>fillfactor 80: 같은 페이지 여유 공간에 새 버전이 들어가는 <b style="color:var(--ok)">HOT update</b> 성공! 인덱스는 손대지 않고, 페이지를 열 때마다 HOT pruning으로 옛 버전을 즉시 청소할 수도 있습니다. <code>pg_stat_user_tables.n_tup_hot_upd</code>로 효과를 측정하세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- UPDATE가 잦은 테이블: 여유 공간을 미리 확보</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">SET</span> (fillfactor = 80);
+<span class="c">-- 대신 디스크 점유는 그만큼 늘어난다 (트레이드오프)</span></code></pre>
+
+<h2 id="s4">4.4 TOAST — 8KB에 1MB를 넣는 마법</h2>
+
+<p>규칙: <strong>한 튜플은 한 페이지에 들어가야 한다.</strong> 그런데 50KB짜리 JSONB는요? 답이 <strong>TOAST(The Oversized-Attribute Storage Technique)</strong>입니다. 튜플이 약 <strong>2KB</strong>(<code>TOAST_TUPLE_THRESHOLD</code>)를 넘으면 큰 컬럼 값을 압축하고, 그래도 크면 별도의 숨겨진 테이블로 <strong>청크 단위 분할 저장</strong>합니다. 2KB의 근거는 "8KB 페이지에 최소 4개 튜플은 들어가게"입니다.</p>
+
+<div class="anim" data-steps="5" data-title="큰 값이 TOAST로 밀려나는 과정" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 330">
+      <!-- 원본 heap 페이지 -->
+      <rect x="40" y="50" width="300" height="120" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+      <text x="46" y="40" class="sv-label">articles heap 페이지</text>
+
+      <!-- step1: 큰 튜플 시도 -->
+      <g data-show="1-1">
+        <rect x="60" y="70" width="380" height="44" rx="8" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="250" y="90" text-anchor="middle" class="sv-label-sm">INSERT: id=1, title, body = 50KB 텍스트 😱</text>
+        <text x="250" y="106" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">튜플이 2KB 임계 초과 — 페이지에 못 들어감</text>
+      </g>
+
+      <!-- step2: 압축 -->
+      <g data-show="2-3">
+        <rect x="60" y="70" width="240" height="44" rx="8" fill="color-mix(in srgb, var(--warn) 16%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="180" y="90" text-anchor="middle" class="sv-label-sm">🗜 1단계: 압축 (pglz / lz4)</text>
+        <text x="180" y="106" text-anchor="middle" class="sv-label-sm">50KB → 18KB… 아직도 큼</text>
+      </g>
+
+      <!-- step3~: 청크 분할 -->
+      <g data-show="3">
+        <rect x="440" y="50" width="280" height="220" rx="10" fill="color-mix(in srgb, var(--purple) 7%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="580" y="76" text-anchor="middle" class="sv-label">🧊 pg_toast.pg_toast_16432</text>
+        <text x="580" y="94" text-anchor="middle" class="sv-label-sm">(숨겨진 TOAST 테이블)</text>
+        <rect x="460" y="106" width="240" height="28" rx="6" class="sv-box"/>
+        <text x="580" y="125" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">chunk_id=16501 seq=0 [~2000B]</text>
+        <rect x="460" y="140" width="240" height="28" rx="6" class="sv-box"/>
+        <text x="580" y="159" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">chunk_id=16501 seq=1 [~2000B]</text>
+        <rect x="460" y="174" width="240" height="28" rx="6" class="sv-box"/>
+        <text x="580" y="193" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">chunk_id=16501 seq=2 [~2000B]</text>
+        <text x="580" y="226" text-anchor="middle" class="sv-label-sm sv-mono">… seq=8까지</text>
+        <path d="M 300 92 Q 380 100 436 120" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="352" y="80" class="sv-label-sm" fill="var(--purple)">청크 분할</text>
+      </g>
+
+      <!-- step4: 포인터만 남음 -->
+      <g data-show="4">
+        <rect x="60" y="70" width="240" height="44" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="180" y="90" text-anchor="middle" class="sv-label-sm">id=1, title, body = 📌 <tspan class="sv-mono">TOAST pointer</tspan></text>
+        <text x="180" y="106" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">원본엔 18바이트 포인터만!</text>
+      </g>
+
+      <!-- step5: 조회 -->
+      <g data-show="5">
+        <path d="M 300 92 Q 380 100 436 120" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="380" y="300" text-anchor="middle" class="sv-label-sm">SELECT body → 포인터를 따라 청크들을 모아 압축 해제 후 원본 복원 (자동, 투명)</text>
+        <text x="180" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--accent)" data-show="5">읽을 때 역순으로 조립</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>50KB 텍스트를 가진 행을 INSERT합니다. 튜플이 약 2KB 임계(<code>TOAST_TUPLE_THRESHOLD</code>)를 넘어 <b style="color:var(--danger)">그대로는 페이지에 못 들어갑니다</b>.</p>
+    <p>1단계는 <b style="color:var(--warn)">압축</b>(기본 pglz, PG14+는 lz4 선택 가능). 그래도 목표 크기(~2KB)를 넘으면 다음 단계로.</p>
+    <p>값을 <b style="color:var(--purple)">약 2000바이트 청크로 잘라</b> 숨겨진 테이블 <code>pg_toast.pg_toast_&lt;oid&gt;</code>에 저장합니다. 청크 크기의 근거도 "TOAST 페이지에 4개씩 들어가게"입니다.</p>
+    <p>원본 heap 튜플에는 <b style="color:var(--ok)">18바이트 TOAST 포인터만</b> 남습니다. 이제 튜플은 가볍게 페이지에 들어갑니다.</p>
+    <p>SELECT 시엔 포인터를 따라 청크를 모아 압축을 풀어 복원합니다. 전 과정이 자동 — 개발자가 호출할 API 자체가 없습니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>STORAGE 전략</th><th>압축</th><th>외부 저장</th><th>비고</th></tr></thead>
+  <tbody>
+    <tr><td><strong>PLAIN</strong></td><td>✗</td><td>✗</td><td>고정 길이 타입(<code>integer</code> 등). TOAST 안 함</td></tr>
+    <tr><td><strong>EXTENDED</strong> (기본)</td><td>✓</td><td>✓</td><td><code>text</code>·<code>jsonb</code>·<code>bytea</code>의 기본</td></tr>
+    <tr><td><strong>EXTERNAL</strong></td><td>✗</td><td>✓</td><td><code>substr()</code> 잦으면 압축 해제 비용 회피</td></tr>
+    <tr><td><strong>MAIN</strong></td><td>✓</td><td>최후 수단</td><td>가능한 한 인라인 유지</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 전략 변경 (이후 UPDATE부터 적용)</span>
+<span class="k">ALTER TABLE</span> articles <span class="k">ALTER COLUMN</span> body <span class="k">SET STORAGE</span> EXTERNAL;
+
+<span class="c">-- PG14+: 더 빠른 lz4 압축으로</span>
+<span class="k">ALTER TABLE</span> articles <span class="k">ALTER COLUMN</span> body <span class="k">SET COMPRESSION</span> lz4;
+
+<span class="c">-- 내 테이블의 TOAST 테이블 찾기</span>
+<span class="k">SELECT</span> relname, reltoastrelid::regclass
+<span class="k">FROM</span> pg_class <span class="k">WHERE</span> relname = <span class="s">'articles'</span>;
+<span class="c">--  articles | pg_toast.pg_toast_16432</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">TOAST 테이블도 bloat됩니다</div>
+    <p>거대한 jsonb를 자주 UPDATE하면 <strong>TOAST 쪽에도 dead tuple이 쌓입니다</strong>. 원본 테이블 VACUUM 시 함께 처리되지만, "테이블은 작은데 total size가 크다"면 TOAST bloat를 의심하고 <code>pg_total_relation_size</code>와 비교해 보세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">4.5 VM과 FSM — 테이블 옆의 두 조수</h2>
+
+<p>각 테이블 본체 파일 옆에는 보조 파일(fork)이 두 개 붙습니다: <code>24576_fsm</code>, <code>24576_vm</code>.</p>
+
+<ul>
+  <li><strong>Visibility Map(VM)</strong> — heap 페이지마다 2비트. <code>all-visible</code>(dead tuple 없음, 모두에게 보임)이면 <strong>Index-Only Scan이 heap을 건너뛸 수 있고</strong>, <code>all-frozen</code>이면 VACUUM이 그 페이지를 스킵합니다.</li>
+  <li><strong>Free Space Map(FSM)</strong> — 페이지별 남은 공간을 트리로 요약. INSERT·Non-HOT UPDATE가 "자리 있는 페이지"를 빨리 찾게 해줍니다.</li>
+</ul>
+
+<pre><code><span class="c">-- Index-Only Scan이 진짜로 heap을 안 읽었는지 확인</span>
+<span class="k">EXPLAIN</span> (<span class="k">ANALYZE</span>, BUFFERS)
+<span class="k">SELECT</span> user_id <span class="k">FROM</span> orders <span class="k">WHERE</span> user_id = <span class="n">42</span>;
+<span class="c">-- Index Only Scan using idx_orders_user ...</span>
+<span class="c">--   Heap Fetches: 0   ← 완벽 (VM 비트가 1)</span>
+<span class="c">--   Heap Fetches: 12  ← VACUUM 지연 신호. VACUUM 후 다시 측정</span></code></pre>
+
+<h2 id="s6">4.6 CTID — 물리 주소는 영원하지 않다</h2>
+
+<p>모든 튜플의 물리 주소는 <code>(블록 번호, ItemId 번호)</code> 쌍, 즉 <strong>CTID</strong>입니다. 인덱스 엔트리가 가리키는 것이 바로 이 값이죠. 단, <strong>CTID는 UPDATE·VACUUM FULL·CLUSTER로 바뀌는 불안정한 주소</strong>입니다. 애플리케이션이 저장해 두면 안 되고, 진단·복구 용도로만 씁니다. 영구 식별자는 <code>bigserial</code>·<code>uuid</code> 같은 논리 키로.</p>
+
+<pre><code><span class="k">SELECT</span> ctid, id, name <span class="k">FROM</span> users <span class="k">LIMIT</span> <span class="n">3</span>;
+<span class="c">--  ctid  | id | name</span>
+<span class="c">-- -------+----+-------</span>
+<span class="c">--  (0,1) |  1 | Alice     ← 블록 0, ItemId 1</span>
+<span class="c">--  (0,2) |  2 | Bob</span>
+<span class="c">--  (1,1) |  4 | Dave      ← 블록 1로 넘어감</span></code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">8KB 페이지 안에서 ItemId 배열과 튜플 본체가 각각 자라는 방향은?</div>
+  <div class="quiz-opts">
+    <button type="button">둘 다 앞에서 뒤로 순서대로 쌓인다</button>
+    <button type="button" data-correct>ItemId는 앞에서 뒤로, 튜플은 뒤에서 앞으로 — 가운데 빈 공간이 좁아진다</button>
+    <button type="button">튜플이 앞에서, ItemId가 뒤에서 자란다</button>
+    <button type="button">페이지마다 무작위 위치에 배치된다</button>
+  </div>
+  <div class="quiz-expl">✅ ItemId(line pointer)는 헤더 뒤에서 앞→뒤로, 튜플 본체는 페이지 끝에서 뒤→앞으로 자랍니다. <code>pd_lower</code>와 <code>pd_upper</code>가 만나면 페이지 풀. ItemId 번호가 곧 ctid의 두 번째 값이기 때문에 배열 순서를 유지해야 하는 구조입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">50KB짜리 text 값을 가진 행을 INSERT하면 (기본 EXTENDED 전략) 무슨 일이 일어날까요?</div>
+  <div class="quiz-opts">
+    <button type="button">에러가 발생한다 — 8KB 페이지보다 큰 값은 저장할 수 없다</button>
+    <button type="button">페이지 크기가 자동으로 64KB로 확장된다</button>
+    <button type="button" data-correct>압축을 시도하고, 여전히 크면 TOAST 테이블에 청크로 분할 저장, 원본엔 포인터만 남는다</button>
+  </div>
+  <div class="quiz-expl">✅ 튜플이 ~2KB 임계를 넘으면 TOAST가 발동합니다. 먼저 압축(pglz/lz4), 그래도 크면 <code>pg_toast.pg_toast_&lt;oid&gt;</code>에 ~2000B 청크로 분할 저장하고 원본 heap에는 18바이트 포인터만 남깁니다. 전 과정이 자동이라 개발자는 평소 존재조차 못 느낍니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch04_storage_tuples_toast.md" target="_blank" rel="noopener">chapters/ch04_storage_tuples_toast.md</a> — PageHeaderData C 구조체, MAXALIGN 세부, TOAST 임계 상수표, 운영 관찰 쿼리 모음이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch03.html"><span class="dir">← 이전</span><br><span class="title">3장. MVCC — 동시성의 비밀</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch05.html"><span class="dir">다음 →</span><br><span class="title">5장. 인덱스 완전 정복</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

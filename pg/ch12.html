@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12장. 파티셔닝 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch12">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>12장. 파티셔닝 — 거대한 테이블을 서랍장으로</h1>
+<p class="lead">10억 행짜리 테이블은 "느린 것"이 문제가 아니라 "관리 불가능한 것"이 문제입니다. 테이블을 월별 서랍으로 나누면 쿼리는 필요한 서랍만 열고, 오래된 서랍은 통째로 버릴 수 있습니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 인덱스 · 8장 VACUUM</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 왜 파티셔닝인가 — DELETE vs DROP의 압도적 비용 차이 ② RANGE/LIST/HASH 세 가지 분할 방식 ③ Partition Pruning — 필요한 파티션만 스캔하는 원리 ④ 월별 로테이션 운영 패턴과 함정들</p>
+  </div>
+</div>
+
+<h2 id="s1">12.1 왜 파티셔닝인가 — 성능보다 먼저 "운영 가능성"</h2>
+
+<p>단일 테이블이 수억 행을 넘어가면 세 가지 문제가 동시에 옵니다: <strong>VACUUM이 한 바퀴 도는 데 몇 시간</strong>(autovacuum이 못 따라감), <strong>인덱스가 거대해져 REINDEX가 부담</strong>, 그리고 <strong>"3개월 지난 로그 삭제" 같은 대량 DELETE가 Bloat 폭탄</strong>이 됩니다.</p>
+
+<p><strong>파티셔닝(Partitioning)</strong>은 하나의 논리 테이블을 물리적으로 여러 자식 테이블(파티션)로 나누는 표준 기법입니다. 앱은 여전히 <code>logs</code> 하나에 쿼리하지만, 실제 데이터는 <code>logs_2024_01</code>, <code>logs_2024_02</code>… 로 나뉘어 저장됩니다.</p>
+
+<div class="anim" data-steps="4" data-title="대량 DELETE vs 파티션 DROP — 같은 일, 전혀 다른 비용" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <line x1="390" y1="20" x2="390" y2="300" class="sv-line" stroke-dasharray="4 6"/>
+      <!-- left: single table DELETE -->
+      <text x="195" y="32" text-anchor="middle" class="sv-label" font-size="14">단일 테이블 + DELETE</text>
+      <rect x="60" y="50" width="270" height="130" rx="10" class="sv-box"/>
+      <text x="195" y="72" text-anchor="middle" class="sv-label sv-mono" font-size="12">logs (10억 행, 500GB)</text>
+      <rect x="75" y="85" width="240" height="26" rx="5" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+      <text x="195" y="103" text-anchor="middle" class="sv-label-sm">1월 데이터 (지울 대상)</text>
+      <rect x="75" y="118" width="240" height="26" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="195" y="136" text-anchor="middle" class="sv-label-sm">2월 데이터</text>
+      <rect x="75" y="151" width="240" height="22" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="195" y="167" text-anchor="middle" class="sv-label-sm">3월 데이터</text>
+
+      <g data-show="2">
+        <rect x="75" y="85" width="240" height="26" rx="5" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="195" y="103" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">수백만 dead tuple ☠</text>
+        <text x="195" y="210" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">DELETE = 행마다 xmax 마킹</text>
+        <text x="195" y="232" text-anchor="middle" class="sv-label-sm">→ Bloat 폭증 + WAL 대량 생성</text>
+        <text x="195" y="254" text-anchor="middle" class="sv-label-sm">→ 복제 지연 + VACUUM 몇 시간</text>
+      </g>
+
+      <!-- right: partitioned DROP -->
+      <text x="585" y="32" text-anchor="middle" class="sv-label" font-size="14">파티션 + DROP</text>
+      <rect x="450" y="50" width="270" height="36" rx="8" fill="none" stroke="var(--pg-soft)" stroke-width="1.6"/>
+      <text x="585" y="73" text-anchor="middle" class="sv-label sv-mono" font-size="12">logs (파티션 부모 — 껍데기)</text>
+      <rect x="450" y="100" width="80" height="60" rx="8" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+      <text x="490" y="126" text-anchor="middle" class="sv-label-sm sv-mono">2024_01</text>
+      <text x="490" y="144" text-anchor="middle" class="sv-label-sm">1월</text>
+      <rect x="545" y="100" width="80" height="60" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="585" y="126" text-anchor="middle" class="sv-label-sm sv-mono">2024_02</text>
+      <text x="585" y="144" text-anchor="middle" class="sv-label-sm">2월</text>
+      <rect x="640" y="100" width="80" height="60" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="680" y="126" text-anchor="middle" class="sv-label-sm sv-mono">2024_03</text>
+      <text x="680" y="144" text-anchor="middle" class="sv-label-sm">3월</text>
+
+      <g data-show="3">
+        <text x="490" y="190" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">DROP TABLE logs_2024_01;</text>
+        <line x1="455" y1="105" x2="525" y2="155" stroke="var(--ok)" stroke-width="3"/>
+        <line x1="525" y1="105" x2="455" y2="155" stroke="var(--ok)" stroke-width="3"/>
+      </g>
+      <g data-show="4">
+        <rect x="450" y="210" width="270" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="585" y="234" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">파일 unlink 수준 — ms 단위 완료 ⚡</text>
+        <text x="585" y="256" text-anchor="middle" class="sv-label-sm">dead tuple 0개 · WAL 거의 없음</text>
+        <text x="585" y="276" text-anchor="middle" class="sv-label-sm">인덱스도 같이 사라짐</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>같은 과제입니다: "1월 데이터를 지워라". 왼쪽은 10억 행 단일 테이블, 오른쪽은 월별 파티션 구조입니다.</p>
+    <p>단일 테이블의 <code>DELETE</code>는 수백만 행 각각에 xmax를 마킹합니다. <b style="color:var(--danger)">dead tuple 폭증 → Bloat, WAL 대량 생성 → 복제 지연, 그리고 VACUUM이 몇 시간</b> — 삭제 한 번이 클러스터 전체를 흔듭니다.</p>
+    <p>파티션 구조에서는 <code>DROP TABLE logs_2024_01</code> 한 줄이면 끝. 1월 파티션 <b>파일 자체를 unlink</b>합니다.</p>
+    <p>결과: <b style="color:var(--ok)">ms 단위 완료, dead tuple 0, WAL 거의 없음, 인덱스도 함께 소멸</b>. 파티셔닝은 "쿼리 가속 기능"이기 전에 <b>거대 테이블을 운영 가능하게 만드는 기능</b>입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">12.2 Declarative Partitioning — RANGE / LIST / HASH</h2>
+
+<p>v10부터 도입된 <strong>Declarative Partitioning</strong>이 현재 표준입니다. 파티션 키를 테이블 정의에 선언하면 INSERT 라우팅을 엔진이 알아서 합니다. (v9 시절의 상속+트리거 방식은 유지비용이 극심해 신규 도입 이유가 없습니다.)</p>
+
+<pre><code><span class="c">-- RANGE: 시간/ID 범위 — 가장 일반적</span>
+<span class="k">CREATE TABLE</span> orders (
+    order_id   bigserial,
+    created_at timestamptz <span class="k">NOT NULL</span>,
+    amount     numeric(12,2),
+    <span class="k">PRIMARY KEY</span> (order_id, created_at)   <span class="c">-- ⚠️ PK에 파티션 키 포함 필수!</span>
+) <span class="k">PARTITION BY RANGE</span> (created_at);
+
+<span class="k">CREATE TABLE</span> orders_2024_q1 <span class="k">PARTITION OF</span> orders
+    <span class="k">FOR VALUES FROM</span> (<span class="s">'2024-01-01'</span>) <span class="k">TO</span> (<span class="s">'2024-04-01'</span>);  <span class="c">-- [from, to) 반개구간</span>
+
+<span class="c">-- LIST: 이산 값 (국가, 테넌트)</span>
+<span class="k">CREATE TABLE</span> events_kr <span class="k">PARTITION OF</span> events <span class="k">FOR VALUES IN</span> (<span class="s">'KR'</span>);
+<span class="k">CREATE TABLE</span> events_etc <span class="k">PARTITION OF</span> events <span class="k">DEFAULT</span>;      <span class="c">-- 캐치올 (v11+)</span>
+
+<span class="c">-- HASH: 균등 분산 (v11+) — 등가 조건(=)에서만 pruning!</span>
+<span class="k">CREATE TABLE</span> users_p0 <span class="k">PARTITION OF</span> users
+    <span class="k">FOR VALUES WITH</span> (<span class="k">MODULUS</span> <span class="n">4</span>, <span class="k">REMAINDER</span> <span class="n">0</span>);</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>방식</th><th>적합한 키</th><th>대표 용도</th><th>주의</th></tr></thead>
+  <tbody>
+    <tr><td><code>RANGE</code></td><td>시간, 연속 ID</td><td>로그·주문 월별 관리</td><td>새 파티션 미리 생성 필요</td></tr>
+    <tr><td><code>LIST</code></td><td>국가, 테넌트, 상태</td><td>지역·테넌트 분리</td><td>DEFAULT 파티션 관리</td></tr>
+    <tr><td><code>HASH</code></td><td>자연 범위가 없는 값</td><td>균등 분산, 샤딩 흉내</td><td>범위 쿼리에서 pruning 불가</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">UNIQUE/PK에는 파티션 키가 반드시 포함되어야 한다</div>
+    <p>글로벌 인덱스가 없기 때문에 <code>order_id bigserial UNIQUE</code>만으로는 에러가 납니다. <code>UNIQUE (order_id, created_at)</code>처럼 복합으로 만들거나, 전역 유일성이 꼭 필요하면 애플리케이션에서 UUID/ULID로 보장해야 합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">12.3 Partition Pruning — 필요한 서랍만 연다</h2>
+
+<p>파티셔닝의 쿼리 성능 이득은 대부분 <strong>Pruning(가지치기)</strong>에서 나옵니다. 플래너가 WHERE 조건을 각 파티션의 범위와 비교해서, <em>관련 없는 파티션을 스캔 대상에서 아예 제외</em>하는 것입니다.</p>
+
+<div class="anim" data-steps="4" data-title="Partition Pruning — 쿼리가 필요한 파티션만 스캔" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <!-- query -->
+      <rect x="180" y="20" width="420" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="390" y="48" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE created_at &gt;= '2024-06-01' AND &lt; '2024-07-01'</text>
+
+      <!-- planner -->
+      <g data-show="2-4">
+        <rect x="290" y="96" width="200" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="390" y="118" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--purple)">Planner: 범위 비교</text>
+        <text x="390" y="133" text-anchor="middle" class="sv-label-sm">"6월은 어느 파티션에?"</text>
+        <path d="M 390 66 L 390 92" class="sv-arrow flow-line"/>
+      </g>
+
+      <!-- partitions -->
+      <rect x="60" y="180" width="150" height="80" rx="10" class="sv-box"/>
+      <text x="135" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">orders_2024_q1</text>
+      <text x="135" y="228" text-anchor="middle" class="sv-label-sm">1~3월</text>
+      <rect x="240" y="180" width="150" height="80" rx="10" class="sv-box"/>
+      <text x="315" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">orders_2024_q2</text>
+      <text x="315" y="228" text-anchor="middle" class="sv-label-sm">4~6월</text>
+      <rect x="420" y="180" width="150" height="80" rx="10" class="sv-box"/>
+      <text x="495" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">orders_2024_q3</text>
+      <text x="495" y="228" text-anchor="middle" class="sv-label-sm">7~9월</text>
+      <rect x="600" y="180" width="150" height="80" rx="10" class="sv-box"/>
+      <text x="675" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">orders_2024_q4</text>
+      <text x="675" y="228" text-anchor="middle" class="sv-label-sm">10~12월</text>
+
+      <!-- step3: prune others -->
+      <g data-show="3">
+        <g opacity="0.85">
+          <rect x="60" y="180" width="150" height="80" rx="10" fill="color-mix(in srgb, var(--text-faint) 10%, transparent)" stroke="var(--text-faint)" stroke-dasharray="5 4"/>
+          <text x="135" y="248" text-anchor="middle" class="sv-label-sm">✂️ 제외</text>
+          <rect x="420" y="180" width="150" height="80" rx="10" fill="color-mix(in srgb, var(--text-faint) 10%, transparent)" stroke="var(--text-faint)" stroke-dasharray="5 4"/>
+          <text x="495" y="248" text-anchor="middle" class="sv-label-sm">✂️ 제외</text>
+          <rect x="600" y="180" width="150" height="80" rx="10" fill="color-mix(in srgb, var(--text-faint) 10%, transparent)" stroke="var(--text-faint)" stroke-dasharray="5 4"/>
+          <text x="675" y="248" text-anchor="middle" class="sv-label-sm">✂️ 제외</text>
+        </g>
+        <rect x="240" y="180" width="150" height="80" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="315" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">orders_2024_q2</text>
+        <text x="315" y="230" text-anchor="middle" class="sv-label" font-size="12" fill="var(--ok)">✅ 이것만 스캔!</text>
+        <path d="M 355 140 Q 330 160 320 176" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr12a)"/>
+      </g>
+
+      <!-- step4: result -->
+      <g data-show="4">
+        <rect x="180" y="280" width="420" height="34" rx="8" class="sv-box"/>
+        <text x="390" y="302" text-anchor="middle" class="sv-label-sm">스캔량 1/4 이하 · EXPLAIN에 q2만 등장 — 함수로 감싼 조건은 pruning 실패 주의!</text>
+      </g>
+      <defs>
+        <marker id="arr12a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>"6월 주문만 집계해줘"라는 쿼리가 들어옵니다. 테이블은 분기별 4개 파티션으로 나뉘어 있습니다.</p>
+    <p>플래너가 WHERE 조건의 범위(6월)를 각 파티션의 경계(<code>FOR VALUES FROM ... TO ...</code>)와 비교합니다.</p>
+    <p>6월은 q2(4~6월)에만 존재하므로 <b>q1, q3, q4는 계획에서 아예 제거</b>됩니다. 실행 시점에 결정되는 파라미터 조건도 v11+부터는 execution-time pruning으로 처리됩니다.</p>
+    <p>결과: 스캔량이 1/4 이하로. 단, <code>to_char(created_at,'YYYY-MM') = '2024-06'</code>처럼 <b>파티션 키를 함수로 감싸면 pruning이 안 됩니다</b> — 반드시 키 원본에 대한 범위 조건으로 쓰세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- Pruning 확인: Append 아래 파티션이 하나만 나오면 성공</span>
+<span class="k">EXPLAIN</span> <span class="k">SELECT</span> <span class="f">count</span>(*) <span class="k">FROM</span> orders
+<span class="k">WHERE</span> created_at &gt;= <span class="s">'2024-06-01'</span> <span class="k">AND</span> created_at &lt; <span class="s">'2024-07-01'</span>;
+<span class="c">--  Aggregate
+--    -&gt;  Seq Scan on orders_2024_q2    ← 1개만 스캔!</span>
+
+<span class="c">-- ❌ Pruning 실패: 함수 래핑</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> <span class="f">to_char</span>(created_at, <span class="s">'YYYY-MM'</span>) = <span class="s">'2024-06'</span>;</code></pre>
+
+<h2 id="s4">12.4 월별 로테이션 — 파티션의 일생</h2>
+
+<p>시계열 파티션 운영의 정석은 <strong>"미리 만들고, 오래되면 분리해서 버린다"</strong>는 컨베이어 벨트입니다. 순정 PostgreSQL은 파티션을 자동으로 만들어주지 않으므로, 이 로테이션을 cron/<code>pg_cron</code> 또는 <code>pg_partman</code>으로 자동화합니다.</p>
+
+<div class="anim" data-steps="5" data-title="월별 파티션 로테이션 — premake부터 DROP까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <rect x="30" y="40" width="720" height="50" rx="9" fill="none" stroke="var(--pg-soft)" stroke-width="1.6"/>
+      <text x="390" y="70" text-anchor="middle" class="sv-label sv-mono" font-size="13">logs (파티션 부모)</text>
+
+      <!-- partitions row -->
+      <rect x="60" y="130" width="140" height="76" rx="10" fill="color-mix(in srgb, var(--text-faint) 12%, transparent)" stroke="var(--text-faint)"/>
+      <text x="130" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2024_10</text>
+      <text x="130" y="178" text-anchor="middle" class="sv-label-sm">오래됨 (읽기만)</text>
+      <rect x="230" y="130" width="140" height="76" rx="10" class="sv-box"/>
+      <text x="300" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2024_11</text>
+      <text x="300" y="178" text-anchor="middle" class="sv-label-sm">읽기 위주</text>
+      <rect x="400" y="130" width="140" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+      <text x="470" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2024_12</text>
+      <text x="470" y="178" text-anchor="middle" class="sv-label" font-size="12" fill="var(--ok)">🔥 활성 쓰기</text>
+
+      <!-- step1: premake -->
+      <g data-show="1">
+        <rect x="570" y="130" width="140" height="76" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="6 4"/>
+        <text x="640" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2025_01</text>
+        <text x="640" y="178" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">✨ premake (미리 생성)</text>
+      </g>
+
+      <!-- step2: month rolls, writes move -->
+      <g data-show="2">
+        <path d="M 470 120 Q 550 100 630 124" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr12b)"/>
+        <text x="553" y="102" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">해가 바뀌면 INSERT가 자동 라우팅</text>
+      </g>
+      <g data-show="2-5">
+        <rect x="570" y="130" width="140" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="640" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2025_01</text>
+        <text x="640" y="178" text-anchor="middle" class="sv-label" font-size="12" fill="var(--ok)">🔥 활성 쓰기</text>
+      </g>
+
+      <!-- step3: detach oldest -->
+      <g data-show="3">
+        <rect x="60" y="130" width="140" height="76" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="130" y="158" text-anchor="middle" class="sv-label sv-mono" font-size="12">2024_10</text>
+        <text x="130" y="178" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">DETACH CONCURRENTLY</text>
+        <path d="M 130 126 Q 130 108 150 96" stroke="var(--warn)" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
+        <text x="130" y="230" text-anchor="middle" class="sv-label-sm">부모와의 연결만 끊김 (락 거의 없음, v14+)</text>
+      </g>
+
+      <!-- step4: archive & drop -->
+      <g data-show="4">
+        <path d="M 130 210 Q 130 250 200 265" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr12c)"/>
+        <rect x="205" y="248" width="180" height="40" rx="8" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.4"/>
+        <text x="295" y="273" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">📦 S3 아카이브 (pg_dump)</text>
+        <text x="470" y="270" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">→ DROP TABLE logs_2024_10; ⚡</text>
+      </g>
+
+      <!-- step5: automation -->
+      <g data-show="5">
+        <rect x="530" y="240" width="220" height="60" rx="10" class="sv-box"/>
+        <text x="640" y="264" text-anchor="middle" class="sv-label" font-size="12.5">🤖 자동화</text>
+        <text x="640" y="286" text-anchor="middle" class="sv-label-sm sv-mono">pg_partman + pg_cron</text>
+      </g>
+      <defs>
+        <marker id="arr12b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr12c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>12월이 활성 쓰기 파티션인 시점, 다음 달 파티션 <code>2025_01</code>을 <b style="color:var(--accent)">미리 생성(premake)</b>합니다. 미리 안 만들어두면 1월 1일 0시에 INSERT가 실패합니다!</p>
+    <p>해가 바뀌면 새 행들이 파티션 키 값에 따라 <b style="color:var(--ok)">자동으로 2025_01에 라우팅</b>됩니다. 앱 코드는 아무것도 바꾸지 않습니다.</p>
+    <p>보관 기간이 지난 가장 오래된 파티션은 <code>DETACH PARTITION ... CONCURRENTLY</code>(v14+)로 <b style="color:var(--warn)">부모와의 연결만 끊습니다</b>. 데이터는 독립 테이블로 그대로 남습니다.</p>
+    <p>분리된 테이블을 <b style="color:var(--purple)">S3 등에 아카이브</b>한 뒤 <code>DROP TABLE</code> — ms 단위로 공간이 반환됩니다. DELETE 대비 Bloat도 WAL 폭증도 없습니다.</p>
+    <p>이 사이클(premake → 활성 → 읽기 위주 → detach → drop)을 <b>pg_partman + pg_cron</b>으로 자동화하는 것이 운영 표준입니다. 13장에서 이 extension들을 다룹니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- pg_partman으로 로테이션 자동화 (13장 참조)</span>
+<span class="k">SELECT</span> partman.<span class="f">create_parent</span>(
+    p_parent_table =&gt; <span class="s">'public.logs'</span>,
+    p_control      =&gt; <span class="s">'ts'</span>,
+    p_interval     =&gt; <span class="s">'daily'</span>,
+    p_premake      =&gt; <span class="n">7</span>            <span class="c">-- 7일치 미리 생성</span>
+);
+<span class="c">-- pg_cron으로 주기 실행</span>
+<span class="k">CALL</span> partman.<span class="f">run_maintenance_proc</span>();</code></pre>
+
+<h2 id="s5">12.5 함정 총정리 — 도입 전 체크</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>함정</th><th>내용</th><th>대응</th></tr></thead>
+  <tbody>
+    <tr><td>글로벌 인덱스 없음</td><td>부모에 CREATE INDEX 하면 파티션마다 로컬 인덱스가 각각 생성</td><td>설계 시 인지, UNIQUE는 파티션 키 포함</td></tr>
+    <tr><td>파티션 수 과다</td><td>플래너 계획 시간이 파티션 수에 비례해 증가</td><td>경험칙 <strong>1,000개 이하</strong> 유지</td></tr>
+    <tr><td>DEFAULT 파티션 방치</td><td>데이터가 쌓이면 새 파티션 ATTACH 시 긴 락</td><td>이상값 감지용으로만, 쌓이면 즉시 이관</td></tr>
+    <tr><td>파티션 키 UPDATE</td><td>v11+는 DELETE+INSERT로 재라우팅되지만 비용 큼</td><td>변경되지 않는 컬럼을 키로 선택</td></tr>
+    <tr><td>HASH + 범위 쿼리</td><td><code>BETWEEN</code>에서 pruning 불가</td><td>등가 조건 워크로드에만 HASH</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">ATTACH를 빠르게 하는 요령</div>
+    <p>독립 테이블을 파티션으로 편입(<code>ATTACH PARTITION</code>)할 때, 미리 같은 범위의 <code>CHECK</code> 제약을 만들어 <code>VALIDATE</code>까지 해두면 ATTACH 시 전체 스캔을 생략합니다. 대량 데이터 이관의 표준 패턴입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">3개월 지난 로그를 정기 삭제해야 합니다. 파티셔닝이 대량 DELETE보다 압도적으로 유리한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">DELETE보다 DROP이 더 강력한 락을 잡아서 안전하기 때문</button>
+    <button type="button" data-correct>DROP PARTITION은 파일 unlink 수준이라 dead tuple과 WAL을 거의 만들지 않기 때문</button>
+    <button type="button">파티션에는 인덱스가 없어서 삭제가 빠르기 때문</button>
+    <button type="button">DELETE는 파티션 테이블에서 아예 실행할 수 없기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ DELETE는 행마다 xmax를 마킹해 수백만 dead tuple + 대량 WAL을 만들고 VACUUM 부담과 복제 지연으로 이어집니다. DROP PARTITION은 파일을 통째로 지우므로 ms 단위에 끝나고, 로컬 인덱스도 함께 사라집니다. 파티션에도 인덱스는 정상적으로 존재하며(로컬 인덱스), DELETE도 실행 가능합니다 — 비효율적일 뿐입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">월별 RANGE 파티션 테이블에서 다음 중 Partition Pruning이 <strong>동작하지 않는</strong> 쿼리는?</div>
+  <div class="quiz-opts">
+    <button type="button"><code>WHERE created_at >= '2024-06-01' AND created_at < '2024-07-01'</code></button>
+    <button type="button" data-correct><code>WHERE to_char(created_at, 'YYYY-MM') = '2024-06'</code></button>
+    <button type="button"><code>WHERE created_at = '2024-06-15 10:00'</code></button>
+  </div>
+  <div class="quiz-expl">✅ 파티션 키를 <code>to_char()</code> 같은 함수로 감싸면 플래너가 파티션 경계와 비교할 수 없어 <strong>모든 파티션을 스캔</strong>합니다. pruning을 살리려면 키 원본 컬럼에 대한 범위/등가 조건으로 작성해야 합니다. EXPLAIN에서 파티션이 전부 나열된다면 이 패턴부터 의심하세요.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch12_partitioning.md" target="_blank" rel="noopener">chapters/ch12_partitioning.md</a> — Sub-partitioning, DEFAULT 파티션 이관 패턴, TimescaleDB 비교, 버전별 기능 매트릭스, 진단 쿼리 모음이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch11.html"><span class="dir">← 이전</span><br><span class="title">11장. 백업과 PITR 복구</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch13.html"><span class="dir">다음 →</span><br><span class="title">13장. Extension 생태계</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

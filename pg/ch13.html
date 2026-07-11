@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13장. Extension 생태계 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch13">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>13장. Extension 생태계 — 같은 엔진, 무한한 변신</h1>
+<p class="lead">PostgreSQL의 진짜 강점은 엔진이 아니라 생태계입니다. 같은 바이너리가 extension에 따라 시계열 DB도, 벡터 검색 엔진도, 지리정보 시스템도 됩니다 — 플러그인이 아니라 "코어에 직접 연결되는 일급 시민"이기 때문입니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 2장 아키텍처</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Extension이 훅(Hook)으로 코어에 연결되는 구조 ② shared_preload_libraries와 CREATE EXTENSION의 차이 ③ 반드시 켜야 할 pg_stat_statements 활성화 흐름 ④ 목적별 대표 extension 지도</p>
+  </div>
+</div>
+
+<h2 id="s1">13.1 Extension은 어떻게 코어에 "끼어드는가"</h2>
+
+<p>PostgreSQL 코어에는 쿼리 처리 경로 곳곳에 <strong>훅(Hook)</strong>이라는 함수 포인터가 심어져 있습니다. 평소에는 비어 있지만, extension이 자기 함수를 등록하면 <em>모든 쿼리가 그 함수를 통과</em>하게 됩니다. 콘센트(훅)에 플러그(extension)를 꽂는 셈이죠. 이 밖에도 SPI(내부 SQL 실행), FDW(외부 데이터 소스), Index AM(새 인덱스 타입 — pgvector의 HNSW가 이것) 같은 공식 API가 열려 있습니다.</p>
+
+<div class="anim" data-steps="4" data-title="훅(Hook) — extension이 쿼리 경로에 끼어드는 구조" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <!-- core pipeline -->
+      <text x="120" y="34" text-anchor="middle" class="sv-label" font-size="13">PostgreSQL 코어</text>
+      <rect x="40" y="50" width="160" height="44" rx="9" class="sv-box"/>
+      <text x="120" y="77" text-anchor="middle" class="sv-label sv-mono" font-size="12">Parser</text>
+      <rect x="40" y="120" width="160" height="44" rx="9" class="sv-box"/>
+      <text x="120" y="147" text-anchor="middle" class="sv-label sv-mono" font-size="12">Planner</text>
+      <rect x="40" y="190" width="160" height="44" rx="9" class="sv-box"/>
+      <text x="120" y="217" text-anchor="middle" class="sv-label sv-mono" font-size="12">Executor</text>
+      <path d="M 120 94 L 120 116" class="sv-arrow"/>
+      <path d="M 120 164 L 120 186" class="sv-arrow"/>
+
+      <!-- hooks -->
+      <circle cx="200" cy="142" r="7" fill="none" stroke="var(--warn)" stroke-width="2"/>
+      <text x="222" y="132" class="sv-label-sm" fill="var(--warn)">planner_hook</text>
+      <circle cx="200" cy="212" r="7" fill="none" stroke="var(--warn)" stroke-width="2"/>
+      <text x="222" y="202" class="sv-label-sm" fill="var(--warn)">ExecutorEnd_hook</text>
+
+      <g data-show="1-1">
+        <text x="330" y="146" class="sv-label-sm">← 훅 = 비어 있는 함수 포인터 (콘센트 🔌)</text>
+      </g>
+
+      <!-- step2: preload attaches -->
+      <g data-show="2">
+        <rect x="480" y="60" width="260" height="70" rx="10" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="610" y="87" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">pg_stat_statements.so</text>
+        <text x="610" y="108" text-anchor="middle" class="sv-label-sm">서버 시작 시 preload → 훅에 함수 등록</text>
+        <path d="M 480 110 Q 330 140 210 210" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr13a)"/>
+      </g>
+      <g data-show="2-4">
+        <circle cx="200" cy="212" r="7" fill="var(--purple)" stroke="var(--purple)" stroke-width="2"/>
+      </g>
+
+      <!-- step3: query flows through -->
+      <g data-show="3">
+        <path d="M 120 30 L 120 46" stroke="var(--ok)" stroke-width="2.5" class="flow-line" marker-end="url(#arr13b)"/>
+        <text x="60" y="26" class="sv-label-sm" fill="var(--ok)">쿼리 실행</text>
+        <path d="M 207 217 Q 320 250 430 250" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr13b)"/>
+        <rect x="435" y="225" width="305" height="50" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="587" y="246" text-anchor="middle" class="sv-label-sm">실행이 끝날 때마다 extension 함수가 호출됨</text>
+        <text x="587" y="264" text-anchor="middle" class="sv-label-sm sv-mono">실행 시간·호출 횟수를 공유 메모리에 누적</text>
+      </g>
+
+      <!-- step4: view -->
+      <g data-show="4">
+        <rect x="480" y="140" width="260" height="56" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="610" y="163" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">SELECT * FROM pg_stat_statements</text>
+        <text x="610" y="184" text-anchor="middle" class="sv-label-sm">누적 통계를 SQL 뷰로 조회</text>
+        <text x="390" y="305" text-anchor="middle" class="sv-label-sm">코어 소스는 한 줄도 안 고쳤다 — 이것이 "일급 시민" 확장의 의미</text>
+      </g>
+      <defs>
+        <marker id="arr13a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+        <marker id="arr13b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>코어의 쿼리 파이프라인(Parser → Planner → Executor) 곳곳에 <b style="color:var(--warn)">훅</b>이 있습니다. 평소엔 비어 있는 함수 포인터 — 콘센트만 있고 아무것도 안 꽂힌 상태입니다.</p>
+    <p>서버 시작 시 <code>shared_preload_libraries</code>에 지정된 <code>pg_stat_statements.so</code>가 로드되며 <b style="color:var(--purple)">자기 함수를 훅에 등록</b>합니다. 플러그가 꽂혔습니다.</p>
+    <p>이후 <b>모든 쿼리</b>가 실행을 마칠 때마다 훅에 꽂힌 extension 함수가 호출됩니다. pg_stat_statements는 이 순간 실행 시간과 호출 횟수를 공유 메모리에 누적합니다.</p>
+    <p>사용자는 <code>pg_stat_statements</code> 뷰로 누적 통계를 조회합니다. <b>코어 소스는 한 줄도 수정하지 않고</b> 엔진의 동작을 확장했습니다 — 이것이 훅 아키텍처의 힘입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">13.2 두 개의 스위치 — preload와 CREATE EXTENSION</h2>
+
+<p>Extension 활성화에는 종류에 따라 <strong>두 단계의 스위치</strong>가 있습니다. 이걸 혼동하면 "설치했는데 왜 안 되지?"의 늪에 빠집니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>스위치</th><th>시점</th><th>하는 일</th><th>대상</th></tr></thead>
+  <tbody>
+    <tr><td><code>shared_preload_libraries</code></td><td>서버 시작 시 (재시작 필요)</td><td>.so를 프로세스에 로드, 훅 등록, 공유 메모리 확보</td><td>pg_stat_statements, auto_explain, pgaudit, pg_cron 등</td></tr>
+    <tr><td><code>CREATE EXTENSION</code></td><td>언제든 (DB 단위)</td><td>SQL 객체(뷰·함수·타입·연산자) 생성</td><td>모든 extension — 단 <strong>DB마다 따로</strong> 실행</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c"># ① postgresql.conf — 프로세스 레벨 (재시작 필요)</span>
+shared_preload_libraries = <span class="s">'pg_stat_statements,auto_explain'</span>
+pg_stat_statements.max = <span class="n">10000</span>
+pg_stat_statements.track = all
+
+<span class="c">-- ② 재시작 후, 사용할 DB에서 — SQL 객체 생성</span>
+<span class="k">CREATE EXTENSION</span> pg_stat_statements;
+
+<span class="c">-- 확인: 설치 가능/설치된 extension</span>
+<span class="k">SELECT</span> name, default_version, installed_version
+<span class="k">FROM</span> pg_available_extensions <span class="k">ORDER BY</span> name;</code></pre>
+
+<div class="anim" data-steps="4" data-title="pg_stat_statements 활성화 — conf부터 첫 조회까지" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 300">
+      <!-- step boxes in a flow -->
+      <rect x="30" y="60" width="170" height="80" rx="10" class="sv-box"/>
+      <text x="115" y="88" text-anchor="middle" class="sv-label sv-mono" font-size="12">postgresql.conf</text>
+      <text x="115" y="110" text-anchor="middle" class="sv-label-sm sv-mono">shared_preload_</text>
+      <text x="115" y="126" text-anchor="middle" class="sv-label-sm sv-mono">libraries = '...'</text>
+
+      <rect x="240" y="60" width="160" height="80" rx="10" class="sv-box"/>
+      <text x="320" y="94" text-anchor="middle" class="sv-label" font-size="12.5">🔄 서버 재시작</text>
+      <text x="320" y="116" text-anchor="middle" class="sv-label-sm">.so 로드 + 훅 등록</text>
+
+      <rect x="440" y="60" width="160" height="80" rx="10" class="sv-box"/>
+      <text x="520" y="88" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">CREATE EXTENSION</text>
+      <text x="520" y="110" text-anchor="middle" class="sv-label-sm">뷰·함수 생성</text>
+      <text x="520" y="126" text-anchor="middle" class="sv-label-sm">(DB마다!)</text>
+
+      <rect x="640" y="60" width="110" height="80" rx="10" class="sv-box"/>
+      <text x="695" y="94" text-anchor="middle" class="sv-label" font-size="12.5">📊 조회</text>
+      <text x="695" y="116" text-anchor="middle" class="sv-label-sm">누적 통계</text>
+
+      <g data-show="1-1"><rect x="30" y="60" width="170" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="115" y="88" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--accent)">postgresql.conf</text>
+        <text x="115" y="110" text-anchor="middle" class="sv-label-sm sv-mono">shared_preload_</text>
+        <text x="115" y="116" text-anchor="middle" class="sv-label-sm sv-mono"> </text>
+        <text x="115" y="126" text-anchor="middle" class="sv-label-sm sv-mono">libraries = '...'</text>
+      </g>
+      <g data-show="2">
+        <path d="M 205 100 L 235 100" class="sv-arrow flow-line" marker-end="url(#arr13c)"/>
+        <rect x="240" y="60" width="160" height="80" rx="10" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="2"/>
+        <text x="320" y="94" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--purple)">🔄 서버 재시작</text>
+        <text x="320" y="116" text-anchor="middle" class="sv-label-sm">.so 로드 + 훅 등록</text>
+      </g>
+      <g data-show="3">
+        <path d="M 405 100 L 435 100" class="sv-arrow flow-line" marker-end="url(#arr13c)"/>
+        <rect x="440" y="60" width="160" height="80" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="520" y="88" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">CREATE EXTENSION</text>
+        <text x="520" y="110" text-anchor="middle" class="sv-label-sm">뷰·함수 생성</text>
+        <text x="520" y="126" text-anchor="middle" class="sv-label-sm">(DB마다!)</text>
+      </g>
+      <g data-show="4">
+        <path d="M 605 100 L 635 100" class="sv-arrow flow-line" marker-end="url(#arr13c)"/>
+        <rect x="80" y="190" width="620" height="76" rx="10" fill="var(--bg-inset)" stroke="var(--border)" stroke-width="1.4"/>
+        <text x="390" y="216" text-anchor="middle" class="sv-label sv-mono" font-size="12">SELECT query, calls, mean_exec_time FROM pg_stat_statements</text>
+        <text x="390" y="238" text-anchor="middle" class="sv-label sv-mono" font-size="12">ORDER BY total_exec_time DESC LIMIT 20;</text>
+        <text x="390" y="258" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">→ "우리 DB에서 제일 무거운 쿼리 TOP 20"이 한 방에</text>
+      </g>
+      <defs>
+        <marker id="arr13c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>① <code>postgresql.conf</code>의 <code>shared_preload_libraries</code>에 extension을 추가합니다. 이 설정만으로는 아직 아무 일도 일어나지 않습니다.</p>
+    <p>② <b style="color:var(--purple)">서버를 재시작</b>하면 .so가 모든 프로세스에 로드되고 훅이 등록됩니다. 이때부터 통계 수집은 시작되지만, 조회할 SQL 객체가 아직 없습니다.</p>
+    <p>③ 대상 DB에서 <code>CREATE EXTENSION pg_stat_statements;</code>를 실행하면 뷰와 함수가 생성됩니다. extension은 <b>DB 단위</b>라 사용할 DB마다 실행해야 합니다.</p>
+    <p>④ 이제 <code>pg_stat_statements</code> 뷰에서 "가장 무거운 쿼리 TOP 20"을 한 번에 뽑을 수 있습니다. 운영 DB라면 <b>설치하지 않을 이유가 없는</b> 필수 extension입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">"CREATE EXTENSION 했는데 안 돼요"의 90%</div>
+    <p>preload가 필요한 extension(<code>pg_stat_statements</code>, <code>auto_explain</code>, <code>pgaudit</code>, <code>pg_cron</code>)을 <code>shared_preload_libraries</code>에 넣지 않았거나 재시작을 빠뜨린 경우입니다. 반대로 <code>pg_trgm</code>, <code>postgis</code>, <code>pgvector</code> 등은 preload 없이 CREATE EXTENSION만으로 동작합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">13.3 대표 Extension 지도 — 목적별 카드</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>📊 pg_stat_statements</h4>
+    <p>쿼리를 정규화해 실행 횟수·시간·버퍼 히트를 누적. <strong>운영 환경 1순위 설치.</strong> preload 필요.</p>
+  </div>
+  <div class="card">
+    <h4>🔍 auto_explain</h4>
+    <p>임계값(예: 1초) 이상 걸린 쿼리의 실행 계획을 로그에 자동 기록. 재현 안 되는 장애의 결정적 증거. preload 필요.</p>
+  </div>
+  <div class="card">
+    <h4>🛡️ pgaudit</h4>
+    <p>누가 언제 어떤 SQL을 실행했는지 감사 로그. 금융·공공·의료 규제 대응 필수. preload 필요.</p>
+  </div>
+  <div class="card">
+    <h4>🔤 pg_trgm</h4>
+    <p><code>LIKE '%foo%'</code>와 오타 허용 검색을 GIN 인덱스로 가속. <code>similarity()</code> 유사도 계산.</p>
+  </div>
+  <div class="card">
+    <h4>🌍 PostGIS</h4>
+    <p>지리정보 표준. 좌표계 변환, 공간 조인, 반경 검색(<code>ST_DWithin</code>), KNN까지.</p>
+  </div>
+  <div class="card">
+    <h4>🧠 pgvector</h4>
+    <p>LLM 임베딩 유사도 검색. v0.5+의 HNSW 인덱스로 실전 수준 속도. <code>&lt;=&gt;</code> 코사인 거리 연산자.</p>
+  </div>
+  <div class="card">
+    <h4>⏰ pg_cron</h4>
+    <p>DB 안에서 cron 문법으로 SQL 스케줄링. 파티션 생성·VACUUM 등 유지보수 자동화. preload 필요.</p>
+  </div>
+  <div class="card">
+    <h4>📅 pg_partman</h4>
+    <p>12장의 파티션 생성/삭제 로테이션을 자동화. pg_cron과 짝으로 쓰는 것이 표준.</p>
+  </div>
+  <div class="card">
+    <h4>📈 TimescaleDB</h4>
+    <p>시계열 특화 — hypertable 자동 파티셔닝, 압축, 연속 집계. 라이선스(Apache 2.0/TSL) 확인 필수.</p>
+  </div>
+  <div class="card">
+    <h4>🌐 Citus</h4>
+    <p>테이블을 여러 워커 노드로 분산(샤딩)해 스케일 아웃. 멀티테넌트 SaaS에 적합.</p>
+  </div>
+  <div class="card">
+    <h4>🚪 pgBouncer</h4>
+    <p>(extension은 아니지만) 커넥션 풀링의 사실상 표준. transaction 모드가 일반적 선택. 14장 참조.</p>
+  </div>
+  <div class="card">
+    <h4>🔧 pg_repack</h4>
+    <p>VACUUM FULL 없이 무중단으로 테이블 재구성 — Bloat 제거의 운영 표준. 8장 참조.</p>
+  </div>
+</div>
+
+<p>실무에서 자주 쓰는 조합을 외워두면 아키텍처 결정이 빨라집니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>목적</th><th>추천 조합</th></tr></thead>
+  <tbody>
+    <tr><td>기본 모니터링</td><td><code>pg_stat_statements</code> + <code>auto_explain</code></td></tr>
+    <tr><td>대량 데이터 관리</td><td><code>pg_partman</code> + <code>pg_cron</code></td></tr>
+    <tr><td>전문/유사 검색</td><td><code>pg_trgm</code> + <code>btree_gin</code></td></tr>
+    <tr><td>AI/임베딩</td><td><code>pgvector</code> + <code>pg_trgm</code> (하이브리드 검색)</td></tr>
+    <tr><td>규제 대응</td><td><code>pgaudit</code> + <code>pgcrypto</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s4">13.4 손으로 익히기 — pg_trgm과 pgvector 맛보기</h2>
+
+<pre><code><span class="c">-- pg_trgm: LIKE '%…%'를 인덱스 스캔으로</span>
+<span class="k">CREATE EXTENSION</span> pg_trgm;
+<span class="k">CREATE INDEX</span> <span class="k">ON</span> users <span class="k">USING</span> GIN (email gin_trgm_ops);
+
+<span class="k">SELECT</span> <span class="f">similarity</span>(<span class="s">'postgres'</span>, <span class="s">'postgrez'</span>);   <span class="c">-- 0.625 (오타 유사도)</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> users <span class="k">WHERE</span> email <span class="k">LIKE</span> <span class="s">'%@danble.co%'</span>;  <span class="c">-- 이제 인덱스 사용!</span>
+
+<span class="c">-- pgvector: 임베딩 유사도 top-5</span>
+<span class="k">CREATE EXTENSION</span> vector;
+<span class="k">CREATE TABLE</span> docs (id bigserial, content text, embedding vector(<span class="n">1536</span>));
+<span class="k">CREATE INDEX</span> <span class="k">ON</span> docs <span class="k">USING</span> HNSW (embedding vector_cosine_ops);
+
+<span class="k">SELECT</span> id, <span class="n">1</span> - (embedding &lt;=&gt; :q) <span class="k">AS</span> similarity
+<span class="k">FROM</span> docs <span class="k">ORDER BY</span> embedding &lt;=&gt; :q <span class="k">LIMIT</span> <span class="n">5</span>;</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">메이저 업그레이드 전 체크</div>
+    <p><code>pg_upgrade</code>로 PostgreSQL을 올릴 때는 source에 설치된 모든 extension의 <strong>동일 버전이 target에도 준비</strong>되어 있어야 합니다. PostGIS·TimescaleDB는 자체 업그레이드 절차가 복잡하니 반드시 해당 프로젝트 가이드를 따르세요. <code>shared_preload_libraries</code>도 새 서버 conf에 별도로 옮겨야 합니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q"><code>CREATE EXTENSION pg_stat_statements;</code>를 실행했는데 뷰에 통계가 쌓이지 않습니다. 가장 유력한 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">CREATE EXTENSION을 superuser가 아닌 계정으로 실행했다</button>
+    <button type="button" data-correct>shared_preload_libraries에 등록하지 않았거나 등록 후 서버를 재시작하지 않았다</button>
+    <button type="button">pg_stat_statements는 v16부터 코어에 내장되어 CREATE EXTENSION이 불필요하다</button>
+    <button type="button">통계는 하루에 한 번만 갱신되므로 기다려야 한다</button>
+  </div>
+  <div class="quiz-expl">✅ pg_stat_statements는 훅 등록과 공유 메모리 확보를 위해 <strong>서버 시작 시 preload</strong>되어야 합니다. CREATE EXTENSION은 조회용 SQL 객체만 만들 뿐이라, preload 없이는 수집 자체가 일어나지 않습니다. "conf 등록 → 재시작 → CREATE EXTENSION" 순서를 기억하세요.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">Extension이 PostgreSQL 코어의 동작을 바꿀 수 있는 이유로 가장 정확한 설명은?</div>
+  <div class="quiz-opts">
+    <button type="button">extension 설치 시 코어 소스를 패치하고 재컴파일하기 때문</button>
+    <button type="button">extension이 별도 프로세스로 떠서 쿼리를 가로채기 때문</button>
+    <button type="button" data-correct>코어가 쿼리 경로 곳곳에 훅(함수 포인터)과 공식 API(SPI/FDW/Index AM)를 열어두었고, extension이 여기에 자기 코드를 등록하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ PostgreSQL은 planner_hook, ExecutorEnd_hook 같은 훅과 SPI·FDW·Index AM 등의 확장 API를 설계 차원에서 제공합니다. extension은 이 지점에 코드를 등록해 코어 수정 없이 동작을 확장합니다. pgvector가 HNSW라는 새 인덱스 타입을 추가할 수 있는 것도 Index AM API 덕분입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch13_extensions.md" target="_blank" rel="noopener">chapters/ch13_extensions.md</a> — pgaudit 상세 설정, PostGIS geography vs geometry, pgvector 인덱스 파라미터, Citus 분산 테이블, pgBouncer 모드별 함정이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch12.html"><span class="dir">← 이전</span><br><span class="title">12장. 파티셔닝</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch14.html"><span class="dir">다음 →</span><br><span class="title">14장. 모니터링과 트러블슈팅</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

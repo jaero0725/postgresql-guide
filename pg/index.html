@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 학습 홈 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>🐘 PostgreSQL 학습 홈</h1>
+<p class="lead">"가장 앞선 오픈소스 관계형 데이터베이스"를 그림과 애니메이션으로 배웁니다. 14개 챕터로 아키텍처의 뼈대부터 운영·트러블슈팅까지 — 눈으로 보면 절반은 이해한 것입니다.</p>
+<div class="chapter-meta">
+  <span class="tag">📚 챕터 14개</span>
+  <span class="tag">🎬 시각화 중심 학습</span>
+  <span class="tag">✅ 완료한 챕터: <span data-progress-of="pg/ch">0</span> / 14</span>
+</div>
+
+<h2 id="journey">한눈에 보는 PostgreSQL — SELECT 한 방의 여정</h2>
+<p>PostgreSQL의 전체 구조를 이 애니메이션 하나로 먼저 느껴보세요. <code>SELECT</code> 한 문장이 클라이언트를 떠나 결과로 돌아오기까지의 여정입니다. 여기 등장하는 등장인물(postmaster, backend, shared buffers, 디스크)이 앞으로 14개 챕터의 주인공들입니다.</p>
+
+<div class="anim" data-steps="6" data-title="SELECT 한 방의 여정 — 클라이언트에서 디스크까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <!-- 클라이언트 -->
+      <rect x="24" y="140" width="120" height="56" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="84" y="164" text-anchor="middle" class="sv-label">💻 클라이언트</text>
+      <text x="84" y="182" text-anchor="middle" class="sv-label-sm sv-mono">psql / 앱</text>
+
+      <!-- Postmaster -->
+      <rect x="250" y="34" width="150" height="52" rx="9" class="sv-box"/>
+      <text x="325" y="56" text-anchor="middle" class="sv-label">👮 postmaster</text>
+      <text x="325" y="74" text-anchor="middle" class="sv-label-sm">감독관 프로세스</text>
+
+      <!-- Backend (step2부터) -->
+      <g data-show="2" class="rise">
+        <rect x="250" y="140" width="150" height="56" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="325" y="164" text-anchor="middle" class="sv-label">⚙️ backend</text>
+        <text x="325" y="182" text-anchor="middle" class="sv-label-sm">내 전담 프로세스</text>
+      </g>
+
+      <!-- Shared Buffers -->
+      <rect x="460" y="132" width="140" height="72" rx="9" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="530" y="156" text-anchor="middle" class="sv-label">🧠 shared buffers</text>
+      <text x="530" y="174" text-anchor="middle" class="sv-label-sm">8KB 페이지 캐시</text>
+      <g data-show="5">
+        <rect x="474" y="182" width="52" height="14" rx="4" fill="color-mix(in srgb, var(--ok) 30%, transparent)" stroke="var(--ok)" stroke-width="1"/>
+        <text x="500" y="193" text-anchor="middle" class="sv-label-sm" font-size="9">page ✓</text>
+      </g>
+
+      <!-- 디스크 -->
+      <rect x="646" y="140" width="94" height="56" rx="9" class="sv-box"/>
+      <text x="693" y="164" text-anchor="middle" class="sv-label">💾 디스크</text>
+      <text x="693" y="182" text-anchor="middle" class="sv-label-sm sv-mono">heap 8KB</text>
+
+      <!-- 1. 접속 요청 -->
+      <g data-show="1-2">
+        <path d="M 120 138 Q 180 80 246 62" class="sv-arrow flow-line" marker-end="url(#arrhub)"/>
+        <text x="146" y="86" class="sv-label-sm" fill="var(--accent)">① 접속 요청 (TCP 5432)</text>
+      </g>
+
+      <!-- 2. fork -->
+      <g data-show="2">
+        <path d="M 325 88 L 325 136" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="336" y="116" class="sv-label-sm" fill="var(--ok)">② fork()</text>
+      </g>
+
+      <!-- 3. SELECT 전달 -->
+      <g data-show="3">
+        <path d="M 146 168 L 246 168" class="sv-arrow flow-line"/>
+        <text x="152" y="222" class="sv-label-sm" fill="var(--accent)">③ SELECT … (postmaster는 이제 관여 안 함)</text>
+      </g>
+
+      <!-- 4. 버퍼 조회 -->
+      <g data-show="4">
+        <path d="M 402 160 L 456 160" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="404" y="126" class="sv-label-sm" fill="var(--purple)">④ 캐시에 있나?</text>
+      </g>
+
+      <!-- 5. 디스크 로드 -->
+      <g data-show="5">
+        <path d="M 644 178 L 602 178" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="560" y="230" class="sv-label-sm" fill="var(--warn)">⑤ 없으면 디스크에서 8KB 페이지 로드</text>
+      </g>
+
+      <!-- 6. 결과 반환 -->
+      <g data-show="6">
+        <path d="M 246 186 Q 190 226 148 196" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="168" y="248" class="sv-label" fill="var(--ok)" font-size="14">⑥ 결과 반환! 🎉</text>
+      </g>
+
+      <text x="380" y="316" text-anchor="middle" class="sv-label-sm">이 그림의 모든 등장인물을 2장(아키텍처)에서 자세히 만납니다</text>
+
+      <defs>
+        <marker id="arrhub" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 TCP 5432 포트로 접속을 요청합니다. 이 요청을 받는 것은 <b>postmaster</b> — 쿼리를 직접 처리하지 않는 "감독관" 프로세스입니다.</p>
+    <p>postmaster가 <code>fork()</code>로 <b>backend 프로세스</b>를 하나 만들어 줍니다. 연결 1개 = 프로세스 1개, PostgreSQL의 상징적인 설계입니다.</p>
+    <p>이후 클라이언트는 backend와 <b>직접</b> 대화합니다. SELECT 문장이 backend에 도착해 파싱·계획 수립을 거칩니다.</p>
+    <p>backend는 필요한 데이터 페이지를 먼저 <b style="color:var(--purple)">shared buffers</b>(공유 메모리 캐시)에서 찾습니다.</p>
+    <p>캐시에 없으면(cache miss) <b style="color:var(--warn)">디스크에서 8KB 페이지를 읽어</b> shared buffers에 올립니다. 다음번엔 캐시에서 바로 꺼내겠죠.</p>
+    <p>페이지에서 조건에 맞는 행을 골라 클라이언트에 돌려주면 여정 끝! 이 한 번의 왕복에 <b>아키텍처(2장)·스토리지(4장)·플래너(6장)</b>의 모든 개념이 들어 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="chapters">챕터 한눈에 보기</h2>
+
+<h3>🧱 기초 — 뼈대 세우기</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch01.html">01. PostgreSQL 개요와 철학</a></h4>
+    <p>ORDBMS의 정체성, 30년 설계 철학, MySQL·Oracle·ClickHouse와 갈라지는 지점.</p>
+    <div class="chapter-meta"><span class="tag lv-basic">기초</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch02.html">02. 아키텍처 — 프로세스와 메모리</a></h4>
+    <p>postmaster의 fork, shared buffers, 쿼리가 처리되는 4단계 경로.</p>
+    <div class="chapter-meta"><span class="tag lv-basic">기초</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch03.html">03. MVCC — 동시성의 비밀</a></h4>
+    <p>읽기가 쓰기를 막지 않는 마법. xmin/xmax, 스냅샷, dead tuple의 탄생.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch04.html">04. Storage · Tuple · TOAST</a></h4>
+    <p>8KB 페이지의 해부. 튜플이 쌓이는 방식과 큰 값이 밀려나는 TOAST.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h3>🔍 쿼리와 트랜잭션 — 성능의 핵심</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch05.html">05. 인덱스 완전 정복</a></h4>
+    <p>B-tree부터 GIN·BRIN까지 6종 인덱스, 언제 무엇을 쓸지의 선택 기준.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch06.html">06. 쿼리 플래너와 EXPLAIN</a></h4>
+    <p>비용 기반 옵티마이저의 속마음. 통계·cost 모델·EXPLAIN 읽는 법.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch07.html">07. 트랜잭션과 격리 수준</a></h4>
+    <p>Dirty Read부터 Serialization Anomaly까지, 격리 수준과 Lock·Deadlock.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h3>🛠 운영의 핵심 — 장애 없는 하루</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch08.html">08. VACUUM과 Autovacuum</a></h4>
+    <p>dead tuple 청소부의 모든 것. Bloat와 XID Wraparound에서 살아남기.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch09.html">09. WAL과 Checkpoint</a></h4>
+    <p>"커밋했으면 절대 안 잃는다"의 원리. WAL, fsync, 크래시 복구.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch10.html">10. Replication — 복제</a></h4>
+    <p>Streaming/Logical 복제, replication slot, 장애 조치(failover)의 기본.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch11.html">11. 백업과 PITR 복구</a></h4>
+    <p>pg_dump vs pg_basebackup, WAL 아카이브로 "그 시각"으로 되감기.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h3>🧩 확장과 관리 — 더 크게, 더 넓게</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch12.html">12. 파티셔닝</a></h4>
+    <p>선언적 파티셔닝과 파티션 pruning. 대용량 테이블 다루기.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch13.html">13. Extension 생태계</a></h4>
+    <p>pg_stat_statements·PostGIS·pgvector — 커널 수정 없는 기능 확장.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch14.html">14. 모니터링과 트러블슈팅</a></h4>
+    <p>pg_stat_* 뷰 활용법과 실전 장애 대응 시나리오.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h2 id="paths">추천 학습 경로</h2>
+<p>목적에 따라 골라 읽어도 좋습니다. 화살표 순서대로 읽으면 앞 장의 개념이 뒷 장의 발판이 됩니다.</p>
+<div class="grid g3">
+  <div class="card">
+    <h4>🌱 처음 시작 (초급)</h4>
+    <p><a href="ch01.html">1장</a> → <a href="ch02.html">2장</a> → <a href="ch03.html">3장</a> → <a href="ch05.html">5장</a> → <a href="ch07.html">7장</a></p>
+    <p>정체성 → 구조 → 동시성 → 인덱스 → 트랜잭션. 개발자가 매일 만나는 순서입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🛠 운영 담당자</h4>
+    <p><a href="ch08.html">8장</a> → <a href="ch09.html">9장</a> → <a href="ch14.html">14장</a></p>
+    <p>VACUUM·WAL·모니터링. "새벽에 안 깨는 DBA"가 되는 최단 경로입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🔬 내부 구조 심화</h4>
+    <p><a href="ch04.html">4장</a> → <a href="ch06.html">6장</a> → <a href="ch10.html">10장</a> → <a href="ch12.html">12장</a></p>
+    <p>스토리지 → 플래너 → 복제 → 파티셔닝. 성능 튜닝의 근거를 원리에서 찾습니다.</p>
+  </div>
+</div>
+
+<h2 id="repo">원문 저장소의 보너스 자료</h2>
+<p>이 사이트는 <a href="https://github.com/jaero0725/postgresql-guide" target="_blank" rel="noopener">postgresql-guide 저장소</a>의 챕터 문서를 시각화한 것입니다. 저장소에는 챕터 외에도 실무에 바로 쓰는 자료가 함께 있습니다.</p>
+<div class="grid g3">
+  <div class="card">
+    <h4>🧪 examples/</h4>
+    <p>E-commerce, SaaS 멀티테넌시, 시계열 등 실무 도메인별 스키마·쿼리 예제.</p>
+    <p><a href="https://github.com/jaero0725/postgresql-guide/tree/main/examples" target="_blank" rel="noopener">examples 보러 가기 →</a></p>
+  </div>
+  <div class="card">
+    <h4>🚑 troubleshooting/</h4>
+    <p>Bloat 폭증, XID Wraparound, 느린 쿼리 등 장애 케이스별 대응 레시피.</p>
+    <p><a href="https://github.com/jaero0725/postgresql-guide/tree/main/troubleshooting" target="_blank" rel="noopener">troubleshooting 보러 가기 →</a></p>
+  </div>
+  <div class="card">
+    <h4>📋 cheatsheets/</h4>
+    <p>psql 명령어, 버전별 변경사항, 튜닝 파라미터 요약표 모음.</p>
+    <p><a href="https://github.com/jaero0725/postgresql-guide/tree/main/cheatsheets" target="_blank" rel="noopener">cheatsheets 보러 가기 →</a></p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">학습 진도는 자동으로 저장됩니다</div>
+    <p>각 챕터 하단의 "이 장 완료로 표시" 버튼을 누르면 사이드바에 ✓ 표시가 남습니다(브라우저 로컬 저장). 부담 없이 하루 한 챕터씩 진행해 보세요.</p>
+  </div>
+</div>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

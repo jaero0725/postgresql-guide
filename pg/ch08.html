@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8장. VACUUM과 Autovacuum — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch08">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>8장. VACUUM과 Autovacuum — 청소부 없는 MVCC는 없다</h1>
+<p class="lead">UPDATE와 DELETE가 남긴 dead tuple은 저절로 사라지지 않습니다. Bloat 폭증, 쿼리 지연, 그리고 최악의 장애 XID Wraparound까지 — PostgreSQL 운영 사고의 절반은 여기서 시작됩니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 3장 MVCC</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① dead tuple이 쌓이는 이유와 VACUUM이 실제로 하는 일 ② Autovacuum이 자동으로 도는 조건(트리거 공식)과 튜닝 ③ XID Wraparound의 원리와 Freeze ④ VACUUM을 막는 4대 요인과 Bloat 대응</p>
+  </div>
+</div>
+
+<h2 id="s1">8.1 왜 VACUUM이 필요한가 — 지워도 지워지지 않는 데이터</h2>
+
+<p>3장에서 배웠듯이 PostgreSQL의 UPDATE는 <strong>"기존 튜플에 xmax 표시 + 새 버전 삽입"</strong>이고, DELETE는 xmax만 표시할 뿐 물리적으로 지우지 않습니다. 마치 아파트에서 이사를 나가도 <em>이전 집 짐을 그대로 두고 새 집으로 옮기는 것</em>과 같습니다. 누군가 이전 집을 치워주지 않으면 아파트는 빈 짐으로 가득 차게 되죠.</p>
+
+<p>이 "빈 짐"이 바로 <strong>dead tuple</strong>이고, 치워주는 청소부가 <strong>VACUUM</strong>입니다. 청소를 안 하면 네 가지 문제가 생깁니다.</p>
+
+<ul>
+  <li><strong>Bloat</strong>: 테이블·인덱스가 실제 데이터보다 몇 배로 부풀어 스캔 I/O 증가, 캐시 효율 저하</li>
+  <li><strong>XID Wraparound</strong>: 32비트 트랜잭션 ID가 순환하며 "과거 커밋이 미래처럼 보이는" 재앙</li>
+  <li><strong>Index-Only Scan 불가</strong>: Visibility Map이 갱신되지 않아 항상 heap 접근</li>
+  <li><strong>통계 부정확</strong>: <code>pg_class.reltuples</code> 오류로 플래너가 잘못된 계획을 세움</li>
+</ul>
+
+<div class="anim" data-steps="5" data-title="dead tuple이 쌓이고 VACUUM이 회수하는 과정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <text x="20" y="26" class="sv-label" font-size="14">heap 페이지 (8KB)</text>
+      <rect x="20" y="40" width="480" height="240" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+
+      <!-- live tuples -->
+      <rect x="40" y="60" width="200" height="40" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="140" y="85" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=1 "Alice" (live)</text>
+      <rect x="260" y="60" width="200" height="40" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="360" y="85" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=2 "Bob" (live)</text>
+
+      <!-- step2: update creates dead + new version -->
+      <g data-show="2-3">
+        <rect x="40" y="60" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="140" y="85" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--danger)">id=1 "Alice" ☠ dead</text>
+      </g>
+      <g data-show="2">
+        <rect x="40" y="120" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="140" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=1 "Alicia" (live)</text>
+      </g>
+
+      <!-- step3: more dead tuples accumulate -->
+      <g data-show="3-3">
+        <rect x="260" y="120" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="360" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--danger)">id=2 v2 ☠ dead</text>
+        <rect x="40" y="180" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="140" y="205" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--danger)">id=1 v2 ☠ dead</text>
+      </g>
+      <g data-show="3">
+        <rect x="260" y="180" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="360" y="205" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=2 "Bobby" (live)</text>
+      </g>
+      <g data-show="3-3">
+        <text x="600" y="130" text-anchor="middle" class="sv-label" font-size="14" fill="var(--danger)">🎈 Bloat!</text>
+        <text x="600" y="152" text-anchor="middle" class="sv-label-sm">페이지의 절반이</text>
+        <text x="600" y="168" text-anchor="middle" class="sv-label-sm">죽은 데이터</text>
+      </g>
+
+      <!-- step4: VACUUM sweeps -->
+      <g data-show="4">
+        <text x="600" y="60" text-anchor="middle" class="sv-label" font-size="15" fill="var(--purple)">🧹 VACUUM</text>
+        <path d="M 560 70 Q 500 90 470 85" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 560 80 Q 480 150 465 140" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 555 95 Q 420 220 300 200" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+      <g data-show="4-4">
+        <rect x="40" y="60" width="200" height="40" rx="7" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 4"/>
+        <text x="140" y="85" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">회수됨 (재사용 가능)</text>
+        <rect x="260" y="120" width="200" height="40" rx="7" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 4"/>
+        <text x="360" y="145" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">회수됨</text>
+        <rect x="40" y="180" width="200" height="40" rx="7" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 4"/>
+        <text x="140" y="205" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">회수됨</text>
+      </g>
+
+      <!-- step5: FSM + reuse -->
+      <g data-show="5">
+        <rect x="530" y="200" width="200" height="56" rx="9" class="sv-box"/>
+        <text x="630" y="223" text-anchor="middle" class="sv-label sv-mono" font-size="12">Free Space Map</text>
+        <text x="630" y="242" text-anchor="middle" class="sv-label-sm">"이 페이지에 빈 공간 있음"</text>
+        <path d="M 530 228 Q 480 228 462 200" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8a)"/>
+        <rect x="40" y="60" width="200" height="40" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="140" y="85" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=3 "Carol" ✨ 새 INSERT</text>
+        <text x="380" y="315" text-anchor="middle" class="sv-label-sm">⚠️ 단, 파일 크기 자체는 줄지 않습니다 — 페이지 안에서 재사용될 뿐!</text>
+      </g>
+      <defs>
+        <marker id="arr8a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>처음에는 heap 페이지에 살아있는(live) 튜플만 있습니다. 모든 것이 깨끗한 상태.</p>
+    <p><code>UPDATE</code>가 실행되면 기존 튜플은 <b style="color:var(--danger)">dead tuple</b>이 되고, 새 버전이 페이지에 추가됩니다. 공간은 두 배로!</p>
+    <p>UPDATE가 반복될수록 dead tuple이 쌓입니다. 살아있는 데이터는 그대로인데 페이지는 죽은 버전으로 가득 — 이것이 <b style="color:var(--danger)">Bloat</b>입니다.</p>
+    <p><b style="color:var(--purple)">VACUUM</b>이 페이지를 돌며 어떤 스냅샷에서도 보이지 않는 dead tuple을 식별하고, 그 자리를 <b>재사용 가능한 빈 공간</b>으로 표시합니다.</p>
+    <p>빈 공간 정보는 <b>Free Space Map(.fsm)</b>에 기록되고, 이후 INSERT가 그 자리를 재사용합니다. 단, 일반 VACUUM은 <b>파일 크기를 줄이지 않는다</b>는 점을 기억하세요!</p>
+  </div>
+</div>
+
+<h2 id="s2">8.2 VACUUM이 실제로 하는 일 — 그리고 하지 않는 일</h2>
+
+<p>일반 VACUUM(lazy vacuum)은 생각보다 많은 일을 합니다. dead tuple 회수는 그중 하나일 뿐입니다.</p>
+
+<ol>
+  <li><strong>Heap 스캔</strong> — 페이지를 읽어 dead tuple 식별</li>
+  <li><strong>인덱스 정리</strong> — dead tuple을 가리키는 인덱스 엔트리 제거</li>
+  <li><strong>공간 회수</strong> — dead tuple의 line pointer를 재사용 가능 상태로 표시</li>
+  <li><strong>FSM/VM 갱신</strong> — 빈 공간 지도와 Visibility Map(<code>all-visible</code>/<code>all-frozen</code>) 갱신</li>
+  <li><strong>통계 갱신</strong> — <code>pg_class.reltuples</code>, <code>relpages</code></li>
+  <li><strong>Freeze</strong> — 오래된 튜플의 xmin을 FrozenXid로 교체 (8.4에서 자세히)</li>
+</ol>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">일반 VACUUM은 파일 크기를 줄이지 않는다</div>
+    <p>페이지 <em>안의</em> 공간을 재사용 가능하게 만들 뿐, 물리 파일은 테이블 맨 끝이 완전히 비었을 때만 조건부로 잘립니다. "VACUUM 했는데 디스크가 안 줄어요"는 정상 동작입니다. 파일 축소가 필요하면 <code>pg_repack</code>을 쓰세요.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>도구</th><th>공간 회수</th><th>Lock</th><th>특징</th></tr></thead>
+  <tbody>
+    <tr><td><code>VACUUM</code></td><td>페이지 내 재사용</td><td>비차단 (SUE)</td><td>기본. 파일 크기 안 줄어듦</td></tr>
+    <tr><td><code>VACUUM FULL</code></td><td>완전 회수 + 파일 축소</td><td><strong>AccessExclusive</strong></td><td>읽기까지 차단 — 서비스 중 금지</td></tr>
+    <tr><td><code>CLUSTER</code></td><td>완전 회수 + 물리 정렬</td><td>AccessExclusive</td><td>인덱스 순으로 재작성</td></tr>
+    <tr><td><code>pg_repack</code></td><td>완전 회수</td><td>순간의 AE만</td><td>확장 설치 필요, 사실상 무중단 — 운영 표준</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 자주 쓰는 VACUUM 옵션</span>
+<span class="k">VACUUM</span> (VERBOSE, ANALYZE) orders;       <span class="c">-- 상세 로그 + 통계 갱신</span>
+<span class="k">VACUUM</span> (FREEZE) orders;                 <span class="c">-- 가능한 모든 튜플을 즉시 frozen</span>
+<span class="k">VACUUM</span> (PARALLEL <span class="n">4</span>) orders;             <span class="c">-- 인덱스 병렬 정리 (13+)</span>
+
+<span class="c">-- 진행 중인 VACUUM 실시간 확인 (9.6+)</span>
+<span class="k">SELECT</span> pid, relid::regclass, phase,
+       heap_blks_total, heap_blks_scanned, num_dead_tuples
+<span class="k">FROM</span> pg_stat_progress_vacuum;</code></pre>
+
+<h2 id="s3">8.3 Autovacuum — 청소부는 언제 자동으로 출근하는가</h2>
+
+<p>매번 수동으로 VACUUM을 돌릴 수는 없으니, PostgreSQL은 <strong>Autovacuum Launcher</strong>라는 관리자를 둡니다. Launcher는 <code>autovacuum_naptime</code>(기본 1분)마다 깨어나 통계를 살펴보고, 청소가 필요한 테이블에 <strong>워커</strong>를 파견합니다. 파견 기준은 명확한 공식입니다.</p>
+
+<pre><code><span class="c">-- VACUUM 트리거 공식 (기본값 기준)</span>
+n_dead_tup  &gt;  autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples
+            =  <span class="n">50</span> + <span class="n">0.2</span> × 행수
+
+<span class="c">-- 예: 100만 행 테이블 → dead tuple이 200,050개를 넘어야 autovacuum이 돈다</span>
+<span class="c">-- ANALYZE 트리거는 별도: 50 + 0.1 × 행수</span></code></pre>
+
+<div class="anim" data-steps="4" data-title="Autovacuum — 트리거 조건 판정과 워커 파견" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- launcher -->
+      <rect x="30" y="40" width="190" height="60" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="125" y="65" text-anchor="middle" class="sv-label" font-size="13">Autovacuum Launcher</text>
+      <text x="125" y="85" text-anchor="middle" class="sv-label-sm">naptime(1min)마다 기상 ⏰</text>
+
+      <!-- tables -->
+      <rect x="300" y="30" width="200" height="52" rx="9" class="sv-box"/>
+      <text x="400" y="51" text-anchor="middle" class="sv-label sv-mono" font-size="12">users (100만 행)</text>
+      <text x="400" y="70" text-anchor="middle" class="sv-label-sm sv-mono">n_dead_tup = 5만</text>
+
+      <rect x="300" y="100" width="200" height="52" rx="9" class="sv-box"/>
+      <text x="400" y="121" text-anchor="middle" class="sv-label sv-mono" font-size="12">orders (100만 행)</text>
+      <text x="400" y="140" text-anchor="middle" class="sv-label-sm sv-mono">n_dead_tup = 25만</text>
+
+      <g data-show="1">
+        <path d="M 220 70 Q 260 70 295 60" class="sv-arrow flow-line"/>
+        <path d="M 220 80 Q 260 100 295 120" class="sv-arrow flow-line"/>
+      </g>
+
+      <!-- step2: formula check -->
+      <g data-show="2">
+        <rect x="530" y="30" width="210" height="52" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="635" y="51" text-anchor="middle" class="sv-label-sm sv-mono">5만 &lt; 50 + 0.2×100만</text>
+        <text x="635" y="70" text-anchor="middle" class="sv-label" font-size="12" fill="var(--ok)">기준 미달 → 통과 ✅</text>
+      </g>
+      <g data-show="2">
+        <rect x="530" y="100" width="210" height="52" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+        <text x="635" y="121" text-anchor="middle" class="sv-label-sm sv-mono">25만 &gt; 200,050</text>
+        <text x="635" y="140" text-anchor="middle" class="sv-label" font-size="12" fill="var(--danger)">기준 초과 → VACUUM! 🚨</text>
+      </g>
+
+      <!-- step3: worker spawn -->
+      <g data-show="3">
+        <rect x="80" y="180" width="180" height="56" rx="10" fill="color-mix(in srgb, var(--purple) 14%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="170" y="203" text-anchor="middle" class="sv-label" font-size="13" fill="var(--purple)">🧹 Autovacuum Worker</text>
+        <text x="170" y="222" text-anchor="middle" class="sv-label-sm">최대 autovacuum_max_workers(3)</text>
+        <path d="M 125 100 Q 110 140 130 178" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 260 215 Q 340 210 370 156" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8b)"/>
+        <text x="320" y="240" class="sv-label-sm" fill="var(--purple)">orders 청소 시작</text>
+      </g>
+
+      <!-- step4: cost limit throttle -->
+      <g data-show="4">
+        <rect x="430" y="185" width="300" height="100" rx="10" class="sv-box"/>
+        <text x="580" y="208" text-anchor="middle" class="sv-label" font-size="12.5">브레이크: cost 기반 스로틀링</text>
+        <rect x="450" y="222" width="70" height="20" rx="5" fill="color-mix(in srgb, var(--purple) 20%, transparent)" stroke="var(--purple)"/>
+        <text x="485" y="236" text-anchor="middle" class="sv-label-sm">작업</text>
+        <rect x="530" y="222" width="52" height="20" rx="5" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="556" y="236" text-anchor="middle" class="sv-label-sm">sleep</text>
+        <rect x="592" y="222" width="70" height="20" rx="5" fill="color-mix(in srgb, var(--purple) 20%, transparent)" stroke="var(--purple)"/>
+        <text x="627" y="236" text-anchor="middle" class="sv-label-sm">작업</text>
+        <rect x="672" y="222" width="48" height="20" rx="5" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="696" y="236" text-anchor="middle" class="sv-label-sm">sleep</text>
+        <text x="580" y="268" text-anchor="middle" class="sv-label-sm sv-mono">cost_limit(200) 도달 → cost_delay(2ms) 휴식</text>
+      </g>
+      <defs>
+        <marker id="arr8b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>Launcher가 <code>autovacuum_naptime</code>(기본 1분)마다 깨어나 각 테이블의 <code>pg_stat_all_tables</code> 통계를 확인합니다.</p>
+    <p>테이블마다 공식을 대입합니다. users는 dead 5만 &lt; 임계 200,050이라 통과, orders는 25만 &gt; 200,050이라 <b style="color:var(--danger)">VACUUM 대상</b>!</p>
+    <p>Launcher가 <b style="color:var(--purple)">워커</b>를 파견해 orders를 청소합니다. 워커는 동시에 최대 <code>autovacuum_max_workers</code>(기본 3)개까지만.</p>
+    <p>워커는 전력 질주하지 않습니다. 페이지를 읽고 쓸 때마다 비용을 합산해 <code>cost_limit</code>에 도달하면 <code>cost_delay</code>만큼 쉽니다. 기본값은 너무 느려서(약 8MB/s 수준) <b>대형 테이블에서는 cost_limit 상향이 현대적 권장</b>입니다.</p>
+  </div>
+</div>
+
+<p>기본값의 함정: <code>scale_factor = 0.2</code>는 10억 행 테이블에서 <strong>2억 개의 dead tuple이 쌓여야</strong> 청소가 시작된다는 뜻입니다. 큰 테이블일수록 개별 설정으로 문턱을 낮춰야 합니다.</p>
+
+<pre><code><span class="c">-- 핫 테이블은 개별 storage parameter가 정답</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">SET</span> (
+  autovacuum_vacuum_scale_factor = <span class="n">0.02</span>,   <span class="c">-- 20% → 2%로 낮춤</span>
+  autovacuum_vacuum_threshold = <span class="n">10000</span>,
+  autovacuum_vacuum_cost_limit = <span class="n">2000</span>,     <span class="c">-- 더 빠르게 청소</span>
+  fillfactor = <span class="n">85</span>                          <span class="c">-- HOT 업데이트용 여유 공간</span>
+);</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">PG 13+: INSERT만 하는 테이블도 청소 대상</div>
+    <p><code>autovacuum_vacuum_insert_threshold</code>(기본 1000) 덕분에 append-only 로그 테이블도 autovacuum이 돌아 Visibility Map을 갱신합니다. 12 이하에서는 이런 테이블이 wraparound 직전에야 emergency vacuum을 맞는 문제가 있었습니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">8.4 XID Wraparound — 가장 위험한 장애와 Freeze</h2>
+
+<p>PostgreSQL의 트랜잭션 ID(XID)는 <strong>32비트, 약 40억 개</strong>입니다. 다 쓰면 0부터 다시 시작하는 <strong>순환 구조</strong>죠. 문제는 MVCC의 가시성 판정이 "내 XID보다 과거인가/미래인가" 비교에 의존한다는 것입니다. XID가 한 바퀴 돌면 <em>아주 오래된 과거 커밋이 갑자기 미래처럼 보이는</em> — 즉 데이터가 사라져 보이는 재앙이 일어납니다.</p>
+
+<p>방지책이 <strong>Freeze</strong>입니다. 충분히 오래된 튜플의 xmin을 특수값 <code>FrozenXid</code>로 바꿔 "누가 봐도 무조건 과거"로 만들어 XID를 재활용할 수 있게 합니다.</p>
+
+<div class="anim" data-steps="5" data-title="XID 시계 — Wraparound 위험과 Freeze" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <!-- XID circle -->
+      <circle cx="200" cy="170" r="110" fill="none" stroke="var(--border)" stroke-width="2"/>
+      <text x="200" y="40" text-anchor="middle" class="sv-label" font-size="13">XID 순환 시계 (32bit ≈ 40억)</text>
+      <text x="200" y="165" text-anchor="middle" class="sv-label-sm">비교 가능 범위</text>
+      <text x="200" y="182" text-anchor="middle" class="sv-label-sm">= 약 20억 (반원)</text>
+
+      <!-- tuple marker at fixed position -->
+      <circle cx="200" cy="60" r="9" fill="var(--accent)"/>
+      <text x="248" y="55" class="sv-label-sm sv-mono">튜플 xmin=100</text>
+
+      <!-- current xid pointer moving: step1 near tuple, step2 quarter, step3 opposite -->
+      <g data-show="1-1">
+        <line x1="200" y1="170" x2="290" y2="105" stroke="var(--ok)" stroke-width="3"/>
+        <circle cx="290" cy="105" r="7" fill="var(--ok)"/>
+        <text x="305" y="100" class="sv-label-sm" fill="var(--ok)">현재 XID (age 작음)</text>
+      </g>
+      <g data-show="2-2">
+        <line x1="200" y1="170" x2="310" y2="170" stroke="var(--warn)" stroke-width="3"/>
+        <circle cx="310" cy="170" r="7" fill="var(--warn)"/>
+        <text x="325" y="175" class="sv-label-sm" fill="var(--warn)">시간이 흘러 age 증가…</text>
+      </g>
+      <g data-show="3-3">
+        <line x1="200" y1="170" x2="230" y2="276" stroke="var(--danger)" stroke-width="3"/>
+        <circle cx="230" cy="276" r="7" fill="var(--danger)" class="pulse"/>
+        <text x="248" y="288" class="sv-label-sm" fill="var(--danger)">age &gt; 2억!</text>
+      </g>
+      <g data-show="4-5">
+        <line x1="200" y1="170" x2="230" y2="276" stroke="var(--text-faint)" stroke-width="2"/>
+        <circle cx="230" cy="276" r="6" fill="var(--text-faint)"/>
+      </g>
+
+      <!-- right panel -->
+      <g data-show="3-3">
+        <rect x="450" y="60" width="280" height="70" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="590" y="88" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">🚨 anti-wraparound VACUUM 강제</text>
+        <text x="590" y="110" text-anchor="middle" class="sv-label-sm sv-mono">autovacuum_freeze_max_age = 2억</text>
+      </g>
+      <g data-show="4">
+        <rect x="450" y="150" width="280" height="80" rx="10" fill="color-mix(in srgb, var(--accent) 10%, transparent)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="590" y="176" text-anchor="middle" class="sv-label" font-size="13">🧊 Freeze</text>
+        <text x="590" y="196" text-anchor="middle" class="sv-label-sm sv-mono">xmin=100 → FrozenXid</text>
+        <text x="590" y="215" text-anchor="middle" class="sv-label-sm">"누가 봐도 과거" — 순환과 무관해짐</text>
+        <path d="M 445 185 Q 320 140 218 68" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="6 5" class="flow-line"/>
+      </g>
+      <g data-show="4-5">
+        <circle cx="200" cy="60" r="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="200" y="65" text-anchor="middle" font-size="10" fill="var(--accent)">❄</text>
+      </g>
+      <g data-show="5">
+        <rect x="450" y="250" width="280" height="66" rx="10" class="sv-box"/>
+        <text x="590" y="274" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">최후의 선: age 20억</text>
+        <text x="590" y="296" text-anchor="middle" class="sv-label-sm sv-mono">database is not accepting commands</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>XID는 시계처럼 순환합니다. 튜플의 <code>xmin=100</code>과 현재 XID가 가까울 때(age 작음)는 아무 문제가 없습니다.</p>
+    <p>트랜잭션이 계속 발생하며 현재 XID가 전진합니다. 튜플의 age(나이)가 점점 커집니다.</p>
+    <p>age가 <code>autovacuum_freeze_max_age</code>(기본 2억)를 넘으면 <b style="color:var(--danger)">anti-wraparound VACUUM이 강제 실행</b>됩니다. 이 VACUUM은 autovacuum을 꺼둔 테이블에도 옵니다.</p>
+    <p>VACUUM이 오래된 튜플의 xmin을 <b>FrozenXid로 교체(Freeze)</b>합니다. 이제 이 튜플은 순환과 무관하게 "무조건 과거"로 판정되어 안전합니다.</p>
+    <p>만약 Freeze가 계속 실패해 age가 <b style="color:var(--danger)">20억</b>에 근접하면 DB가 쓰기를 거부합니다. 단일 사용자 모드로 수동 VACUUM해야 하는 최악의 장애 — 조기 경보 모니터링이 필수인 이유입니다.</p>
+  </div>
+</div>
+
+<p>조기 경보는 간단한 쿼리 하나면 됩니다. <strong>일간 모니터링에 반드시 포함</strong>하세요.</p>
+
+<pre><code><span class="c">-- 테이블별 frozenxid 나이 — 5억 넘으면 WARN, 15억 넘으면 CRITICAL</span>
+<span class="k">SELECT</span> c.relname,
+       <span class="f">age</span>(c.relfrozenxid) <span class="k">AS</span> xid_age,
+       <span class="f">pg_size_pretty</span>(<span class="f">pg_table_size</span>(c.oid)) <span class="k">AS</span> size
+<span class="k">FROM</span> pg_class c
+<span class="k">JOIN</span> pg_namespace n <span class="k">ON</span> n.oid = c.relnamespace
+<span class="k">WHERE</span> c.relkind <span class="k">IN</span> (<span class="s">'r'</span>,<span class="s">'m'</span>)
+  <span class="k">AND</span> n.nspname <span class="k">NOT IN</span> (<span class="s">'pg_catalog'</span>,<span class="s">'information_schema'</span>)
+<span class="k">ORDER BY</span> <span class="f">age</span>(c.relfrozenxid) <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">20</span>;</code></pre>
+
+<h2 id="s5">8.5 VACUUM을 막는 4대 요인</h2>
+
+<p>VACUUM은 <strong>"현재 활성인 가장 오래된 스냅샷보다 더 오래된" dead tuple만</strong> 회수할 수 있습니다. 누군가 오래된 스냅샷을 붙들고 있으면, VACUUM이 아무리 부지런히 돌아도 헛돌게 됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>원인</th><th>증상</th><th>해결</th></tr></thead>
+  <tbody>
+    <tr><td><strong>긴 트랜잭션</strong></td><td><code>pg_stat_activity.backend_xmin</code>이 오래된 XID를 유지</td><td><code>idle_in_transaction_session_timeout</code>, <code>statement_timeout</code></td></tr>
+    <tr><td><strong>2PC prepared transaction</strong></td><td><code>pg_prepared_xacts</code>에 잔류 거래</td><td><code>ROLLBACK PREPARED</code>로 정리</td></tr>
+    <tr><td><strong>Replication slot</strong></td><td>소비자 없는 슬롯이 xmin·WAL 홀드</td><td>불필요 슬롯 <code>pg_drop_replication_slot</code></td></tr>
+    <tr><td><strong>장기 커서 / hot_standby_feedback</strong></td><td>세션 스냅샷이 오래 유지</td><td>커서 스트리밍 쿼리 재검토</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 범인 색출: 가장 오래된 xmin을 붙들고 있는 세션</span>
+<span class="k">SELECT</span> pid, usename, state,
+       now() - xact_start <span class="k">AS</span> tx_age,
+       <span class="f">age</span>(backend_xmin) <span class="k">AS</span> xmin_age,
+       <span class="f">left</span>(query, <span class="n">100</span>) <span class="k">AS</span> q
+<span class="k">FROM</span> pg_stat_activity
+<span class="k">WHERE</span> backend_xmin <span class="k">IS NOT NULL</span>
+<span class="k">ORDER BY</span> <span class="f">age</span>(backend_xmin) <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">10</span>;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">자주 하는 실수 Top 3</div>
+    <p>① <strong>Autovacuum 끄기</strong> — 재앙의 지름길. 꺼도 anti-wraparound VACUUM은 반드시 옵니다. ② <strong>운영 중 VACUUM FULL</strong> — 읽기까지 차단됩니다. ③ <strong>긴 ETL 트랜잭션 방치</strong> — 한 세션이 전체 클러스터의 VACUUM을 마비시킵니다. 배치는 작게 쪼개 커밋하세요.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">일반 <code>VACUUM</code>(FULL 아님)을 실행한 뒤 테이블에 일어나는 일로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">테이블 파일 크기가 dead tuple만큼 즉시 줄어든다</button>
+    <button type="button" data-correct>파일 크기는 거의 그대로지만, dead tuple 공간이 재사용 가능해지고 FSM/VM이 갱신된다</button>
+    <button type="button">읽기 쿼리가 모두 차단된 상태로 테이블이 재작성된다</button>
+    <button type="button">모든 튜플이 즉시 frozen 상태가 된다</button>
+  </div>
+  <div class="quiz-expl">✅ 일반 VACUUM은 페이지 <strong>안의</strong> 공간을 회수해 재사용 가능하게 만들 뿐 파일을 줄이지 않습니다. 파일 축소가 필요하면 pg_repack(무중단) 또는 VACUUM FULL(서비스 차단)이 필요합니다. 읽기 차단은 VACUUM FULL의 이야기이고, 전체 freeze는 VACUUM (FREEZE) 옵션의 동작입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">100만 행 테이블(기본 설정)에서 autovacuum의 VACUUM이 촉발되려면 dead tuple이 대략 몇 개 쌓여야 할까요?</div>
+  <div class="quiz-opts">
+    <button type="button">50개</button>
+    <button type="button">10만 개 (10%)</button>
+    <button type="button" data-correct>약 20만 개 (50 + 0.2 × 100만)</button>
+    <button type="button">100만 개 (100%)</button>
+  </div>
+  <div class="quiz-expl">✅ 공식은 <code>threshold(50) + scale_factor(0.2) × reltuples</code>입니다. 100만 행이면 200,050개. 테이블이 클수록 문턱이 비례해서 높아지므로, 대형·핫 테이블은 <code>ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = 0.02)</code>처럼 개별 설정으로 낮추는 것이 운영 표준입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch08_vacuum_autovacuum.md" target="_blank" rel="noopener">chapters/ch08_vacuum_autovacuum.md</a> — cost 계산 상세, pgstattuple로 Bloat 정밀 측정, 커뮤니티 bloat 쿼리, 운영 체크리스트 전체가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch07.html"><span class="dir">← 이전</span><br><span class="title">7장. 트랜잭션과 격리 수준</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch09.html"><span class="dir">다음 →</span><br><span class="title">9장. WAL과 Checkpoint</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

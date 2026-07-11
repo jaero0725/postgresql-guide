@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6장. 쿼리 플래너와 EXPLAIN — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch06">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>6장. 쿼리 플래너와 EXPLAIN</h1>
+<p class="lead">"인덱스가 있는데 왜 Seq Scan을?" — 그 답은 플래너의 머릿속에 있습니다. 비용 기반 옵티마이저가 계획을 고르는 원리와, EXPLAIN으로 그 속마음을 읽는 법을 배웁니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 인덱스</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 쿼리 처리 파이프라인 — Parse→Rewrite→Plan→Execute ② cost 모델과 SSD 시대의 <code>random_page_cost</code> ③ 통계(pg_stats)와 ANALYZE — 플래너 오판의 진원지 ④ 조인 3종(Nested Loop·Hash·Merge)과 EXPLAIN 출력 해석</p>
+  </div>
+</div>
+
+<h2 id="s1">6.1 파이프라인 — SQL 한 줄이 계획이 되기까지</h2>
+
+<p>PostgreSQL은 <strong>비용 기반 옵티마이저(cost-based optimizer)</strong>입니다. 가능한 실행 계획들을 열거하고 예상 비용을 계산해 <strong>가장 싸 보이는</strong> 하나를 고릅니다. "싸 보인다"는 판단이 통계와 파라미터에 의존한다는 점이 이 장 전체의 복선입니다.</p>
+
+<div class="anim" data-steps="5" data-title="Parse → Rewrite → Plan → Execute — SQL의 변신 과정" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <!-- 파이프라인 박스들 -->
+      <g data-active="1-1">
+        <rect x="30" y="90" width="160" height="60" rx="10" class="sv-box"/>
+        <text x="110" y="115" text-anchor="middle" class="sv-label">📝 Parser</text>
+        <text x="110" y="134" text-anchor="middle" class="sv-label-sm">문법 분석</text>
+      </g>
+      <g data-active="2-2">
+        <rect x="224" y="90" width="160" height="60" rx="10" class="sv-box"/>
+        <text x="304" y="115" text-anchor="middle" class="sv-label">🔁 Rewriter</text>
+        <text x="304" y="134" text-anchor="middle" class="sv-label-sm">뷰·RULE 확장</text>
+      </g>
+      <g data-active="3-3">
+        <rect x="418" y="90" width="160" height="60" rx="10" class="sv-box"/>
+        <text x="498" y="115" text-anchor="middle" class="sv-label">🧮 Planner</text>
+        <text x="498" y="134" text-anchor="middle" class="sv-label-sm">비용 비교·선택</text>
+      </g>
+      <g data-active="4-4">
+        <rect x="612" y="90" width="140" height="60" rx="10" class="sv-box"/>
+        <text x="682" y="115" text-anchor="middle" class="sv-label">▶ Executor</text>
+        <text x="682" y="134" text-anchor="middle" class="sv-label-sm">계획 실행</text>
+      </g>
+      <path d="M 190 120 L 224 120" class="sv-arrow" marker-end="url(#arr6a)"/>
+      <path d="M 384 120 L 418 120" class="sv-arrow" marker-end="url(#arr6a)"/>
+      <path d="M 578 120 L 612 120" class="sv-arrow" marker-end="url(#arr6a)"/>
+
+      <!-- step1 -->
+      <g data-show="1-1">
+        <rect x="30" y="20" width="330" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="195" y="42" text-anchor="middle" class="sv-label sv-mono" font-size="12">SELECT id FROM active_users WHERE country='KR'</text>
+        <path d="M 110 54 L 110 86" stroke="var(--accent)" stroke-width="2" class="flow-line"/>
+        <text x="110" y="180" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">문자열 → Parse Tree</text>
+        <text x="110" y="198" text-anchor="middle" class="sv-label-sm">문법 오류는 여기서 검출</text>
+      </g>
+
+      <!-- step2 -->
+      <g data-show="2-2">
+        <text x="304" y="180" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">뷰가 "펼쳐진다"</text>
+        <text x="304" y="200" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">active_users → users WHERE status='active'</text>
+      </g>
+
+      <!-- step3 -->
+      <g data-show="3-3">
+        <rect x="404" y="176" width="188" height="110" rx="9" fill="color-mix(in srgb, var(--warn) 8%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+        <text x="498" y="198" text-anchor="middle" class="sv-label-sm">후보 계획과 예상 비용</text>
+        <text x="498" y="222" text-anchor="middle" class="sv-label-sm sv-mono">Seq Scan       cost 20543</text>
+        <text x="498" y="244" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">Index Scan  ✓ cost 8.44</text>
+        <text x="498" y="266" text-anchor="middle" class="sv-label-sm sv-mono">Bitmap Scan    cost 112</text>
+      </g>
+      <g data-show="3">
+        <rect x="404" y="34" width="188" height="40" rx="8" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.4"/>
+        <text x="498" y="51" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">📊 pg_statistic (통계)</text>
+        <text x="498" y="67" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">random_page_cost 등 GUC</text>
+        <path d="M 498 74 L 498 86" stroke="var(--purple)" stroke-width="2" class="flow-line"/>
+      </g>
+
+      <!-- step4 -->
+      <g data-show="4-4">
+        <text x="682" y="180" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">Volcano 모델:</text>
+        <text x="682" y="198" text-anchor="middle" class="sv-label-sm">노드가 튜플을 한 개씩</text>
+        <text x="682" y="214" text-anchor="middle" class="sv-label-sm">위로 올려보냄</text>
+      </g>
+
+      <!-- step5 -->
+      <g data-show="5">
+        <rect x="80" y="240" width="620" height="52" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="390" y="262" text-anchor="middle" class="sv-label">계획의 품질 = 통계의 품질 × cost 파라미터의 현실성</text>
+        <text x="390" y="281" text-anchor="middle" class="sv-label-sm">둘 중 하나라도 낡으면 "인덱스가 있는데 Seq Scan" 같은 오판이 나온다</text>
+      </g>
+
+      <defs>
+        <marker id="arr6a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>Parse</b>: SQL 문자열을 토큰화·문법 분석해 Parse Tree로 만듭니다. 오타·문법 오류는 이 단계에서 걸러집니다.</p>
+    <p><b>Rewrite</b>: 뷰와 RULE을 펼칩니다. <code>active_users</code> 뷰가 기반 테이블 <code>users</code> 쿼리로 치환됩니다 — "뷰라서 느린" 게 아니라 펼친 결과가 느린 것입니다.</p>
+    <p><b>Plan</b>: 진짜 승부처. Seq Scan·Index Scan·Bitmap Scan… 후보마다 비용을 계산해 최저가를 선택합니다. 이때 입력이 <b style="color:var(--purple)">통계(pg_statistic)와 cost 파라미터</b>입니다.</p>
+    <p><b>Execute</b>: 선택된 Plan Tree를 Volcano(iterator) 모델로 실행합니다. 루트 노드가 자식에게 "튜플 하나 줘"를 재귀적으로 요청하는 구조입니다.</p>
+    <p>기억할 것 하나: <b>계획의 품질은 통계와 파라미터의 품질</b>입니다. 플래너는 거짓말하지 않습니다 — 낡은 정보로 정직하게 오판할 뿐이죠.</p>
+  </div>
+</div>
+
+<h2 id="s2">6.2 Cost 모델 — 숫자의 단위는 "순차 페이지 1장"</h2>
+
+<p>EXPLAIN에 나오는 cost는 초(second)가 아니라 <strong>단위 없는 상대값</strong>입니다. 기준은 "페이지 하나를 순차로 읽는 비용 = 1.0".</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>파라미터</th><th>기본값</th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td><code>seq_page_cost</code></td><td>1.0</td><td>순차 페이지 읽기 (기준)</td></tr>
+    <tr><td><code>random_page_cost</code></td><td><strong>4.0</strong></td><td>무작위 페이지 읽기 — <strong>HDD 기준!</strong></td></tr>
+    <tr><td><code>cpu_tuple_cost</code></td><td>0.01</td><td>튜플 1개 처리 CPU 비용</td></tr>
+    <tr><td><code>effective_cache_size</code></td><td>4GB</td><td>"이만큼은 캐시에 있을 것"이라는 힌트 (메모리 예약 아님)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">SSD인데 random_page_cost가 4.0이라면</div>
+    <p>기본값 4.0은 회전 디스크 전제입니다. SSD/NVMe에서는 무작위·순차 접근 차이가 작으므로 <strong>1.1~2.0으로 낮추는 것이 표준 튜닝</strong>입니다. 안 낮추면 플래너가 Index Scan을 과대평가된 비용으로 보고 <strong>Seq Scan으로 도망</strong>갑니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># postgresql.conf — SSD/NVMe 권장 출발점</span>
+random_page_cost = <span class="n">1.1</span>
+effective_cache_size = <span class="s">'12GB'</span>   <span class="c"># RAM의 50~75% 수준</span></code></pre>
+
+<h2 id="s3">6.3 통계 — 플래너의 눈, ANALYZE로 닦아준다</h2>
+
+<p>선택도 추정의 근거는 <code>ANALYZE</code>가 수집해 <code>pg_statistic</code>(뷰: <code>pg_stats</code>)에 저장한 통계입니다: 고유값 수(<code>n_distinct</code>), 최빈값(<code>most_common_vals</code>), 히스토그램, 물리 정렬 상관(<code>correlation</code>)…. 이 통계가 낡으면 무슨 일이 벌어지는지 봅시다.</p>
+
+<div class="anim" data-steps="4" data-title="낡은 통계가 만드는 오판 — rows=100의 배신" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 테이블 성장 -->
+      <g data-active="1-1">
+        <rect x="40" y="60" width="180" height="80" rx="10" class="sv-box"/>
+        <text x="130" y="90" text-anchor="middle" class="sv-label">orders 테이블</text>
+        <text x="130" y="112" text-anchor="middle" class="sv-label-sm">어제: 1만 행</text>
+        <text x="130" y="128" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">통계도 1만 행 기준 ✓</text>
+      </g>
+
+      <!-- step2: 대량 적재 -->
+      <g data-show="2">
+        <rect x="40" y="60" width="180" height="110" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="130" y="90" text-anchor="middle" class="sv-label">orders 테이블</text>
+        <text x="130" y="112" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">오늘 새벽: +500만 행 적재!</text>
+        <text x="130" y="134" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">통계는 여전히 1만 행 기준 ✗</text>
+        <text x="130" y="156" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">last_analyze = 어제</text>
+      </g>
+
+      <!-- 플래너 -->
+      <rect x="330" y="70" width="170" height="70" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="415" y="99" text-anchor="middle" class="sv-label">🧮 플래너</text>
+      <text x="415" y="120" text-anchor="middle" class="sv-label-sm">통계를 믿고 계획</text>
+
+      <!-- step2~3 결과 -->
+      <g data-show="2-2">
+        <path d="M 222 105 L 326 105" class="sv-arrow flow-line"/>
+      </g>
+      <g data-show="3-3">
+        <rect x="560" y="46" width="180" height="120" rx="10" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="650" y="72" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">Nested Loop</text>
+        <text x="650" y="94" text-anchor="middle" class="sv-label-sm sv-mono">(rows=100 예상)</text>
+        <text x="650" y="116" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">actual rows=500000</text>
+        <text x="650" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">5,000배 오판 → 폭망 🐌</text>
+        <path d="M 502 105 L 556 105" stroke="var(--danger)" stroke-width="2" class="flow-line"/>
+      </g>
+
+      <!-- step4: ANALYZE -->
+      <g data-show="4">
+        <rect x="300" y="200" width="230" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="415" y="226" text-anchor="middle" class="sv-label sv-mono" font-size="13">ANALYZE orders;</text>
+        <path d="M 415 198 L 415 144" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <text x="415" y="272" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">통계 갱신 → 재계획 → Hash Join 선택, 정상 성능 회복 ✓</text>
+        <rect x="560" y="46" width="180" height="120" rx="10" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="650" y="86" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">Hash Join</text>
+        <text x="650" y="110" text-anchor="middle" class="sv-label-sm sv-mono">(rows≈480000 예상)</text>
+        <text x="650" y="134" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">현실에 맞는 계획 ✓</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>어제의 orders 테이블은 1만 행이었고, 통계도 그 기준으로 수집되어 있습니다. 평화롭죠.</p>
+    <p>새벽 배치가 500만 행을 적재했습니다. 그런데 <b style="color:var(--danger)">통계는 아직 어제 것</b> — 플래너는 여전히 "작은 테이블"이라고 믿습니다.</p>
+    <p>플래너가 "100행쯤 나오겠네"라며 Nested Loop을 고릅니다. 실제로는 50만 행 — <code>rows=100</code> vs <code>actual rows=500000</code>, 이 괴리가 EXPLAIN ANALYZE에 고스란히 찍힙니다.</p>
+    <p>처방은 간단합니다: <code>ANALYZE orders;</code>. 통계가 갱신되면 플래너는 Hash Join으로 갈아타고 성능이 돌아옵니다. <b>예상 rows와 actual rows가 10배 이상 벌어지면 통계부터 의심</b>하세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 통계 들여다보기</span>
+<span class="k">SELECT</span> attname, n_distinct, most_common_vals, correlation
+<span class="k">FROM</span> pg_stats <span class="k">WHERE</span> tablename = <span class="s">'orders'</span> <span class="k">AND</span> attname = <span class="s">'user_id'</span>;
+
+<span class="c">-- 분포가 복잡한 컬럼은 표본을 늘린다 (기본 100)</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">ALTER COLUMN</span> user_id <span class="k">SET STATISTICS</span> <span class="n">1000</span>;
+<span class="k">ANALYZE</span> orders;
+
+<span class="c">-- 컬럼 간 상관(예: city ↔ zip_code)은 확장 통계로 (10+)</span>
+<span class="k">CREATE STATISTICS</span> s_orders_region (ndistinct, dependencies, mcv)
+  <span class="k">ON</span> city, zip_code <span class="k">FROM</span> orders;</code></pre>
+
+<h2 id="s4">6.4 조인 3종 세트 — Nested Loop · Hash · Merge</h2>
+
+<p>두 테이블을 묶는 방법은 세 가지뿐입니다. 각자의 동작을 한 화면에서 비교해 봅시다.</p>
+
+<div class="anim" data-steps="6" data-title="조인 3종의 동작 — 언제 무엇이 이기는가" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 340">
+      <!-- 구분선 -->
+      <line x1="270" y1="20" x2="270" y2="260" class="sv-line" stroke-dasharray="4 6"/>
+      <line x1="520" y1="20" x2="520" y2="260" class="sv-line" stroke-dasharray="4 6"/>
+
+      <!-- NL 영역 -->
+      <text x="140" y="34" text-anchor="middle" class="sv-label" font-size="14">🔁 Nested Loop</text>
+      <g data-active="1-2">
+        <rect x="40" y="50" width="90 " height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="85" y="68" text-anchor="middle" class="sv-label-sm">Outer</text>
+        <text x="85" y="83" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">100행</text>
+        <rect x="150" y="50" width="100" height="40" rx="8" class="sv-box"/>
+        <text x="200" y="68" text-anchor="middle" class="sv-label-sm">Inner</text>
+        <text x="200" y="83" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">인덱스 조회</text>
+      </g>
+      <g data-show="2">
+        <path d="M 130 62 Q 140 56 148 62" stroke="var(--accent)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 130 72 Q 140 66 148 72" stroke="var(--accent)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 130 82 Q 140 76 148 82" stroke="var(--accent)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <text x="140" y="120" text-anchor="middle" class="sv-label-sm">외부 행마다 내부를 1회씩</text>
+        <text x="140" y="140" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">100 × O(logN)</text>
+        <text x="140" y="170" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 외부가 작고 내부에 인덱스</text>
+        <text x="140" y="190" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">✗ 외부가 크면 N×M 폭발</text>
+      </g>
+
+      <!-- Hash 영역 -->
+      <text x="395" y="34" text-anchor="middle" class="sv-label" font-size="14">#️⃣ Hash Join</text>
+      <g data-active="3-4">
+        <rect x="300" y="50" width="90" height="40" rx="8" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)"/>
+        <text x="345" y="68" text-anchor="middle" class="sv-label-sm">작은 쪽</text>
+        <text x="345" y="83" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">Build</text>
+        <rect x="400" y="50" width="100" height="40" rx="8" class="sv-box"/>
+        <text x="450" y="68" text-anchor="middle" class="sv-label-sm">큰 쪽</text>
+        <text x="450" y="83" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">Probe</text>
+      </g>
+      <g data-show="3">
+        <rect x="310" y="110" width="170" height="44" rx="8" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-dasharray="4 3"/>
+        <text x="395" y="128" text-anchor="middle" class="sv-label-sm">해시 테이블 (work_mem 안)</text>
+        <text x="395" y="146" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">key → 행</text>
+        <path d="M 345 92 L 360 108" stroke="var(--warn)" stroke-width="1.8" class="flow-line"/>
+      </g>
+      <g data-show="4">
+        <path d="M 450 92 Q 440 104 420 112" stroke="var(--accent)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <text x="395" y="176" text-anchor="middle" class="sv-label-sm">큰 쪽을 훑으며 해시 lookup</text>
+        <text x="395" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 대용량 equi-join의 왕</text>
+        <text x="395" y="216" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">✗ 메모리 초과 시 디스크 spill</text>
+      </g>
+
+      <!-- Merge 영역 -->
+      <text x="648" y="34" text-anchor="middle" class="sv-label" font-size="14">🔀 Merge Join</text>
+      <g data-active="5-5">
+        <rect x="550" y="50" width="90" height="40" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)"/>
+        <text x="595" y="68" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">1,3,5,8…</text>
+        <text x="595" y="83" text-anchor="middle" class="sv-label-sm" font-size="10">정렬됨</text>
+        <rect x="650" y="50" width="90" height="40" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)"/>
+        <text x="695" y="68" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10.5">2,3,6,8…</text>
+        <text x="695" y="83" text-anchor="middle" class="sv-label-sm" font-size="10">정렬됨</text>
+      </g>
+      <g data-show="5">
+        <path d="M 595 92 Q 620 110 645 118" stroke="var(--purple)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 695 92 Q 670 110 645 118" stroke="var(--purple)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <text x="645" y="140" text-anchor="middle" class="sv-label-sm">두 정렬 스트림을 지퍼처럼 병합</text>
+        <text x="645" y="170" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 이미 정렬돼 있으면 최강</text>
+        <text x="645" y="190" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">✗ 정렬 비용이 있으면 부담</text>
+      </g>
+
+      <!-- step6: 요약 -->
+      <g data-show="6">
+        <rect x="60" y="272" width="660" height="52" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="390" y="292" text-anchor="middle" class="sv-label">소량+인덱스 → Nested Loop · 대량 equi-join → Hash · 양쪽 정렬됨 → Merge</text>
+        <text x="390" y="312" text-anchor="middle" class="sv-label-sm">선택은 플래너의 몫 — 단, work_mem·통계가 정확해야 옳은 선택을 한다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>Nested Loop</b>의 재료: 작은 외부 집합과 인덱스 있는 내부 테이블.</p>
+    <p>외부 100행 각각에 대해 내부를 인덱스로 한 번씩 조회합니다. 소량 조인에선 최적이지만, 외부가 커지면 곱셈(N×M)이 폭발합니다. EXPLAIN에서 <code>loops=100000</code> 같은 숫자가 그 신호입니다.</p>
+    <p><b>Hash Join</b> 1단계(Build): 작은 쪽 테이블로 <b style="color:var(--warn)">메모리(work_mem) 안에 해시 테이블</b>을 만듭니다.</p>
+    <p>2단계(Probe): 큰 쪽을 한 번 훑으며 해시 lookup. 대용량 equi-join의 왕입니다. 단 해시가 work_mem을 넘치면 디스크 spill(<code>Batches &gt; 1</code>)로 급감속합니다.</p>
+    <p><b>Merge Join</b>: 양쪽이 조인 키로 정렬되어 있다면(또는 인덱스가 정렬을 제공하면) 두 스트림을 지퍼 잠그듯 한 번씩만 스캔합니다. 정렬을 새로 해야 한다면 그 비용이 관건입니다.</p>
+    <p>정리하면 — 소량+인덱스는 Nested Loop, 대량 동등 조인은 Hash, 정렬된 입력은 Merge. 플래너가 자동 선택하지만, 그 판단의 재료(통계·work_mem)는 우리가 관리해야 합니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">work_mem은 "쿼리당"이 아니라 "노드당"</div>
+    <p>기본 4MB는 대개 너무 작지만, <code>work_mem</code>은 <strong>백엔드당·정렬/해시 노드당</strong> 할당됩니다. 전역으로 크게 잡으면 <code>연결 수 × 노드 수 × work_mem</code>으로 메모리가 증발할 수 있으니, 큰 쿼리 전에 <code>SET work_mem = '128MB'</code>처럼 세션 단위로 올리는 것이 안전합니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">6.5 EXPLAIN 읽기 — 다섯 가지만 먼저 본다</h2>
+
+<pre><code><span class="k">EXPLAIN</span> (<span class="k">ANALYZE</span>, BUFFERS)
+<span class="k">SELECT</span> u.name, <span class="f">SUM</span>(o.amount)
+<span class="k">FROM</span> users u <span class="k">JOIN</span> orders o <span class="k">ON</span> o.user_id = u.id
+<span class="k">WHERE</span> u.signup_date &gt;= <span class="s">'2026-01-01'</span>
+<span class="k">GROUP BY</span> u.name <span class="k">ORDER BY</span> <span class="n">2</span> <span class="k">DESC LIMIT</span> <span class="n">20</span>;
+
+Limit  (cost=12345.67..12345.72 rows=20) (actual time=234.5..234.6 rows=20 loops=1)
+  Buffers: shared hit=1234 read=56
+  -&gt;  Sort  (Sort Method: top-N heapsort  Memory: 31kB)
+        -&gt;  HashAggregate
+              -&gt;  Hash Join  (Hash Cond: o.user_id = u.id)
+                    -&gt;  Seq Scan on orders o
+                    -&gt;  Hash  (Buckets: 2048  Batches: 1  Memory Usage: 85kB)
+                          -&gt;  Seq Scan on users u
+                                Filter: signup_date &gt;= '2026-01-01'
+                                Rows Removed by Filter: 19200
+Planning Time: 0.42 ms
+Execution Time: 235.1 ms</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>체크 포인트</th><th>읽는 법</th></tr></thead>
+  <tbody>
+    <tr><td><code>rows</code> vs <code>actual rows</code></td><td><strong>10배 이상 차이 = 통계 부정확.</strong> ANALYZE·SET STATISTICS·CREATE STATISTICS</td></tr>
+    <tr><td><code>loops</code></td><td>Nested Loop 내부가 수만 회면 총비용 = loops × 1회 비용. Hash Join 검토</td></tr>
+    <tr><td><code>Rows Removed by Filter</code></td><td>스캔 후 버려진 행. 크면 그 조건을 인덱스로 밀어넣을 후보</td></tr>
+    <tr><td><code>Buffers: shared hit / read</code></td><td>캐시 적중 / 디스크 읽기. read가 계속 크면 캐시 부족·패턴 문제</td></tr>
+    <tr><td><code>Sort Method</code></td><td><code>external merge Disk</code>가 보이면 work_mem 부족</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">EXPLAIN ANALYZE는 진짜로 실행됩니다</div>
+    <p>DELETE/UPDATE에 EXPLAIN ANALYZE를 걸면 <strong>실제로 지워지고 수정됩니다</strong>. 반드시 <code>BEGIN; EXPLAIN (ANALYZE) DELETE …; ROLLBACK;</code>으로 감싸세요.</p>
+  </div>
+</div>
+
+<h2 id="s6">6.6 운영에서는 auto_explain — 느린 쿼리만 자동 채집</h2>
+
+<pre><code><span class="c"># postgresql.conf</span>
+shared_preload_libraries = <span class="s">'auto_explain'</span>   <span class="c"># 재시작 필요</span>
+auto_explain.log_min_duration = <span class="s">'500ms'</span>     <span class="c"># 이보다 느린 쿼리만 로그</span>
+auto_explain.log_analyze = on
+auto_explain.log_buffers = on
+auto_explain.sample_rate = <span class="n">1.0</span>              <span class="c"># 고TPS면 0.01~0.1로</span></code></pre>
+
+<p>추천 조합: <code>pg_stat_statements</code>로 "빈도 × 평균 시간"이 큰 문제 쿼리 후보를 찾고 → auto_explain 로그에서 실제 계획을 확인하고 → 재현 환경에서 <code>EXPLAIN (ANALYZE, BUFFERS)</code>로 튜닝합니다.</p>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">EXPLAIN ANALYZE에서 <code>(rows=100)</code> 예상에 <code>actual rows=500000</code>이 나왔습니다. 가장 먼저 할 일은?</div>
+  <div class="quiz-opts">
+    <button type="button">work_mem을 늘린다</button>
+    <button type="button" data-correct>ANALYZE를 실행해 통계를 갱신한다 (필요 시 SET STATISTICS 상향)</button>
+    <button type="button">인덱스를 모두 재구축한다</button>
+    <button type="button">random_page_cost를 올린다</button>
+  </div>
+  <div class="quiz-expl">✅ 예상 rows와 실제 rows의 큰 괴리는 <strong>통계 부정확</strong>의 대표 신호입니다. <code>ANALYZE</code> 재수행 → 그래도 부정확하면 <code>SET STATISTICS</code> 상향, 컬럼 간 상관이 원인이면 <code>CREATE STATISTICS</code>가 순서입니다. 잘못된 rows 추정은 조인 방식·순서 선택을 연쇄적으로 망가뜨립니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">"작은 dim 테이블(1천 행) ⋈ 대형 fact 테이블(1억 행)"의 equi-join에서 플래너가 보통 선택하는 조인과 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">Merge Join — 두 테이블을 각각 정렬하는 것이 가장 싸므로</button>
+    <button type="button" data-correct>Hash Join — 작은 쪽으로 메모리 해시를 만들고 큰 쪽을 한 번만 훑으면 되므로</button>
+    <button type="button">Nested Loop — 행 수와 무관하게 항상 가장 빠르므로</button>
+  </div>
+  <div class="quiz-expl">✅ 작은 쪽(1천 행)이 work_mem에 충분히 들어가므로 Build는 순식간이고, 1억 행은 <strong>단 한 번의 순차 스캔 + O(1) 해시 lookup</strong>으로 처리됩니다. Nested Loop이라면 내부 조회가 1억 번 반복됐을 것입니다. 단, 해시가 work_mem을 넘치면(Batches&gt;1) 디스크 spill로 느려집니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch06_query_planner.md" target="_blank" rel="noopener">chapters/ch06_query_planner.md</a> — cost 계산 공식, plan_cache_mode·GEQO, 자주 발생하는 오류 패턴 6종, 운영 체크리스트가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch05.html"><span class="dir">← 이전</span><br><span class="title">5장. 인덱스 완전 정복</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch07.html"><span class="dir">다음 →</span><br><span class="title">7장. 트랜잭션과 격리 수준</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

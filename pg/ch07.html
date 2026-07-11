@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7장. 트랜잭션과 격리 수준 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch07">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>7장. 트랜잭션과 격리 수준</h1>
+<p class="lead">"동시에 두 사람이 같은 계좌를 만지면?" — 이 질문의 모든 답이 격리 수준입니다. Dirty Read부터 Serialization Anomaly까지, 그리고 Lock과 Deadlock의 실전 대응까지 다룹니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 3장 MVCC</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① SQL 표준의 이상현상 4종(Dirty·Non-repeatable·Phantom·Serialization Anomaly) ② PostgreSQL 격리 수준 3단계의 실제 동작 ③ 테이블/행 Lock과 SKIP LOCKED 패턴 ④ Deadlock의 발생·탐지·예방과 진단 쿼리</p>
+  </div>
+</div>
+
+<h2 id="s1">7.1 ACID 복습 — 이 장의 주인공은 I</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>속성</th><th>의미</th><th>PostgreSQL 구현 근거</th></tr></thead>
+  <tbody>
+    <tr><td><strong>A</strong>tomicity</td><td>전부 커밋 또는 전부 롤백</td><td>WAL, CLOG, xmin/xmax</td></tr>
+    <tr><td><strong>C</strong>onsistency</td><td>제약 위반 시 실패</td><td>CHECK/FK/UNIQUE</td></tr>
+    <tr><td><strong>I</strong>solation</td><td>동시 트랜잭션 간 영향 차단</td><td><strong>MVCC + Lock + 격리 수준 (이 장!)</strong></td></tr>
+    <tr><td><strong>D</strong>urability</td><td>커밋된 변경은 장애에도 보존</td><td>WAL fsync, checkpoint (9장)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s2">7.2 이상현상 실험실 — 같은 시나리오, 다른 격리 수준</h2>
+
+<p>SQL 표준이 정의한 이상현상은 <strong>Dirty Read</strong>(미커밋 값 읽음), <strong>Non-repeatable Read</strong>(같은 행이 변함), <strong>Phantom Read</strong>(행 개수가 변함), 그리고 PostgreSQL이 중요하게 다루는 <strong>Serialization Anomaly</strong>입니다. 두 트랜잭션을 나란히 세워두고, 격리 수준에 따라 무엇이 달라지는지 직접 봅시다.</p>
+
+<div class="anim" data-steps="6" data-title="Non-repeatable & Phantom — Read Committed vs Repeatable Read" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <!-- 레인 -->
+      <rect x="30" y="46" width="330" height="250" rx="10" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="195" y="36" text-anchor="middle" class="sv-label" fill="var(--accent)">T1: READ COMMITTED (기본)</text>
+      <rect x="400" y="46" width="330" height="250" rx="10" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="565" y="36" text-anchor="middle" class="sv-label" fill="var(--purple)">T1′: REPEATABLE READ</text>
+
+      <!-- step1: 첫 SELECT (양쪽 동일) -->
+      <g data-show="1">
+        <rect x="50" y="64" width="290" height="34" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="195" y="86" text-anchor="middle" class="sv-label-sm sv-mono">SELECT balance → 1000</text>
+        <rect x="420" y="64" width="290" height="34" rx="7" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)"/>
+        <text x="565" y="86" text-anchor="middle" class="sv-label-sm sv-mono">SELECT balance → 1000 📸 스냅샷 고정</text>
+      </g>
+
+      <!-- step2: T2 개입 -->
+      <g data-show="2">
+        <rect x="230" y="118" width="300" height="40" rx="8" fill="color-mix(in srgb, var(--warn) 16%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="380" y="135" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">⚡ T2 (다른 세션): UPDATE balance=500;</text>
+        <text x="380" y="151" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">INSERT 신규 계좌 1건; COMMIT</text>
+      </g>
+
+      <!-- step3: 재조회 RC -->
+      <g data-show="3">
+        <rect x="50" y="176" width="290" height="34" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="195" y="198" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">같은 SELECT → 500 (값이 변함!)</text>
+        <text x="195" y="228" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">😱 Non-repeatable Read 발생</text>
+      </g>
+
+      <!-- step4: 재조회 RR -->
+      <g data-show="4">
+        <rect x="420" y="176" width="290" height="34" rx="7" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="565" y="198" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">같은 SELECT → 1000 (그대로!)</text>
+        <text x="565" y="228" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 시작 시점 스냅샷을 끝까지 재사용</text>
+      </g>
+
+      <!-- step5: phantom -->
+      <g data-show="5">
+        <rect x="50" y="242" width="290" height="34" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="195" y="264" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">COUNT(*) → 1건 증가 (Phantom!)</text>
+        <rect x="420" y="242" width="290" height="34" rx="7" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="565" y="264" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">COUNT(*) → 그대로 (Phantom 차단)</text>
+      </g>
+
+      <!-- step6: 결론 -->
+      <g data-show="6">
+        <rect x="80" y="304" width="600" height="30" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.3"/>
+        <text x="380" y="324" text-anchor="middle" class="sv-label-sm">PostgreSQL의 Repeatable Read는 표준보다 강력 — Phantom까지 막는 Snapshot Isolation</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>두 세계를 동시에 실험합니다. 왼쪽 T1은 기본값 <b style="color:var(--accent)">Read Committed</b>, 오른쪽 T1′은 <b style="color:var(--purple)">Repeatable Read</b>. 둘 다 잔액을 읽어 1000을 얻습니다. RR은 이 순간 <b>스냅샷을 고정</b>합니다.</p>
+    <p>그 사이 다른 세션 T2가 잔액을 500으로 UPDATE하고, 새 계좌도 하나 INSERT한 뒤 <b>커밋</b>합니다.</p>
+    <p>Read Committed의 T1이 같은 행을 다시 읽으면? <b style="color:var(--danger)">500</b> — 문(statement)마다 새 스냅샷을 뜨기 때문에 커밋된 최신값이 보입니다. 같은 트랜잭션 안에서 값이 변했으니 <b>Non-repeatable Read</b>.</p>
+    <p>Repeatable Read의 T1′은? 여전히 <b style="color:var(--ok)">1000</b>. 시작 시점 스냅샷을 끝까지 재사용하므로 "그 순간의 세상"이 유지됩니다.</p>
+    <p>행 개수도 마찬가지 — RC에서는 T2가 INSERT한 행이 나타나는 <b style="color:var(--danger)">Phantom Read</b>가 발생하지만, RR에서는 차단됩니다.</p>
+    <p>정리: PostgreSQL의 RR은 <b>표준 요구(NRR만 방지)보다 강한 Snapshot Isolation</b>이라 Phantom까지 막습니다. 참고로 Read Uncommitted를 지정해도 MVCC 덕분에 Read Committed와 동일하게 동작 — Dirty Read는 PostgreSQL에 아예 없습니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>격리 수준</th><th>Dirty</th><th>Non-repeatable</th><th>Phantom</th><th>Serialization Anomaly</th></tr></thead>
+  <tbody>
+    <tr><td>Read Committed (기본)</td><td>✗ 없음</td><td>발생</td><td>발생</td><td>발생</td></tr>
+    <tr><td>Repeatable Read</td><td>✗</td><td>✗</td><td><strong>✗ (표준보다 강함)</strong></td><td>발생</td></tr>
+    <tr><td>Serializable (SSI)</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- Repeatable Read의 대가: 쓰기 충돌 시 에러 → 재시도 로직 필수</span>
+<span class="k">BEGIN ISOLATION LEVEL</span> REPEATABLE READ;
+<span class="k">SELECT</span> balance <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="n">1</span>;   <span class="c">-- 1000 (스냅샷 고정)</span>
+<span class="c">-- 그 사이 T2가 같은 행을 UPDATE & COMMIT</span>
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance - <span class="n">100</span> <span class="k">WHERE</span> id = <span class="n">1</span>;
+<span class="c">-- ERROR: could not serialize access due to concurrent update (40001)</span>
+<span class="k">ROLLBACK</span>;  <span class="c">-- 애플리케이션이 처음부터 재시도해야 한다</span></code></pre>
+
+<h2 id="s3">7.3 Serializable — 스냅샷도 못 막는 Write Skew</h2>
+
+<p>Repeatable Read조차 못 막는 미묘한 버그가 있습니다. 각자 "읽고 → 판단하고 → 다른 행을 쓰는" 두 트랜잭션이 교차하면, 개별로는 멀쩡한데 <strong>합치면 제약이 깨지는</strong> 결과가 나옵니다. 병원 당직 시스템으로 봅시다 — 규칙: <strong>최소 한 명은 당직</strong>.</p>
+
+<div class="anim" data-steps="5" data-title="Write Skew — Serializable(SSI)만이 잡는 이상현상" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 상태판 -->
+      <rect x="280" y="30" width="200" height="70" rx="10" class="sv-box"/>
+      <text x="380" y="54" text-anchor="middle" class="sv-label">🏥 당직 현황</text>
+      <text x="380" y="78" text-anchor="middle" class="sv-label-sm sv-mono">Alice: ON · Bob: ON</text>
+
+      <!-- T1 -->
+      <g data-show="1">
+        <rect x="40" y="130" width="290" height="56" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="185" y="152" text-anchor="middle" class="sv-label-sm sv-mono">T1(Alice): 당직자 수 조회 → 2명</text>
+        <text x="185" y="172" text-anchor="middle" class="sv-label-sm">"2명이네? 나는 빠져도 되겠다"</text>
+      </g>
+
+      <!-- T2 -->
+      <g data-show="2">
+        <rect x="430" y="130" width="290" height="56" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="575" y="152" text-anchor="middle" class="sv-label-sm sv-mono">T2(Bob): 당직자 수 조회 → 2명</text>
+        <text x="575" y="172" text-anchor="middle" class="sv-label-sm">"2명이네? 나도 빠져도 되겠다"</text>
+      </g>
+
+      <!-- step3: 둘 다 커밋 (RR) -->
+      <g data-show="3">
+        <text x="185" y="212" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">UPDATE Alice=OFF → 커밋 ✓</text>
+        <text x="575" y="212" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">UPDATE Bob=OFF → 커밋 ✓ (다른 행이라 충돌 없음)</text>
+      </g>
+      <g data-show="3-3">
+        <text x="380" y="250" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="15">😱 당직자 0명 — Repeatable Read로도 못 막았다!</text>
+      </g>
+
+      <!-- step4: SSI -->
+      <g data-show="4">
+        <rect x="180" y="234" width="400" height="40" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="380" y="251" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">SERIALIZABLE이었다면: 읽기 의존성 교차 감지 →</text>
+        <text x="380" y="268" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">ERROR 40001 serialization_failure (한쪽 abort)</text>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <text x="380" y="292" text-anchor="middle" class="sv-label-sm">에러를 받은 쪽이 재시도하면 "1명은 남는다" 제약이 지켜진다 — 직렬 실행과 동등한 결과 보장</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>Alice와 Bob 모두 당직 중입니다. 규칙은 "최소 1명 당직". Alice의 트랜잭션 T1이 당직자 수를 세어 봅니다 — 2명. "빠져도 되겠네."</p>
+    <p>거의 동시에 Bob의 T2도 같은 조회를 합니다 — 역시 2명(스냅샷상). "나도 빠져도 되겠네."</p>
+    <p>T1은 Alice 행을, T2는 Bob 행을 UPDATE합니다. <b>서로 다른 행이라 쓰기 충돌이 없어</b> Repeatable Read에서도 둘 다 커밋 성공 — 결과는 당직자 0명. 이것이 <b style="color:var(--danger)">Write Skew</b>입니다.</p>
+    <p><b>Serializable(SSI)</b>은 다릅니다. 각 트랜잭션이 "읽은 범위"를 predicate lock으로 추적해, 읽기-쓰기 의존성이 위험하게 교차하면 한쪽을 <code>serialization_failure</code>(40001)로 abort시킵니다.</p>
+    <p>에러 받은 쪽이 재시도하면 이번엔 "1명뿐이네, 못 빠진다"를 보게 됩니다. 비용은 predicate lock 오버헤드와 재시도 — <b>진짜 필요한 불변식이 있을 때만</b> 올리세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 세션 기본 격리 수준</span>
+<span class="k">SET</span> default_transaction_isolation = <span class="s">'read committed'</span>;  <span class="c">-- 기본 유지 권장</span>
+
+<span class="c">-- 필요한 트랜잭션만 올린다</span>
+<span class="k">BEGIN ISOLATION LEVEL</span> SERIALIZABLE;
+<span class="c">-- 읽기 전용 리포트라면: 재시도 없는 안전 스냅샷을 기다림</span>
+<span class="k">BEGIN ISOLATION LEVEL</span> SERIALIZABLE <span class="k">READ ONLY DEFERRABLE</span>;</code></pre>
+
+<h2 id="s4">7.4 Lock — MVCC가 못 없애는 최후의 줄서기</h2>
+
+<p>MVCC 덕에 읽기·쓰기는 서로 안 막지만, <strong>쓰기끼리·DDL은 Lock이 필요</strong>합니다. 테이블 레벨 Lock은 8단계나 되지만, 운영에서 기억할 것은 두 개입니다: INSERT/UPDATE/DELETE가 잡는 <code>ROW EXCLUSIVE</code>, 그리고 DROP·TRUNCATE·대부분의 ALTER가 잡는 <code>ACCESS EXCLUSIVE</code> — 후자는 <strong>SELECT까지 차단</strong>하므로 DDL 실수가 곧 서비스 장애가 됩니다.</p>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">DDL 전에는 반드시 lock_timeout</div>
+    <p><code>SET lock_timeout = '2s';</code> 후 ALTER를 실행하세요. Lock을 2초 안에 못 잡으면 에러로 물러나므로, ALTER가 기존 긴 쿼리 뒤에 줄 서 있는 동안 <strong>그 뒤의 모든 SELECT까지 연쇄 대기</strong>하는 참사를 막을 수 있습니다. <code>CREATE INDEX CONCURRENTLY</code>·<code>REINDEX CONCURRENTLY</code>도 같은 맥락의 도구입니다.</p>
+  </div>
+</div>
+
+<p>행 레벨 Lock은 <code>SELECT … FOR UPDATE</code> 계열로 명시적으로 잡을 수 있습니다. 특히 <strong>SKIP LOCKED</strong>는 큐 워커 패턴의 표준입니다.</p>
+
+<pre><code><span class="c">-- 큐 소비자 패턴: 여러 워커가 경합 없이 서로 다른 작업을 집는다</span>
+<span class="k">BEGIN</span>;
+<span class="k">SELECT</span> * <span class="k">FROM</span> jobs
+<span class="k">WHERE</span> status = <span class="s">'pending'</span>
+<span class="k">ORDER BY</span> created_at
+<span class="k">FOR UPDATE SKIP LOCKED</span>   <span class="c">-- 이미 잠긴 행은 건너뛴다 (9.5+)</span>
+<span class="k">LIMIT</span> <span class="n">10</span>;
+<span class="c">-- ... 처리 ...</span>
+<span class="k">UPDATE</span> jobs <span class="k">SET</span> status = <span class="s">'done'</span> <span class="k">WHERE</span> id = <span class="f">ANY</span>(...);
+<span class="k">COMMIT</span>;</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">행 Lock은 어디에 저장될까</div>
+    <p>메모리의 Lock Manager가 아니라 <strong>튜플 헤더의 xmax 필드</strong>에 기록됩니다(3장의 그 xmax!). 그래서 수백만 행을 잠가도 락 테이블이 고갈되지 않습니다. 여러 트랜잭션이 한 행을 공유 잠금하면 MultiXact라는 구조가 동원됩니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">7.5 Deadlock — 서로를 기다리다 함께 멈춘다</h2>
+
+<p>A가 B의 Lock을 기다리고, B가 A의 Lock을 기다리면 영원히 못 풉니다. PostgreSQL은 <code>deadlock_timeout</code>(기본 1초) 후 대기 그래프에서 사이클을 찾아 <strong>한쪽을 강제 abort</strong>합니다.</p>
+
+<div class="anim" data-steps="5" data-title="Deadlock의 탄생과 자동 해소" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 행 2개 -->
+      <rect x="310" y="60" width="140" height="44" rx="9" class="sv-box"/>
+      <text x="380" y="87" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">row id=1</text>
+      <rect x="310" y="180" width="140" height="44" rx="9" class="sv-box"/>
+      <text x="380" y="207" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">row id=2</text>
+
+      <!-- T1, T2 -->
+      <rect x="50" y="110" width="120" height="52" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="110" y="132" text-anchor="middle" class="sv-label">T1</text>
+      <text x="110" y="150" text-anchor="middle" class="sv-label-sm">이체: 1→2</text>
+      <rect x="590" y="110" width="120" height="52" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="650" y="132" text-anchor="middle" class="sv-label">T2</text>
+      <text x="650" y="150" text-anchor="middle" class="sv-label-sm">이체: 2→1</text>
+
+      <!-- step1: 각자 첫 락 -->
+      <g data-show="1">
+        <path d="M 172 122 Q 240 100 306 84" stroke="var(--accent)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="222" y="86" class="sv-label-sm" fill="var(--accent)">UPDATE id=1 🔒</text>
+        <path d="M 588 150 Q 520 180 454 200" stroke="var(--purple)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="480" y="232" class="sv-label-sm" fill="var(--purple)">UPDATE id=2 🔒</text>
+      </g>
+
+      <!-- step2: 교차 대기 -->
+      <g data-show="2">
+        <path d="M 172 150 Q 240 180 306 202" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="200" y="226" class="sv-label-sm" fill="var(--danger)">id=2도 필요… ⏳ 대기</text>
+      </g>
+      <g data-show="3">
+        <path d="M 588 122 Q 520 104 454 86" stroke="var(--purple)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="474" y="66" class="sv-label-sm" fill="var(--danger)">id=1도 필요… ⏳ 대기</text>
+        <text x="380" y="150" text-anchor="middle" class="sv-label" font-size="15" fill="var(--danger)">♻️ 사이클 완성 = Deadlock</text>
+      </g>
+
+      <!-- step4: 탐지 -->
+      <g data-show="4">
+        <rect x="200" y="250" width="360" height="40" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="380" y="267" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">deadlock_timeout(1s) 경과 → 대기 그래프 검사</text>
+        <text x="380" y="284" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">ERROR: deadlock detected → T2 abort</text>
+      </g>
+
+      <!-- step5: 해소 -->
+      <g data-show="5">
+        <rect x="590" y="110" width="120" height="52" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <text x="650" y="98" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">💀 롤백됨</text>
+        <path d="M 172 150 Q 240 180 306 202" stroke="var(--ok)" stroke-width="2.4" fill="none" class="flow-line"/>
+        <text x="200" y="226" class="sv-label-sm" fill="var(--ok)">T1이 Lock 획득, 진행 ✓</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>T1은 계좌 1→2 이체, T2는 반대로 2→1 이체. 각자 첫 번째 행을 UPDATE하며 <b>행 Lock</b>을 잡습니다 — 여기까진 정상.</p>
+    <p>T1이 두 번째 행(id=2)을 UPDATE하려는데, T2가 잡고 있어 <b>대기</b>에 들어갑니다.</p>
+    <p>T2도 id=1을 원합니다 — 그런데 그건 T1이 잡고 있죠. <b style="color:var(--danger)">서로가 서로를 기다리는 사이클</b>이 완성됐습니다. 아무도 스스로는 못 빠져나옵니다.</p>
+    <p><code>deadlock_timeout</code>(기본 1초)이 지나면 PostgreSQL이 대기 그래프를 검사해 사이클을 발견하고, <b>한 트랜잭션을 골라 abort</b>합니다.</p>
+    <p>T2가 롤백되며 Lock이 풀리고 T1은 정상 진행합니다. 예방책은 단순합니다 — <b>모든 코드가 같은 순서로(예: id 오름차순) 행에 접근</b>하면 사이클 자체가 생기지 않습니다.</p>
+  </div>
+</div>
+
+<ul>
+  <li><strong>접근 순서 고정</strong> — 모든 트랜잭션이 같은 순서로 행·테이블에 접근.</li>
+  <li><strong>트랜잭션은 짧게</strong> — Lock 보유 시간 최소화.</li>
+  <li><strong>UPSERT 활용</strong> — 같은 키 경합은 <code>INSERT … ON CONFLICT DO UPDATE</code> 한 문장으로.</li>
+  <li><code>log_lock_waits = on</code> — deadlock 직전의 긴 대기를 로그로 남겨 사전 감지.</li>
+</ul>
+
+<h2 id="s6">7.6 실전 진단 — 누가 누구를 막고 있나</h2>
+
+<pre><code><span class="c">-- 블로킹 체인 추적 (9.6+)</span>
+<span class="k">SELECT</span> blocked.pid  <span class="k">AS</span> blocked_pid,
+       blocked.query <span class="k">AS</span> blocked_query,
+       blocking.pid  <span class="k">AS</span> blocking_pid,
+       blocking.query <span class="k">AS</span> blocking_query
+<span class="k">FROM</span> pg_stat_activity blocked
+<span class="k">JOIN LATERAL</span> (
+    <span class="k">SELECT</span> pid, query <span class="k">FROM</span> pg_stat_activity
+    <span class="k">WHERE</span> pid = <span class="f">ANY</span>(<span class="f">pg_blocking_pids</span>(blocked.pid))
+) blocking <span class="k">ON</span> true
+<span class="k">WHERE</span> blocked.wait_event_type = <span class="s">'Lock'</span>;
+
+<span class="c">-- 원인 세션 정리: 부드럽게 → 강제로</span>
+<span class="k">SELECT</span> <span class="f">pg_cancel_backend</span>(<span class="n">12345</span>);     <span class="c">-- 쿼리만 취소</span>
+<span class="k">SELECT</span> <span class="f">pg_terminate_backend</span>(<span class="n">12345</span>);  <span class="c">-- 연결 종료</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">조용한 빌런: idle in transaction</div>
+    <p>트랜잭션을 열어놓고 커밋을 잊은 세션은 Lock뿐 아니라 <strong>VACUUM의 dead tuple 회수까지 막습니다</strong>(오래된 스냅샷 유지). <code>idle_in_transaction_session_timeout = '5min'</code>을 반드시 설정하세요. 기본값 0(무제한)은 사고를 기다리는 상태입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">PostgreSQL의 Repeatable Read에 대한 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">SQL 표준대로 Non-repeatable Read만 막고 Phantom Read는 허용한다</button>
+    <button type="button" data-correct>Snapshot Isolation으로 구현되어 Phantom Read까지 막지만, Write Skew(Serialization Anomaly)는 못 막는다</button>
+    <button type="button">모든 이상현상을 막아 Serializable과 동일하다</button>
+    <button type="button">문(statement)마다 새 스냅샷을 만든다</button>
+  </div>
+  <div class="quiz-expl">✅ PostgreSQL의 RR은 트랜잭션 시작 시 스냅샷을 한 번 뜨고 끝까지 재사용하는 Snapshot Isolation이라 표준 요구보다 강하게 <strong>Phantom까지 차단</strong>합니다. 그러나 서로 다른 행을 쓰는 Write Skew는 통과시키므로, 그런 불변식이 필요하면 Serializable(SSI)로 올려야 합니다. "문마다 새 스냅샷"은 Read Committed의 동작입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">여러 워커 프로세스가 jobs 테이블에서 대기 작업을 나눠 가져가는 큐를 구현하려 합니다. 가장 적합한 방법은?</div>
+  <div class="quiz-opts">
+    <button type="button">SERIALIZABLE 격리 수준에서 일반 SELECT 후 UPDATE</button>
+    <button type="button">LOCK TABLE jobs로 테이블 전체를 잠그고 처리</button>
+    <button type="button" data-correct>SELECT … FOR UPDATE SKIP LOCKED로 잠기지 않은 행만 집어간다</button>
+  </div>
+  <div class="quiz-expl">✅ <code>FOR UPDATE SKIP LOCKED</code>는 이미 다른 워커가 잠근 행을 대기 없이 건너뛰므로, 워커들이 자연스럽게 서로 다른 작업을 나눠 갖습니다. 테이블 전체 잠금은 병렬성을 죽이고, Serializable은 재시도 폭증을 부릅니다. 이 패턴이 PostgreSQL 기반 작업 큐의 표준입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch07_transactions_isolation.md" target="_blank" rel="noopener">chapters/ch07_transactions_isolation.md</a> — 테이블 Lock 8단계 호환표, Advisory Lock, SAVEPOINT와 서브트랜잭션 오버플로우, 운영 권장 설정이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06.html"><span class="dir">← 이전</span><br><span class="title">6장. 쿼리 플래너와 EXPLAIN</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch08.html"><span class="dir">다음 →</span><br><span class="title">8장. VACUUM과 Autovacuum</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

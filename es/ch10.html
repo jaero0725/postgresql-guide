@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10장. 안티패턴 모음 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch10">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>10장. 안티패턴 모음 — 클러스터를 무너뜨리는 습관들</h1>
+<p class="lead">Elasticsearch는 강력하지만, RDB의 직관을 그대로 가져오면 클러스터가 무너집니다. 운영 현장에서 반복 관찰되는 안티패턴을 "왜 위험한가 → 어떤 증상이 나오는가 → 어떻게 고치는가" 순서로 정리합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 27분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 5~9장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 매핑 안티패턴 — dynamic 방치와 매핑 폭발, text/keyword 혼동, nested 남발 ② 쿼리 안티패턴 — deep pagination, leading wildcard ③ 샤딩·색인 안티패턴 — oversharding, replica 오해, 단건 INSERT ④ JVM heap 32GB의 벽과 update 남발</p>
+  </div>
+</div>
+
+<h2 id="s1">10.1 매핑 폭발 — dynamic: true를 방치하기</h2>
+
+<p>기본값(<code>dynamic: true</code>)에서 처음 보는 필드는 자동으로 매핑에 추가됩니다. 개발 초반에는 편하지만, 필드 이름이 동적으로 만들어지는 데이터(사용자 ID를 키로 쓰는 JSON 등)가 들어오는 순간 매핑이 통제 불능으로 불어납니다. 이것이 <strong>매핑 폭발(mapping explosion)</strong>입니다.</p>
+
+<div class="anim" data-steps="5" data-title="매핑 폭발 — dynamic: true의 폭주와 strict 처방 (before/after)" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 350">
+      <!-- BEFORE 영역 -->
+      <text x="20" y="26" class="sv-label" font-size="14">❌ BEFORE — dynamic: true</text>
+      <rect x="20" y="40" width="360" height="170" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="36" y="64" class="sv-label-sm">인덱스 매핑 (fields)</text>
+
+      <!-- 필드 카운터 -->
+      <rect x="250" y="52" width="116" height="26" rx="13" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <g data-show="1-1"><text x="308" y="70" text-anchor="middle" class="sv-label sv-mono" font-size="12">fields: 3</text></g>
+      <g data-show="2-2"><text x="308" y="70" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">fields: 412</text></g>
+      <g data-show="3-5"><text x="308" y="70" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--danger)">fields: 1000!</text></g>
+
+      <text x="36" y="96" class="sv-label-sm sv-mono">user_id · @timestamp · message</text>
+      <g data-show="2">
+        <text x="36" y="122" class="sv-label-sm sv-mono" fill="var(--warn)">metrics.cpu_host01, metrics.cpu_host02, …</text>
+        <text x="36" y="144" class="sv-label-sm sv-mono" fill="var(--warn)">session_9f2ka1.start, session_x71b2.start, …</text>
+        <text x="36" y="166" class="sv-label-sm" fill="var(--warn)">문서마다 새 키 → 필드가 자동 증식 📈</text>
+      </g>
+      <g data-show="3">
+        <rect x="36" y="178" width="328" height="24" rx="6" fill="color-mix(in srgb, var(--danger) 14%, transparent)" stroke="var(--danger)"/>
+        <text x="200" y="195" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">Limit of total fields [1000] has been exceeded</text>
+      </g>
+
+      <!-- 증상 -->
+      <g data-show="3-3">
+        <text x="200" y="240" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">cluster state 비대화 → master 압박 → 색인 실패</text>
+      </g>
+
+      <!-- AFTER 영역 -->
+      <g data-show="4">
+        <text x="430" y="26" class="sv-label" font-size="14" fill="var(--ok)">✅ AFTER — dynamic: strict</text>
+        <rect x="430" y="40" width="350" height="170" rx="10" fill="color-mix(in srgb, var(--ok) 6%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <rect x="660" y="52" width="104" height="26" rx="13" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)"/>
+        <text x="712" y="70" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">fields: 3</text>
+        <text x="446" y="96" class="sv-label-sm sv-mono">user_id: keyword</text>
+        <text x="446" y="118" class="sv-label-sm sv-mono">@timestamp: date</text>
+        <text x="446" y="140" class="sv-label-sm sv-mono">message: text</text>
+        <text x="446" y="170" class="sv-label-sm">정의 밖 필드가 오면?</text>
+        <rect x="446" y="180" width="310" height="24" rx="6" class="sv-box"/>
+        <text x="601" y="197" text-anchor="middle" class="sv-label-sm sv-mono">strict_dynamic_mapping_exception → 즉시 발견</text>
+      </g>
+
+      <g data-show="5">
+        <rect x="20" y="266" width="760" height="64" rx="10" fill="color-mix(in srgb, var(--accent) 7%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="400" y="292" text-anchor="middle" class="sv-label" font-size="13">선택지: strict(거부·개발 단계 권장) · false(저장하되 색인 안 함) · runtime(런타임 필드로)</text>
+        <text x="400" y="314" text-anchor="middle" class="sv-label-sm">정석 = 명시적 매핑 + 인덱스 템플릿 + 컴포넌트 템플릿</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>처음엔 평화롭습니다. 필드 3개짜리 로그 인덱스에 <code>dynamic: true</code>(기본값) — 새 필드가 오면 ES가 알아서 매핑에 추가합니다.</p>
+    <p>그런데 호스트명·세션ID가 <b>필드 이름에 들어간</b> 문서들이 유입되기 시작합니다. 문서마다 새로운 키 → <b style="color:var(--warn)">매핑 필드가 자동 증식</b>합니다.</p>
+    <p><code>Limit of total fields [1000] has been exceeded</code> — 색인이 실패하기 시작합니다. 그 전부터 이미 매핑이 담긴 <b style="color:var(--danger)">cluster state가 비대해져 master를 압박</b>하고 있었습니다.</p>
+    <p>처방은 <b style="color:var(--ok)">명시적 매핑 + dynamic: strict</b>. 정의 밖 필드는 즉시 예외로 거부되어, 잘못된 데이터 구조를 조기에 발견합니다. 필드 수는 설계한 대로 고정됩니다.</p>
+    <p>상황에 따라 <code>strict</code>(거부), <code>false</code>(저장만 하고 색인 안 함), <code>runtime</code>(런타임 필드) 중 선택하세요. "데이터가 키를 만들게 하지 말고, 키는 값으로 내려라"가 근본 해법입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">PUT</span> /my-index
+{
+  <span class="s">"mappings"</span>: {
+    <span class="s">"dynamic"</span>: <span class="s">"strict"</span>,
+    <span class="s">"properties"</span>: {
+      <span class="s">"user_id"</span>:    { <span class="s">"type"</span>: <span class="s">"keyword"</span> },
+      <span class="s">"@timestamp"</span>: { <span class="s">"type"</span>: <span class="s">"date"</span> },
+      <span class="s">"message"</span>:    { <span class="s">"type"</span>: <span class="s">"text"</span> }
+    }
+  }
+}</code></pre>
+
+<h2 id="s2">10.2 text와 keyword를 혼동하기</h2>
+
+<p>같은 문자열이라도 두 타입은 완전히 다른 일을 합니다. <code>status</code> 필드를 text로만 잡으면 정렬·집계·정확 일치가 전부 깨집니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>타입</th><th>분석</th><th>정렬</th><th>집계</th><th>term 정확 일치</th></tr></thead>
+  <tbody>
+    <tr><td><code>text</code></td><td>토큰화·소문자화</td><td>불가*</td><td>불가*</td><td>불가</td></tr>
+    <tr><td><code>keyword</code></td><td>그대로 저장</td><td>가능</td><td>가능</td><td>가능</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>(*) <code>fielddata: true</code>로 강제할 수 있으나 heap 폭주 위험 때문에 금지 수준으로 비권장.</p>
+
+<pre><code><span class="c">// ✅ 처방: multi-field — 하나의 값을 두 방식으로 색인</span>
+{
+  <span class="s">"status"</span>: {
+    <span class="s">"type"</span>: <span class="s">"text"</span>,                          <span class="c">// 전문 검색용</span>
+    <span class="s">"fields"</span>: {
+      <span class="s">"keyword"</span>: { <span class="s">"type"</span>: <span class="s">"keyword"</span>, <span class="s">"ignore_above"</span>: <span class="n">256</span> }   <span class="c">// 정렬·집계·정확 일치용</span>
+    }
+  }
+}</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">nested도 남발하면 안티패턴</div>
+    <p><code>nested</code> 타입은 배열 요소마다 <strong>숨은 Lucene 문서</strong>를 만듭니다. 문서 1건 + 태그 2개 = Lucene 문서 3개. 인덱스가 예상보다 2~10배 커지고 join 비용으로 검색이 느려집니다. key가 고정 집합이면 평탄화(flatten), 임의 key 검색이 필요하면 <code>flattened</code> 타입을 먼저 검토하고, 요소 간 관계 검증이 진짜 필요할 때만 nested를 쓰세요.</p>
+  </div>
+</div>
+
+<h2 id="s3">10.3 쿼리 안티패턴 — deep pagination과 leading wildcard</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>📄 from: 100000, size: 10</h4>
+    <p>모든 샤드가 from+size개의 상위 결과를 coordinating node로 전송 → 메모리 폭발. 기본 <code>max_result_window</code>(10,000)가 막아주는데, <strong>이 한계를 늘리는 것이 바로 안티패턴</strong>입니다. 처방: <a href="ch07.html">7장</a>의 PIT + search_after. UI는 "X페이지 이동"보다 "더 보기" 패턴으로.</p>
+  </div>
+  <div class="card">
+    <h4>🃏 wildcard: "*example.com*"</h4>
+    <p>선행 와일드카드는 역색인의 정렬을 못 쓰므로 <strong>모든 term 풀스캔</strong>. 처방: ① 8.x <code>wildcard</code> 필드 타입 ② 문자열을 뒤집어 저장하는 reverse 트릭 ③ edge_ngram ④ URL이면 host/path 분리 저장 — 데이터 모델 재설계가 근본 해법.</p>
+  </div>
+</div>
+
+<h2 id="s4">10.4 Oversharding — 작은 shard 수만 개</h2>
+
+<p>"인덱스마다 기본 5 shard니까 괜찮겠지"로 일별 인덱스를 몇 달 쌓으면 shard 수천~수만 개가 됩니다. shard 하나하나는 데이터가 없어도 <strong>고정 비용</strong>(Lucene IndexReader, 파일 핸들, heap 내 segment 메타데이터, cluster state 항목)을 차지합니다.</p>
+
+<div class="anim" data-steps="4" data-title="Oversharding — 샤드 수천 개가 클러스터를 짓누르는 과정 (before/after)" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- 노드 박스 -->
+      <rect x="20" y="46" width="380" height="180" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="30" y="34" class="sv-label" font-size="14">data node (heap 31GB)</text>
+
+      <!-- step1: 작은 샤드들 등장 -->
+      <g data-show="1-3">
+        <g>
+          <rect x="36" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="82" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="128" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="174" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="220" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="266" y="62" width="40" height="24" rx="5" class="sv-box"/><rect x="312" y="62" width="40" height="24" rx="5" class="sv-box"/>
+        </g>
+        <text x="36" y="104" class="sv-label-sm">logs-01-01 × 5 shards, logs-01-02 × 5 shards …</text>
+      </g>
+      <g data-show="2-3">
+        <g>
+          <rect x="36" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="82" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="128" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="174" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="220" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="266" y="114" width="40" height="24" rx="5" class="sv-box"/><rect x="312" y="114" width="40" height="24" rx="5" class="sv-box"/>
+          <rect x="36" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="82" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="128" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="174" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="220" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="266" y="146" width="40" height="24" rx="5" class="sv-box"/><rect x="312" y="146" width="40" height="24" rx="5" class="sv-box"/>
+        </g>
+        <text x="36" y="196" class="sv-label-sm" fill="var(--warn)">…수천 개. shard당 파일 핸들 + heap 메타데이터 고정비</text>
+      </g>
+
+      <!-- heap 게이지 -->
+      <text x="430" y="60" class="sv-label-sm">heap 사용률</text>
+      <rect x="430" y="70" width="180" height="16" rx="8" fill="none" stroke="var(--border)"/>
+      <g data-show="1-1"><rect x="430" y="70" width="45" height="16" rx="8" fill="var(--ok)"/></g>
+      <g data-show="2-3"><rect x="430" y="70" width="150" height="16" rx="8" fill="var(--danger)" class="blink"/></g>
+      <g data-show="4"><rect x="430" y="70" width="63" height="16" rx="8" fill="var(--ok)"/></g>
+
+      <!-- master -->
+      <rect x="430" y="110" width="350" height="70" rx="10" class="sv-box"/>
+      <text x="605" y="136" text-anchor="middle" class="sv-label" font-size="12.5">🧠 master node — cluster state</text>
+      <g data-show="1-1"><text x="605" y="160" text-anchor="middle" class="sv-label-sm sv-mono">shards: 210 · state 갱신 빠름</text></g>
+      <g data-show="2-3"><text x="605" y="160" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">shards: 10,000 · state 갱신 지연 ⛔</text></g>
+      <g data-show="4"><text x="605" y="160" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">shards: 600 · state 가볍고 빠름</text></g>
+
+      <!-- step3: 증상 -->
+      <g data-show="3-3">
+        <text x="400" y="258" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">증상: "too many shards" 경고 · 색인/검색 둔화 · 노드 재시작 복구가 분 → 시간 단위로</text>
+      </g>
+
+      <!-- step4: after -->
+      <g data-show="4">
+        <g>
+          <rect x="36" y="70" width="160" height="56" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+          <text x="116" y="102" text-anchor="middle" class="sv-label-sm sv-mono">shard 42GB</text>
+          <rect x="210" y="70" width="160" height="56" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+          <text x="290" y="102" text-anchor="middle" class="sv-label-sm sv-mono">shard 47GB</text>
+          <rect x="36" y="140" width="160" height="56" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+          <text x="116" y="172" text-anchor="middle" class="sv-label-sm sv-mono">shard 38GB</text>
+          <rect x="210" y="140" width="160" height="56" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+          <text x="290" y="172" text-anchor="middle" class="sv-label-sm sv-mono">shard 44GB</text>
+        </g>
+        <text x="400" y="258" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ AFTER: ILM rollover로 shard 10~50GB 유지 · heap GB당 shard 20개 이하 목표</text>
+        <text x="400" y="284" text-anchor="middle" class="sv-label-sm">같은 매핑의 작은 인덱스들은 1 shard 인덱스로 통합 검토</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>일별 인덱스 × 기본 5 shard × replica. 처음엔 heap도 cluster state도 여유롭습니다.</p>
+    <p>몇 달 뒤 — 몇 MB짜리 shard가 수천 개. 각 shard는 <b style="color:var(--warn)">데이터와 무관한 고정비</b>(IndexReader, 파일 핸들, heap 메타데이터, cluster state 항목)를 차지하고, heap이 메타데이터로 붉게 물듭니다.</p>
+    <p>증상 발현: <b style="color:var(--danger)">"too many shards" 경고, master의 cluster state 갱신 지연, 색인·검색 둔화</b>, 노드 재시작 복구가 시간 단위로 늘어납니다.</p>
+    <p>처방: <b style="color:var(--ok)">ILM rollover로 primary shard 10~50GB 유지</b>, heap GB당 shard 20개 이하, 같은 매핑의 작은 인덱스들은 1-shard 인덱스로 통합. shard 수는 인덱스 생성 시에만 정할 수 있으니 이후엔 reindex가 필요합니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">10.5 그 밖의 함정들 — replica, heap, update, 단건 INSERT</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🪞 "replica 늘리면 색인도 빨라진다?"</h4>
+    <p>반대입니다. replica는 <strong>검색</strong> 처리량용. 색인은 primary가 쓴 것을 <strong>모든 replica가 반복</strong>하므로 네트워크·디스크 쓰기가 N배가 되어 색인은 오히려 느려집니다. 색인 처리량이 필요하면 primary shard 수·노드 추가·bulk 튜닝·refresh_interval 조정 순으로.</p>
+  </div>
+  <div class="card">
+    <h4>🧠 heap 32GB의 벽</h4>
+    <p>JVM은 ~32GB까지만 <strong>compressed oops</strong>(4바이트 포인터)를 씁니다. 33GB로 키우면 포인터가 8바이트가 되어 <em>오히려 쓸 수 있는 객체가 줄어듭니다</em>. 권장: <strong>heap = RAM의 50%와 31GB 중 작은 값</strong>. 남는 RAM은 Lucene이 쓰는 OS 페이지 캐시에 양보하세요.</p>
+  </div>
+  <div class="card">
+    <h4>✏️ update 남발</h4>
+    <p>Lucene segment는 불변입니다. <code>_update</code> = 기존 문서 tombstone 마킹 + 새 문서 색인. 잦은 update는 deleted doc 누적과 merge 폭증을 부릅니다. <code>docs.deleted</code>가 active의 몇 배라면 경고등. 처방: append-only 모델 + <code>top_hits</code>로 최신값 조회, 대량 변경은 reindex + alias 스왑.</p>
+  </div>
+  <div class="card">
+    <h4>📮 단건 INSERT</h4>
+    <p>9장의 반복이지만 그만큼 흔합니다. 요청당 라우팅·acking 오버헤드는 1건이든 1000건이든 동일 — 단건 색인은 처리량 1/100. write queue가 차서 429가 폭주합니다. 처방: <code>_bulk</code> 5~15MiB + 클라이언트 배칭.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># update 남발의 증상 확인: deleted가 active의 몇 배인가?</span>
+<span class="k">GET</span> /_cat/indices?v&amp;h=index,docs.count,docs.deleted
+
+index      docs.count   docs.deleted
+my-index   <span class="n">100000</span>       <span class="n">850000</span>    <span class="c">← 경고: deleted가 8.5배</span></code></pre>
+
+<pre><code><span class="c"># 대량 변경의 정석: reindex + alias 스왑 (무중단)</span>
+<span class="k">POST</span> /_reindex
+{ <span class="s">"source"</span>: { <span class="s">"index"</span>: <span class="s">"old"</span> }, <span class="s">"dest"</span>: { <span class="s">"index"</span>: <span class="s">"new"</span> } }
+
+<span class="k">POST</span> /_aliases
+{ <span class="s">"actions"</span>: [
+  { <span class="s">"remove"</span>: { <span class="s">"index"</span>: <span class="s">"old"</span>, <span class="s">"alias"</span>: <span class="s">"current"</span> } },
+  { <span class="s">"add"</span>:    { <span class="s">"index"</span>: <span class="s">"new"</span>, <span class="s">"alias"</span>: <span class="s">"current"</span> } }
+]}</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">_all 필드는 이제 없다</div>
+    <p>모든 필드를 합쳐 검색하던 <code>_all</code>은 6.0에서 deprecated, 7.x에서 제거되어 8.x에는 존재하지 않습니다. 대안은 <code>copy_to</code>(명시적으로 합칠 필드 지정) 또는 검색 시 <code>multi_match</code> — boost(<code>^N</code>)까지 지원해 <code>_all</code>보다 유연합니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">10.6 한눈에 보는 안티패턴 처방전</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>안티패턴</th><th>핵심 증상</th><th>대안</th></tr></thead>
+  <tbody>
+    <tr><td><code>dynamic: true</code> 방치</td><td>매핑 폭발, 파싱 실패</td><td><code>dynamic: strict</code> + 명시 매핑</td></tr>
+    <tr><td>text/keyword 혼동</td><td>sort·agg 실패, term 미스</td><td>multi-field (<code>.keyword</code>)</td></tr>
+    <tr><td>nested 남발</td><td>doc 수 폭증, merge 비용</td><td>flatten 또는 <code>flattened</code></td></tr>
+    <tr><td>deep pagination</td><td>coordinating OOM</td><td>PIT + search_after</td></tr>
+    <tr><td>leading wildcard</td><td>term 풀스캔</td><td><code>wildcard</code> 타입, 모델 재설계</td></tr>
+    <tr><td>단건 INSERT</td><td>처리량 1/100, 429</td><td>bulk 5~15MiB</td></tr>
+    <tr><td>oversharding</td><td>cluster state 비대화</td><td>shard 10~50GB, heap GB당 20개</td></tr>
+    <tr><td>replica로 색인 가속</td><td>색인 더 느려짐</td><td>primary shard 수 ↑</td></tr>
+    <tr><td>활성 인덱스 force_merge</td><td>디스크 2배, merge 폭주</td><td>ILM warm 자동화 (9장)</td></tr>
+    <tr><td>heap &gt; 32GB</td><td>compressed oops 비활성</td><td>31GB 상한</td></tr>
+    <tr><td>update 남발</td><td>deleted doc 폭증</td><td>append-only, reindex</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">사용자 세션 ID가 필드 이름으로 들어오는 로그를 <code>dynamic: true</code> 인덱스에 색인하고 있다. 가장 먼저 발생할 문제는?</div>
+  <div class="quiz-opts">
+    <button type="button">세션 ID가 중복되어 문서가 덮어써진다</button>
+    <button type="button" data-correct>문서마다 새 필드가 매핑에 추가되어 매핑 폭발 — 필드 수 한계 초과와 cluster state 비대화가 온다</button>
+    <button type="button">text 필드로 잡혀서 정렬이 안 될 뿐 색인에는 문제가 없다</button>
+    <button type="button">refresh 간격이 자동으로 길어져 검색이 느려진다</button>
+  </div>
+  <div class="quiz-expl">✅ 동적 키가 필드 이름이 되면 문서 수만큼 매핑 필드가 증식합니다. 기본 한계(total fields 1000) 초과로 색인이 실패하고, 그 전부터 cluster state가 비대해져 master를 압박합니다. 처방: dynamic: strict + 명시 매핑, 그리고 "키를 값으로" 데이터 구조 변경입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">색인 처리량이 부족해서 replica를 1에서 3으로 늘렸다. 결과는?</div>
+  <div class="quiz-opts">
+    <button type="button">색인이 약 3배 빨라진다 — 부하가 분산되므로</button>
+    <button type="button">색인 속도는 그대로고 검색만 느려진다</button>
+    <button type="button" data-correct>색인은 오히려 느려진다 — 모든 replica가 같은 색인 작업을 반복하고 in-sync 유지 비용이 늘어나므로</button>
+  </div>
+  <div class="quiz-expl">✅ replica는 검색 처리량을 늘리는 장치입니다. 색인은 primary가 처리한 것을 모든 in-sync replica로 복제하므로 네트워크 트래픽과 디스크 쓰기가 replica 수만큼 늘어 색인 latency가 증가합니다. 색인 처리량이 필요하면 primary shard 수 증설, 노드 추가, bulk/refresh 튜닝이 올바른 방향입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch10_anti_patterns.md" target="_blank" rel="noopener">chapters/ch10_anti_patterns.md</a> — 12가지 안티패턴 전체와 트러블슈팅 케이스 링크가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch09.html"><span class="dir">← 이전</span><br><span class="title">9장. 인덱싱 전략</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch11.html"><span class="dir">다음 →</span><br><span class="title">11장. 모니터링과 트러블슈팅</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Elasticsearch 가이드 — 학습 홈 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>🔍 Elasticsearch 학습 홈</h1>
+<p class="lead">"검색은 왜 빠른가?"의 답인 역색인부터, Lucene 세그먼트·샤딩·Analyzer·집계·운영 트러블슈팅까지 — 검색 엔진의 심장을 움직이는 그림으로 배웁니다.</p>
+<div class="chapter-meta">
+  <span class="tag">📖 11개 챕터</span>
+  <span class="tag">🎬 스텝 애니메이션</span>
+  <span class="tag">기준 버전: 8.17 LTS (9.x 변경점 별도 표기)</span>
+  <span class="tag">완료 <b data-progress-of="es/">0</b>/11</span>
+</div>
+
+<h2 id="overview">먼저 큰 그림 — 문서 하나가 검색되기까지</h2>
+<p>Elasticsearch의 모든 것은 이 한 장의 그림에서 출발합니다. 문서가 들어와 <strong>토큰으로 분해</strong>되고 <strong>역색인(inverted index)</strong>에 기록되며, 검색 질의도 <strong>같은 경로</strong>를 거쳐 그 역색인과 매칭됩니다. 재생 버튼을 눌러보세요.</p>
+
+<div class="anim" data-steps="6" data-title="문서 색인의 여정 — 입력부터 검색 매칭까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 900 380">
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--es)"/>
+        </marker>
+      </defs>
+
+      <!-- 색인 경로 (상단) -->
+      <text x="20" y="26" class="sv-label" font-size="14">📥 색인 경로 (Indexing)</text>
+
+      <g data-show="1">
+        <rect x="20" y="44" width="220" height="76" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="34" y="66" class="sv-label" font-size="12.5">① JSON 문서 도착</text>
+        <text x="34" y="88" class="sv-label-sm sv-mono">{"id": 1, "title":</text>
+        <text x="34" y="106" class="sv-label-sm sv-mono">  "Quick Brown Fox"}</text>
+      </g>
+
+      <g data-show="2">
+        <path d="M 240 82 L 300 82" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="305" y="44" width="230" height="76" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="320" y="66" class="sv-label" font-size="12.5">② Analyzer — 토큰 분해</text>
+        <text x="320" y="88" class="sv-label-sm">소문자화 · 토크나이즈 · 불용어 제거</text>
+        <text x="320" y="108" class="sv-label sv-mono" font-size="12" fill="var(--purple)">[quick] [brown] [fox]</text>
+      </g>
+
+      <g data-show="3" data-active="3-6">
+        <path d="M 535 82 L 595 82" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="600" y="36" width="280" height="140" rx="10" class="sv-box"/>
+        <text x="740" y="58" text-anchor="middle" class="sv-label" font-size="13">③ 역색인 (Inverted Index)</text>
+        <line x1="616" y1="68" x2="864" y2="68" class="sv-line" opacity=".5"/>
+        <text x="626" y="90" class="sv-label-sm sv-mono">term      → posting list</text>
+        <text x="626" y="112" class="sv-label sv-mono" font-size="12">brown     → doc1</text>
+        <text x="626" y="134" class="sv-label sv-mono" font-size="12">fox       → doc1</text>
+        <text x="626" y="156" class="sv-label sv-mono" font-size="12">quick     → doc1</text>
+      </g>
+
+      <!-- 검색 경로 (하단) -->
+      <g data-show="4">
+        <text x="20" y="232" class="sv-label" font-size="14">🔎 검색 경로 (Search)</text>
+        <rect x="20" y="250" width="220" height="70" rx="9" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="1.6"/>
+        <text x="34" y="274" class="sv-label" font-size="12.5">④ 검색 질의 입력</text>
+        <text x="34" y="298" class="sv-label sv-mono" font-size="12.5">"Brown FOX!"</text>
+      </g>
+
+      <g data-show="5">
+        <path d="M 240 285 L 300 285" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr2)"/>
+        <rect x="305" y="250" width="230" height="70" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="320" y="274" class="sv-label" font-size="12.5">⑤ 같은 Analyzer 통과</text>
+        <text x="320" y="300" class="sv-label sv-mono" font-size="12" fill="var(--purple)">[brown] [fox]</text>
+      </g>
+
+      <g data-show="6">
+        <path d="M 535 285 Q 580 285 620 190" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr2)"/>
+        <rect x="620" y="100" width="248" height="60" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2" class="blink"/>
+        <text x="626" y="122" class="sv-label sv-mono" font-size="12" fill="var(--ok)">brown → doc1  ✓</text>
+        <text x="626" y="144" class="sv-label sv-mono" font-size="12" fill="var(--ok)">fox   → doc1  ✓</text>
+        <text x="700" y="345" text-anchor="middle" class="sv-label" font-size="14" fill="var(--ok)">✨ 교집합 = doc1 반환!</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>JSON 문서가 REST API로 도착합니다. <code>"Quick Brown Fox"</code>라는 제목을 가진 문서입니다.</p>
+    <p><b>Analyzer</b>가 문자열을 소문자화하고 토큰으로 분해합니다: <code>[quick] [brown] [fox]</code>. 원문 그대로가 아니라 <b>토큰</b>이 저장 단위입니다.</p>
+    <p>각 토큰(term)이 "이 term은 어느 문서에 있다"는 <b>역색인</b>에 기록됩니다. 책 뒤의 '찾아보기'와 같은 구조입니다.</p>
+    <p>이번엔 사용자가 <code>"Brown FOX!"</code>를 검색합니다. 대문자와 느낌표가 섞여 있네요.</p>
+    <p>질의도 색인과 <b>같은 Analyzer</b>를 통과해 <code>[brown] [fox]</code>가 됩니다. 색인과 검색이 같은 언어로 말하게 되는 것이죠.</p>
+    <p>역색인에서 두 term 모두 doc1을 가리킵니다 → <b style="color:var(--ok)">교집합 doc1 반환!</b> 원문을 한 글자도 스캔하지 않고 찾아냈습니다. 이것이 Elasticsearch가 빠른 이유입니다.</p>
+  </div>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 파트의 학습 흐름</div>
+    <p>① 역색인과 검색 엔진의 정체성(1장) → ② 분산 구조: 클러스터·Lucene·샤드(2~4장) → ③ 검색의 핵심: 매핑·Analyzer·Query DSL·집계(5~8장) → ④ 운영: 인덱싱 전략·안티패턴·트러블슈팅(9~11장)</p>
+  </div>
+</div>
+
+<h2 id="chapters">챕터 목록</h2>
+
+<h3>기초 — 검색 엔진이라는 다른 세계</h3>
+<div class="grid g2">
+  <a class="card" href="ch01.html" style="display:block;color:inherit">
+    <h4>01 · Elasticsearch 개요 <span class="tag lv-basic">기초</span></h4>
+    <p>RDB의 LIKE 검색과 역색인은 무엇이 다른가. NRT(near real-time)의 의미, Elastic Stack의 구성, 분산 시스템의 핵심 원칙.</p>
+  </a>
+  <a class="card" href="ch02.html" style="display:block;color:inherit">
+    <h4>02 · 클러스터 아키텍처 <span class="tag lv-mid">중급</span></h4>
+    <p>노드 역할(master/data/coordinating), cluster state, 마스터 선출 쿼럼, 요청이 샤드로 fan-out되는 Query-then-Fetch 흐름.</p>
+  </a>
+  <a class="card" href="ch03.html" style="display:block;color:inherit">
+    <h4>03 · Lucene 내부 구조 <span class="tag lv-adv">고급</span></h4>
+    <p>세그먼트는 왜 불변인가. in-memory buffer → refresh → segment → flush → merge 라이프사이클과 translog의 내구성 보장.</p>
+  </a>
+  <a class="card" href="ch04.html" style="display:block;color:inherit">
+    <h4>04 · 인덱스와 샤드 <span class="tag lv-mid">중급</span></h4>
+    <p>인덱스=논리, 샤드=물리. 라우팅 공식, primary/replica 배치, 노드 장애 시 replica 승격, 샤드 사이징과 oversharding.</p>
+  </a>
+</div>
+
+<h3>검색의 핵심 — 원하는 문서를 정확히 찾기</h3>
+<div class="grid g2">
+  <a class="card" href="ch05.html" style="display:block;color:inherit">
+    <h4>05 · 매핑과 필드 타입 <span class="tag lv-mid">중급</span></h4>
+    <p>text vs keyword — 가장 흔한 실수. dynamic mapping의 함정, multi-fields, nested의 필요성, 무중단 reindex 전략.</p>
+  </a>
+  <a class="card" href="ch06.html" style="display:block;color:inherit">
+    <h4>06 · Text Analysis — Analyzer <span class="tag lv-mid">중급</span></h4>
+    <p>char filter → tokenizer → token filter 파이프라인. 한국어 형태소 분석(Nori), 커스텀 analyzer 설계.</p>
+  </a>
+  <a class="card" href="ch07.html" style="display:block;color:inherit">
+    <h4>07 · Query DSL <span class="tag lv-mid">중급</span></h4>
+    <p>match vs term, bool 쿼리의 must/filter/should, query context vs filter context, BM25 스코어링.</p>
+  </a>
+  <a class="card" href="ch08.html" style="display:block;color:inherit">
+    <h4>08 · Aggregations — 집계 <span class="tag lv-mid">중급</span></h4>
+    <p>metric/bucket/pipeline 집계, doc values 기반 동작 원리, cardinality의 근사 계산, 집계 메모리 관리.</p>
+  </a>
+</div>
+
+<h3>운영 — 프로덕션에서 살아남기</h3>
+<div class="grid g2">
+  <a class="card" href="ch09.html" style="display:block;color:inherit">
+    <h4>09 · 인덱싱 전략 <span class="tag lv-adv">고급</span></h4>
+    <p>bulk API, refresh_interval 튜닝, 시계열 인덱스와 rollover, ILM으로 hot/warm/cold 자동화.</p>
+  </a>
+  <a class="card" href="ch10.html" style="display:block;color:inherit">
+    <h4>10 · 안티패턴 모음 <span class="tag lv-adv">고급</span></h4>
+    <p>oversharding, deep pagination, wildcard 남용, _source 끄기 — 현장에서 반복되는 실수와 올바른 대안.</p>
+  </a>
+  <a class="card" href="ch11.html" style="display:block;color:inherit">
+    <h4>11 · 모니터링과 트러블슈팅 <span class="tag lv-adv">고급</span></h4>
+    <p>클러스터 health(RED/YELLOW/GREEN), 진단 API, unassigned shards, 디스크 watermark 사고 대응.</p>
+  </a>
+</div>
+
+<h2 id="path">추천 학습 경로</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>🌱 입문 코스</h4>
+    <p>검색 엔진이 처음이라면: <strong>1장 → 4장 → 5장 → 7장</strong>. 역색인 개념을 잡고, 인덱스/샤드 모델과 매핑을 이해한 뒤 쿼리를 써봅니다.</p>
+  </div>
+  <div class="card">
+    <h4>🔎 검색 품질 코스</h4>
+    <p>검색 결과를 개선하고 싶다면: <strong>5장 → 6장 → 7장 → 8장</strong>. 매핑·Analyzer·Query DSL·집계로 이어지는 검색 파이프라인 집중 코스.</p>
+  </div>
+  <div class="card">
+    <h4>⚙️ 운영자 코스</h4>
+    <p>이미 운영 중인 클러스터가 있다면: <strong>2장 → 3장 → 4장 → 9~11장</strong>. 내부 동작을 이해하고 사고 예방·대응으로 나아갑니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">이렇게 공부하세요</div>
+    <p>각 장의 애니메이션을 먼저 끝까지 재생하고 본문을 읽은 뒤, 마지막 퀴즈로 확인하세요. 챕터 하단의 <strong>"이 장 완료로 표시"</strong> 버튼을 누르면 진도가 저장됩니다.</p>
+  </div>
+</div>
+
+<h2 id="resources">원문 저장소 자료</h2>
+<p>이 파트는 <a href="https://github.com/jaero0725/elasticSearch-guide" target="_blank" rel="noopener">jaero0725/elasticSearch-guide</a> 저장소의 문서를 초보자 눈높이로 재구성한 것입니다. 저장소에는 챕터 원문 외에도 실습 자료가 있습니다.</p>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>🧪 examples</h4>
+    <p>바로 실행해 볼 수 있는 요청 예제 모음. <a href="https://github.com/jaero0725/elasticSearch-guide/tree/main/examples" target="_blank" rel="noopener">examples 디렉터리 →</a></p>
+  </div>
+  <div class="card">
+    <h4>🚑 troubleshooting</h4>
+    <p>실제 장애 시나리오와 대응 절차. <a href="https://github.com/jaero0725/elasticSearch-guide/tree/main/troubleshooting" target="_blank" rel="noopener">troubleshooting 디렉터리 →</a></p>
+  </div>
+  <div class="card">
+    <h4>📇 cheatsheets</h4>
+    <p>운영 명령·API 치트시트. <a href="https://github.com/jaero0725/elasticSearch-guide/tree/main/cheatsheets" target="_blank" rel="noopener">cheatsheets 디렉터리 →</a></p>
+  </div>
+</div>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

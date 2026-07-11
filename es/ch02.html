@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2장. 클러스터 아키텍처 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch02">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>2장. 클러스터 아키텍처 — 노드들은 어떻게 한 팀이 되는가</h1>
+<p class="lead">마스터는 지휘하고, 데이터 노드는 일하고, coordinating 노드는 교통정리를 합니다. 이후 모든 트러블슈팅과 용량 산정은 이 장의 모델 위에서 이루어집니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 1장 개요</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 노드 역할(master/data/coordinating 등)의 분리 ② cluster state — 클러스터의 단일 진실 ③ 마스터 선출과 쿼럼(왜 3대인가) ④ 검색·색인 요청이 coordinating 노드에서 샤드로 fan-out되는 흐름</p>
+  </div>
+</div>
+
+<h2 id="s1">2.1 노드 역할 — 한 노드는 하나의 프로세스가 아니라 "역할의 집합"</h2>
+
+<p>Elasticsearch 노드는 <code>node.roles</code> 설정으로 결정되는 <strong>하나 이상의 역할</strong>을 갖습니다. 소규모에서는 한 노드가 모든 역할을 겸하지만, 규모가 커지면 역할을 분리하는 것이 운영의 기본입니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>역할</th><th>약어</th><th>하는 일</th></tr></thead>
+  <tbody>
+    <tr><td><code>master</code></td><td>m</td><td>클러스터 상태 관리, 인덱스 생성/삭제, 샤드 할당 결정</td></tr>
+    <tr><td><code>voting_only</code></td><td>v</td><td>마스터 선출 투표만 참여, 자신은 마스터가 되지 않음</td></tr>
+    <tr><td><code>data_content</code></td><td>s</td><td>검색 중심의 일반(비시계열) 데이터</td></tr>
+    <tr><td><code>data_hot</code></td><td>h</td><td>최근 시계열 데이터 — 빈번한 색인/검색, SSD</td></tr>
+    <tr><td><code>data_warm</code></td><td>w</td><td>색인이 끝난 데이터, 가끔 검색</td></tr>
+    <tr><td><code>data_cold</code></td><td>c</td><td>거의 검색 안 되는 오래된 데이터, searchable snapshot</td></tr>
+    <tr><td><code>data_frozen</code></td><td>f</td><td>스냅샷 저장소 부분 마운트 — 매우 저렴, 매우 느림</td></tr>
+    <tr><td><code>ingest</code></td><td>i</td><td>ingest pipeline 실행 (문서 전처리)</td></tr>
+    <tr><td><code>ml</code> / <code>transform</code></td><td>l / t</td><td>Machine Learning / Transform 작업</td></tr>
+    <tr><td>(역할 없음)</td><td>-</td><td><strong>coordinating-only</strong> — 요청 라우팅과 결과 머지만 담당</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c"># elasticsearch.yml — 역할별 노드 설정 예</span>
+
+<span class="c"># 마스터 전용 노드: 데이터/검색 부하로부터 격리</span>
+<span class="f">node.roles</span>: [ <span class="s">master</span> ]
+
+<span class="c"># hot 데이터 노드: 최신 데이터 색인 + 검색 + 전처리</span>
+<span class="f">node.roles</span>: [ <span class="s">data_hot</span>, <span class="s">data_content</span>, <span class="s">ingest</span> ]
+
+<span class="c"># coordinating-only 노드: 역할을 전부 비운다</span>
+<span class="f">node.roles</span>: [ ]</code></pre>
+
+<p>시계열 데이터(로그·메트릭)는 <strong>Hot → Warm → Cold → Frozen</strong> 순으로 값싼 하드웨어로 이동시키는 것이 표준 패턴입니다. 데이터가 오래될수록 검색 빈도가 급감하기 때문에, 비용/성능 곡선을 따라 내려보내는 것이죠. 이 이동은 ILM(Index Lifecycle Management)이 자동화합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">voting_only는 왜 있을까</div>
+    <p>마스터 쿼럼은 홀수가 권장되지만 전용 마스터 3대는 비용이 듭니다. 전용 마스터 2대 + voting_only 1대(보통 데이터 노드 겸직)로 쿼럼 3을 유지하며 비용을 줄일 수 있습니다. 단, 공식 문서는 <strong>운영 환경에서는 진짜 전용 마스터 3대</strong>를 권장합니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">2.2 Cluster State — 클러스터의 단일 진실</h2>
+
+<p><strong>Cluster state</strong>는 클러스터의 모든 메타데이터를 담은 하나의 자료구조입니다. 인덱스 설정과 매핑, 샤드가 어느 노드에 있는지, 노드 목록과 역할, ILM 정책까지 전부 여기 들어 있습니다. 그리고 이 정보의 <strong>단일 진실 공급자(single source of truth)는 마스터 노드</strong>입니다.</p>
+
+<div class="anim" data-steps="4" data-title="Cluster State Publish — 마스터가 변경을 전파하는 방법" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 310">
+      <defs>
+        <marker id="b1arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- master -->
+      <rect x="310" y="30" width="180" height="70" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+      <text x="400" y="58" text-anchor="middle" class="sv-label" font-size="13.5">👑 Master</text>
+      <text x="400" y="82" text-anchor="middle" class="sv-label-sm sv-mono">cluster state v41</text>
+
+      <g data-show="1" data-active="1-1">
+        <rect x="560" y="36" width="210" height="58" rx="9" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="665" y="60" text-anchor="middle" class="sv-label" font-size="12">① 변경 요청 발생</text>
+        <text x="665" y="80" text-anchor="middle" class="sv-label-sm sv-mono">PUT /new-index</text>
+        <path d="M 558 65 L 495 65" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <g data-show="2">
+        <rect x="310" y="106" width="180" height="30" rx="6" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="400" y="126" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">→ state v42 생성 ✍️</text>
+      </g>
+
+      <!-- data nodes -->
+      <g>
+        <rect x="60" y="220" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="140" y="245" text-anchor="middle" class="sv-label" font-size="12.5">data-1</text>
+        <rect x="320" y="220" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="400" y="245" text-anchor="middle" class="sv-label" font-size="12.5">data-2</text>
+        <rect x="580" y="220" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="660" y="245" text-anchor="middle" class="sv-label" font-size="12.5">data-3</text>
+      </g>
+      <g data-show="1-2">
+        <text x="140" y="268" text-anchor="middle" class="sv-label-sm sv-mono">state v41</text>
+        <text x="400" y="268" text-anchor="middle" class="sv-label-sm sv-mono">state v41</text>
+        <text x="660" y="268" text-anchor="middle" class="sv-label-sm sv-mono">state v41</text>
+      </g>
+
+      <g data-show="3">
+        <path d="M 340 140 Q 220 180 150 216" class="sv-arrow flow-line" marker-end="url(#b1arr)"/>
+        <path d="M 400 140 L 400 216" class="sv-arrow flow-line" marker-end="url(#b1arr)"/>
+        <path d="M 460 140 Q 580 180 650 216" class="sv-arrow flow-line" marker-end="url(#b1arr)"/>
+        <text x="220" y="175" class="sv-label-sm" fill="var(--accent)">③ 모든 노드에 publish</text>
+      </g>
+      <g data-show="4">
+        <text x="140" y="268" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">state v42 ✓</text>
+        <text x="400" y="268" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">state v42 ✓</text>
+        <text x="660" y="268" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">state v42 ✓</text>
+        <text x="400" y="302" text-anchor="middle" class="sv-label-sm">각 노드는 새 state에서 자기 몫을 실행 (예: 할당된 샤드 시작)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>인덱스 생성 같은 <b>클러스터 변경 요청</b>은 최종적으로 마스터 노드에서 처리됩니다. 현재 모든 노드는 state v41을 들고 있습니다.</p>
+    <p>마스터가 변경을 반영한 <b>새 cluster state(v42)</b>를 만듭니다. 버전 번호가 붙어 있어 어느 것이 최신인지 항상 판별할 수 있습니다.</p>
+    <p>마스터가 새 state를 <b>모든 노드에 publish</b>합니다. 노드 수와 state 크기에 비례해 네트워크 비용이 듭니다.</p>
+    <p>모든 노드가 v42로 갱신 완료. 각 노드는 새 state를 보고 자기가 할 일(예: 새로 할당된 샤드 시작)을 실행합니다. <b>이 publish가 느려지면 클러스터 전체가 느려집니다</b> — oversharding이 위험한 이유입니다(4장).</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">Cluster state는 모든 노드가 통째로 메모리에 든다</div>
+    <p>인덱스가 수천 개, 샤드가 수만 개가 되면 state가 수백 MB로 커지고, 변경 때마다 이 큰 덩어리의 publish가 일어나 <strong>마스터가 ack를 기다리며 클러스터가 멈칫거리게 됩니다</strong>. <code>GET _cluster/state?filter_path=metadata</code> 응답 크기가 100MB를 넘으면 oversharding을 의심하세요.</p>
+  </div>
+</div>
+
+<h2 id="s3">2.3 Discovery — 노드들이 서로를 찾는 법</h2>
+
+<p>노드는 마법처럼 서로를 찾지 않습니다. 각 노드는 <strong>마스터 후보 노드의 주소 목록</strong>을 알고 시작해야 합니다. 7.0부터 도입된 새 Discovery 체계의 핵심 설정은 두 가지입니다.</p>
+
+<pre><code><span class="c"># elasticsearch.yml</span>
+
+<span class="c"># (1) 같은 cluster.name을 가진 노드만 합류할 수 있다</span>
+<span class="f">cluster.name</span>: <span class="s">prod-logs</span>
+
+<span class="c"># (2) seed_hosts — 처음 접속해 볼 마스터 후보들의 주소 (상시 유지)</span>
+<span class="f">discovery.seed_hosts</span>:
+  - <span class="s">master-1.es.internal</span>
+  - <span class="s">master-2.es.internal</span>
+  - <span class="s">master-3.es.internal</span>
+
+<span class="c"># (3) initial_master_nodes — "최초 부트스트랩" 한 번만 사용!</span>
+<span class="c"># 클러스터가 형성된 후에는 모든 노드의 yaml에서 제거할 것</span>
+<span class="f">cluster.initial_master_nodes</span>:
+  - <span class="s">master-1</span>
+  - <span class="s">master-2</span>
+  - <span class="s">master-3</span></code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">단골 사고: initial_master_nodes 복사-붙여넣기</div>
+    <p><code>cluster.initial_master_nodes</code>는 <strong>빈 클러스터를 처음 띄울 때 한 번만</strong> 의미가 있습니다. 새 노드를 추가하며 기존 yaml을 그대로 복사하면, 새 노드가 기존 클러스터를 무시하고 <strong>별도 클러스터로 부트스트랩</strong>해버릴 수 있습니다 — split-brain의 지름길입니다. 클러스터 형성 직후 모든 노드의 yaml에서 이 설정을 제거하세요.</p>
+  </div>
+</div>
+
+<h2 id="s4">2.4 마스터 선출 — 왜 하필 3대인가</h2>
+
+<p>마스터 선출은 Raft에서 영감을 받은 합의 프로토콜로 동작합니다. 선출에 투표하는 마스터 후보들의 집합을 <strong>voting configuration</strong>이라 하고, 이 집합의 <strong>과반수(strict majority)</strong>가 동의해야 마스터가 정해집니다. 과반수 규칙이 있어야 네트워크가 반으로 갈라져도 <strong>두 쪽이 동시에 마스터를 뽑는 사태(split-brain)</strong>를 막을 수 있습니다.</p>
+
+<div class="anim" data-steps="5" data-title="마스터 장애와 재선출 — 쿼럼이 클러스터를 지키는 법" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <!-- 3 master nodes -->
+      <g data-active="1-1">
+        <rect x="70" y="60" width="180" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="160" y="90" text-anchor="middle" class="sv-label" font-size="13">👑 master-1</text>
+        <text x="160" y="114" text-anchor="middle" class="sv-label-sm">현재 마스터</text>
+      </g>
+      <rect x="310" y="60" width="180" height="80" rx="10" class="sv-box"/>
+      <text x="400" y="90" text-anchor="middle" class="sv-label" font-size="13">master-2</text>
+      <text x="400" y="114" text-anchor="middle" class="sv-label-sm">후보 (대기)</text>
+      <rect x="550" y="60" width="180" height="80" rx="10" class="sv-box"/>
+      <text x="640" y="90" text-anchor="middle" class="sv-label" font-size="13">master-3</text>
+      <text x="640" y="114" text-anchor="middle" class="sv-label-sm">후보 (대기)</text>
+
+      <g data-show="1-1">
+        <text x="400" y="34" text-anchor="middle" class="sv-label" font-size="13.5">voting configuration = {master-1, master-2, master-3} · quorum = 2</text>
+      </g>
+
+      <!-- 장애 -->
+      <g data-show="2">
+        <line x1="90" y1="70" x2="230" y2="130" stroke="var(--danger)" stroke-width="3"/>
+        <line x1="230" y1="70" x2="90" y2="130" stroke="var(--danger)" stroke-width="3"/>
+        <text x="160" y="170" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13">💥 master-1 다운!</text>
+      </g>
+
+      <!-- 투표 -->
+      <g data-show="3">
+        <path d="M 400 145 Q 400 190 430 210" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 640 145 Q 640 190 480 215" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="330" y="210" width="220" height="52" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="440" y="232" text-anchor="middle" class="sv-label" font-size="12.5">🗳️ 투표: master-2 ✓ / master-3 ✓</text>
+        <text x="440" y="252" text-anchor="middle" class="sv-label-sm">2표 / 3 = 과반수 확보 → 선출 성립</text>
+      </g>
+
+      <!-- 승격 -->
+      <g data-show="4">
+        <rect x="310" y="60" width="180" height="80" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2.4" class="pulse"/>
+        <text x="400" y="90" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">👑 master-2</text>
+        <text x="400" y="114" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">새 마스터로 선출!</text>
+      </g>
+
+      <g data-show="5">
+        <text x="400" y="298" text-anchor="middle" class="sv-label" font-size="13">✅ 마스터 2대뿐이었다면? 1대 장애 시 quorum(2) 미달 → 클러스터 전체 마비</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>마스터 후보 3대의 클러스터입니다. voting configuration은 3개 노드, 과반수 <b>quorum은 floor(3/2)+1 = 2</b>입니다. 현재 마스터는 master-1.</p>
+    <p><b>master-1이 갑자기 다운</b>됩니다. 하드웨어 장애, 긴 GC pause, 네트워크 단절 — 원인은 다양합니다.</p>
+    <p>남은 후보 master-2와 master-3이 선출을 시작합니다. <b>2표는 3의 과반수</b>이므로 선출이 성립합니다.</p>
+    <p>master-2가 새 마스터로 승격되고 클러스터는 정상 운영을 계속합니다. 장애 감지부터 재선출까지 보통 수 초입니다.</p>
+    <p>만약 후보가 2대였다면? quorum이 2인데 1대가 죽으면 1표뿐 — <b style="color:var(--danger)">선출 불가로 클러스터가 멈춥니다</b>. 그래서 마스터 후보는 3대(또는 5대)여야 합니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>마스터 후보 수</th><th>quorum</th><th>견딜 수 있는 장애</th><th>평가</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>1</td><td>0대</td><td>SPOF — 단일 장애점</td></tr>
+    <tr><td>2</td><td>2</td><td>0대</td><td>❌ 1대만 죽어도 쿼럼 미달</td></tr>
+    <tr><td><strong>3</strong></td><td><strong>2</strong></td><td><strong>1대</strong></td><td>✅ 표준 권장</td></tr>
+    <tr><td>4</td><td>3</td><td>1대</td><td>3보다 나을 게 없는데 비용만 증가</td></tr>
+    <tr><td>5</td><td>3</td><td>2대</td><td>대규모 클러스터용</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>7.x 이후 voting configuration은 노드가 추가/제거될 때 <strong>자동으로 조정</strong>됩니다. 다만 장애 상황에서 stale하게 남으면 <code>POST _cluster/voting_config_exclusions</code>로 수동 개입이 필요할 수 있습니다.</p>
+
+<h2 id="s5">2.5 요청 라우팅 — coordinating 노드에서 샤드로 fan-out</h2>
+
+<p>클라이언트 요청은 <strong>어느 노드로 보내도 됩니다</strong>. 요청을 받은 노드가 그 순간 <strong>coordinating node</strong>가 되어 교통정리를 맡습니다. 검색은 <strong>Query then Fetch</strong>라는 2단계로 처리됩니다.</p>
+
+<div class="anim" data-steps="6" data-title="검색 요청의 fan-out — Query Phase와 Fetch Phase" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 360">
+      <defs>
+        <marker id="b2arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="b3arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+
+      <!-- client -->
+      <g data-show="1">
+        <rect x="30" y="30" width="150" height="56" rx="9" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="1.6"/>
+        <text x="105" y="53" text-anchor="middle" class="sv-label" font-size="12.5">🧑‍💻 Client</text>
+        <text x="105" y="74" text-anchor="middle" class="sv-label-sm sv-mono">GET /logs/_search</text>
+        <path d="M 180 58 L 305 58" class="sv-arrow flow-line" marker-end="url(#b2arr)"/>
+      </g>
+
+      <!-- coordinating -->
+      <g data-active="2-6">
+        <rect x="310" y="26" width="230" height="64" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="425" y="50" text-anchor="middle" class="sv-label" font-size="13">Node-X = Coordinating</text>
+        <text x="425" y="72" text-anchor="middle" class="sv-label-sm">요청 받은 노드가 그 순간 조정자</text>
+      </g>
+
+      <g data-show="2">
+        <text x="580" y="46" class="sv-label-sm">② cluster state에서 샤드 위치 룩업</text>
+        <text x="580" y="66" class="sv-label-sm">primary/replica 중 부하 분산 선택</text>
+      </g>
+
+      <!-- shards -->
+      <g>
+        <rect x="60" y="180" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="140" y="204" text-anchor="middle" class="sv-label" font-size="12">Shard 0 (Node-A)</text>
+        <rect x="280" y="180" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="360" y="204" text-anchor="middle" class="sv-label" font-size="12">Shard 1 (Node-B)</text>
+        <rect x="500" y="180" width="160" height="60" rx="9" class="sv-box"/>
+        <text x="580" y="204" text-anchor="middle" class="sv-label" font-size="12">Shard 2 (Node-C)</text>
+      </g>
+
+      <!-- fan-out -->
+      <g data-show="3">
+        <path d="M 370 90 Q 220 130 150 176" class="sv-arrow flow-line" marker-end="url(#b2arr)"/>
+        <path d="M 425 90 Q 400 130 370 176" class="sv-arrow flow-line" marker-end="url(#b2arr)"/>
+        <path d="M 480 90 Q 560 130 580 176" class="sv-arrow flow-line" marker-end="url(#b2arr)"/>
+        <text x="700" y="140" class="sv-label" font-size="12.5" fill="var(--accent)">③ Query Phase</text>
+        <text x="700" y="160" class="sv-label-sm">전 샤드로 fan-out</text>
+      </g>
+
+      <!-- 결과 -->
+      <g data-show="4">
+        <text x="140" y="228" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">top-K id+점수</text>
+        <text x="360" y="228" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">top-K id+점수</text>
+        <text x="580" y="228" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">top-K id+점수</text>
+        <path d="M 150 244 Q 250 290 400 296" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 370 244 Q 400 270 420 292" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 580 244 Q 520 290 460 296" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="330" y="292" width="190" height="48" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="425" y="313" text-anchor="middle" class="sv-label" font-size="12">④ 결과 머지</text>
+        <text x="425" y="331" text-anchor="middle" class="sv-label-sm">글로벌 top-K 결정</text>
+      </g>
+
+      <g data-show="5">
+        <path d="M 520 316 Q 620 316 600 244" stroke="var(--warn)" stroke-width="2" fill="none" stroke-dasharray="5 4" class="flow-line"/>
+        <text x="690 " y="300" class="sv-label" font-size="12.5" fill="var(--warn)">⑤ Fetch Phase</text>
+        <text x="690" y="320" class="sv-label-sm">선택된 문서의 _source만</text>
+        <text x="690" y="338" class="sv-label-sm">해당 샤드에서 수집</text>
+      </g>
+
+      <g data-show="6">
+        <path d="M 330 316 Q 105 316 105 92" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#b3arr)"/>
+        <text x="180" y="130" class="sv-label" font-size="12.5" fill="var(--ok)">⑥ Client 응답 ✨</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 아무 노드(Node-X)에나 검색 요청을 보냅니다. 요청을 받은 노드가 <b>coordinating node</b> 역할을 맡습니다.</p>
+    <p>Node-X는 cluster state에서 대상 인덱스의 샤드가 어디 있는지 찾습니다. 각 샤드에 대해 primary/replica 중 하나를 부하 분산으로 고릅니다.</p>
+    <p><b>Query Phase</b>: 질의를 모든 관련 샤드로 <b>fan-out</b>합니다. 각 샤드는 독립적으로 검색을 수행합니다.</p>
+    <p>각 샤드는 문서 전체가 아니라 <b>top-K개의 문서 ID + 점수만</b> 반환하고, coordinating이 이를 머지해 글로벌 top-K를 정합니다.</p>
+    <p><b>Fetch Phase</b>: 최종 선택된 문서들의 실제 내용(_source)만 해당 샤드에서 가져옵니다. 탈락한 문서의 본문은 네트워크를 타지 않습니다.</p>
+    <p>완성된 결과가 클라이언트로 돌아갑니다. 이 구조 때문에 <code>from=10000</code> 같은 deep pagination은 <b>모든 샤드가 from+size개를 반환해야 해서</b> 매우 비쌉니다 → <code>search_after</code> 권장.</p>
+  </div>
+</div>
+
+<p>색인(쓰기) 요청은 경로가 다릅니다. coordinating 노드가 <code>hash(_id) % 샤드 수</code>로 <strong>단 하나의 primary 샤드</strong>를 찾아 전달하고, primary가 색인 후 모든 in-sync replica에 <strong>동기 복제</strong>합니다. 모든 사본의 ack를 받은 뒤에야 클라이언트에 응답하므로, 색인 응답 시점에 데이터는 모든 활성 사본에 도달해 있습니다 (4장에서 상세히).</p>
+
+<h2 id="s6">2.6 운영 팁 — 클러스터 토폴로지 설계</h2>
+
+<ul>
+  <li><strong>전용 마스터 3대는 규모와 무관한 표준</strong>입니다. 데이터 노드의 GC pause나 디스크 I/O 폭증이 마스터 선출 타임아웃을 유발하면 클러스터 전체가 멈춥니다. 마스터 노드는 heap 4~8GB의 작은 사양이면 충분합니다.</li>
+  <li><strong>coordinating-only 노드는 대부분 불필요</strong>합니다. 거대한 집계 쿼리가 잦거나, 클라이언트 연결이 수천 개이거나, 검색/색인 트래픽 격리가 필요할 때만 검토하세요.</li>
+  <li><strong>마스터 노드의 디스크도 모니터링</strong>하세요. cluster state를 디스크에 persist하므로, 디스크가 차면 선출이 실패합니다.</li>
+</ul>
+
+<pre><code><span class="c"># 클러스터 토폴로지 상시 확인 — 운영자의 3종 세트</span>
+<span class="k">GET</span> /_cluster/health
+
+<span class="c"># 노드별 역할/heap/디스크 (master 칼럼의 *가 현재 마스터)</span>
+<span class="k">GET</span> /_cat/nodes?v=true&amp;h=name,node.role,heap.percent,disk.used_percent,master
+
+<span class="c"># 지금 마스터는 누구인가</span>
+<span class="k">GET</span> /_cat/master?v=true</code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">운영 클러스터에서 전용 마스터 노드를 2대로 구성하면 안 되는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">마스터 2대는 데이터를 저장할 수 없기 때문</button>
+    <button type="button" data-correct>quorum이 2가 되어, 1대만 장애가 나도 과반수 미달로 선출이 불가능해지기 때문</button>
+    <button type="button">마스터가 짝수면 cluster state 버전이 충돌하기 때문</button>
+    <button type="button">Elasticsearch가 짝수 마스터 구성을 설정 단계에서 거부하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 마스터 선출은 voting configuration의 <strong>과반수(strict majority)</strong>가 필요합니다. 후보 2대면 quorum=2인데 1대가 죽으면 남은 1표로는 선출이 성립하지 않아, 1대 구성보다 나을 게 없습니다. 그래서 3대(장애 1대 허용) 또는 5대(장애 2대 허용)가 표준입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">검색 요청의 Query Phase에서 각 샤드가 coordinating 노드로 반환하는 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">매칭된 모든 문서의 전체 내용(_source)</button>
+    <button type="button" data-correct>top-K개의 문서 ID와 점수만</button>
+    <button type="button">샤드에 저장된 역색인 사본</button>
+  </div>
+  <div class="quiz-expl">✅ Query Phase에서는 문서 ID + 점수 같은 가벼운 정보만 모아 글로벌 top-K를 정하고, 실제 문서 내용은 Fetch Phase에서 최종 선택된 문서만 가져옵니다. 이 2단계 구조 덕에 네트워크 비용이 최소화되지만, 반대로 deep pagination(<code>from=10000</code>)은 모든 샤드가 from+size개를 반환해야 해서 매우 비싸집니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch02_cluster_architecture.md" target="_blank" rel="noopener">chapters/ch02_cluster_architecture.md</a> — data tier별 샤드 한도, forced awareness, 클러스터 구성 예시 다이어그램 등이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch01.html"><span class="dir">← 이전</span><br><span class="title">1장. Elasticsearch 개요</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch03.html"><span class="dir">다음 →</span><br><span class="title">3장. Lucene 내부 구조</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

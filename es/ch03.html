@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3장. Lucene 내부 구조 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch03">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>3장. Lucene 내부 구조 — 세그먼트의 일생</h1>
+<p class="lead">refresh는 왜 1초인가, 삭제한 문서는 왜 디스크에 남는가, 머지는 왜 계속 도는가 — Elasticsearch의 모든 미스터리는 Lucene의 "불변 세그먼트" 하나로 풀립니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 1장 역색인, 2장 클러스터</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 샤드 = Lucene 인덱스 = 불변 세그먼트의 모음 ② 역색인의 실제 저장 구조(FST, posting list)와 doc values ③ buffer → refresh → segment → flush로 이어지는 색인 라이프사이클과 "near real-time"의 진짜 의미 ④ segment merge와 deleted docs의 운명</p>
+  </div>
+</div>
+
+<h2 id="s1">3.1 Lucene이란 — 그리고 두 가지 본질</h2>
+
+<p>Lucene은 1999년 Doug Cutting이 시작한 <strong>자바 풀텍스트 검색 라이브러리</strong>입니다. 데이터베이스가 아닙니다. 분산도, 복제도, REST도 없습니다. "디렉터리 하나에 인덱스 자료구조를 만들고 그 위에서 검색하는 라이브러리"일 뿐입니다. Elasticsearch의 <strong>샤드 하나 = Lucene 인덱스 하나</strong>이고, 그 안은 이렇게 생겼습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Lucene의 본질</th><th>의미</th><th>여기서 파생되는 것</th></tr></thead>
+  <tbody>
+    <tr><td><strong>세그먼트 기반</strong></td><td>인덱스는 여러 세그먼트(자체 완결적인 미니 인덱스)의 모음</td><td>refresh마다 새 세그먼트 생성, 검색은 전체 세그먼트 순회</td></tr>
+    <tr><td><strong>세그먼트는 immutable</strong></td><td>한 번 쓰인 세그먼트는 절대 수정되지 않음</td><td>변경 = 새 세그먼트 추가, 삭제 = 마킹, 정리 = 백그라운드 머지</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>이 두 성질에서 refresh, flush, merge, NRT, 그리고 색인 처리량의 한계까지 — Elasticsearch의 모든 운영 특성이 흘러나옵니다. 이 장의 목표는 이 인과 사슬을 눈으로 확인하는 것입니다.</p>
+
+<h2 id="s2">3.2 역색인은 디스크에 어떻게 저장되나</h2>
+
+<p>1장에서 본 "term → 문서 목록" 표가 실제로는 세 가지 컴포넌트로 저장됩니다.</p>
+
+<ul>
+  <li><strong>Term Dictionary</strong> — 정렬된 term 사전. 수백만 term을 메모리에 올리기 위해 <strong>FST(Finite State Transducer)</strong>라는 자료구조로 압축합니다. FST는 공통 접두사·접미사를 공유하는 압축 트라이 같은 것으로, term 룩업을 디스크 접근 없이 처리하게 해줍니다.</li>
+  <li><strong>Posting List</strong> — 각 term이 등장하는 doc ID 목록. doc ID 간의 <em>차이값(delta)</em>만 저장하고 bit packing으로 압축합니다.</li>
+  <li><strong>Term Frequencies + Positions</strong> — 각 term이 문서에서 몇 번, 어느 위치에 나왔는지. BM25 스코어링과 구문(phrase) 검색에 필요합니다.</li>
+</ul>
+
+<pre><code><span class="c"># 쿼리 "the quick brown fox"가 처리되는 과정 (BM25)</span>
+① Analyzer가 토큰화:  [quick, brown, fox]        <span class="c"># the는 stopword로 제거</span>
+② 각 term의 posting list 조회 (FST로 룩업):
+     quick → [doc1(tf=1), doc7(tf=2), ...]
+     brown → [doc1(tf=1), doc15(tf=1)]
+     fox   → [doc1(tf=1)]
+③ 교집합(intersection):  {doc1}                   <span class="c"># SkipList로 정렬 순회</span>
+④ 각 문서의 BM25 점수 계산 → top-K 반환</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">검색 속도의 감각</div>
+    <p>posting list 교집합은 정렬된 리스트들을 한 번에 스캔하며 처리되므로, 검색 속도는 대략 <strong>가장 짧은 posting list의 길이</strong>에 비례합니다. 희귀한 term이 하나라도 끼어 있으면 매우 빠릅니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">3.3 Doc Values — 역색인의 반대 방향</h2>
+
+<p>역색인은 "term → docs"는 잘하지만 <strong>"doc → 필드 값"</strong>은 못 합니다. 그런데 정렬·집계·스크립트는 후자가 필요합니다. 그래서 Lucene은 색인 시 <strong>Doc Values</strong>라는 컬럼 지향 자료구조를 함께 만듭니다.</p>
+
+<pre><code><span class="c"># 같은 데이터, 두 방향의 자료구조</span>
+
+Inverted Index (검색용):          Doc Values (정렬/집계용, 컬럼 지향):
+  "apple"  → [doc1, doc5]           field "price":
+  "banana" → [doc3, doc7]             doc1 → 100
+                                      doc2 → 250
+                                      doc3 → 80    <span class="c"># 한 필드 값이 연속 배치</span>
+                                      doc4 → 320   <span class="c"># → sequential read로 집계</span></code></pre>
+
+<p>ClickHouse의 컬럼 저장과 같은 원리입니다. 중요한 점: Doc Values는 JVM heap이 아니라 <strong>OS의 파일 시스템 캐시(off-heap)</strong>에 올라갑니다. Elasticsearch가 heap을 시스템 메모리의 50% 이하로 권장하는 이유가 바로 이것입니다 — 나머지 절반은 OS가 doc values와 posting list를 캐싱하는 데 씁니다.</p>
+
+<h2 id="s4">3.4 _source — 원본 JSON의 자리</h2>
+
+<p>문서의 원본 JSON은 <code>_source</code>라는 stored field에 통째로 저장됩니다(LZ4/ZSTD 압축 청크). 검색 결과 반환, reindex, update API가 모두 이것에 의존합니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">_source 끄기는 위험한 최적화</div>
+    <p>디스크를 아끼려 <code>"_source": {"enabled": false}</code>로 끄면 <strong>reindex 불가, update API 불가, partial update 불가</strong>가 됩니다. 대신 <code>_source.excludes</code>로 큰 필드만 빼거나, doc values에서 _source를 재구성하는 <strong>Synthetic _source</strong>(8.4+)를 검토하세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">3.5 색인 라이프사이클 — buffer에서 디스크까지</h2>
+
+<p>이 절이 이 장의 심장입니다. 색인 요청 하나가 검색 가능해지고(refresh), 영속화되고(flush), 그 사이 유실을 막는(translog) 전체 과정을 봅시다.</p>
+
+<div class="anim" data-steps="6" data-title="문서 색인의 라이프사이클 — buffer → refresh → segment → flush" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 400">
+      <defs>
+        <marker id="c1arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- 영역 라벨 -->
+      <text x="30" y="28" class="sv-label" font-size="13">🧠 메모리 (JVM/OS)</text>
+      <line x1="30" y1="250" x2="830" y2="250" class="sv-line" stroke-dasharray="6 5"/>
+      <text x="30" y="276" class="sv-label" font-size="13">💾 디스크</text>
+
+      <!-- in-memory buffer -->
+      <g data-active="1-2">
+        <rect x="30" y="48" width="240" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="150" y="74" text-anchor="middle" class="sv-label" font-size="12.5">In-memory Indexing Buffer</text>
+        <text x="150" y="96" text-anchor="middle" class="sv-label-sm">새 문서가 일단 쌓이는 곳</text>
+        <text x="150" y="114" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">🔍 검색 불가</text>
+      </g>
+
+      <!-- 문서 도착 -->
+      <g data-show="1">
+        <circle cx="80" cy="88" r="7" fill="var(--accent)" class="pulse"/>
+        <text x="60" y="150" class="sv-label-sm" fill="var(--accent)">① 문서 도착 → buffer에 추가</text>
+      </g>
+
+      <!-- translog -->
+      <g data-show="2" data-active="2-5">
+        <rect x="30" y="290" width="240" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="150" y="316" text-anchor="middle" class="sv-label" font-size="12.5">Translog (append + fsync)</text>
+        <text x="150" y="338" text-anchor="middle" class="sv-label-sm">유실 방지 — 재시작 시 replay</text>
+        <path d="M 150 128 L 150 286" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="162" y="200" class="sv-label-sm" fill="var(--warn)">② 로그 기록 후 ack</text>
+      </g>
+
+      <!-- refresh → in-memory segment -->
+      <g data-show="3" data-active="3-4">
+        <path d="M 270 88 L 340 88" class="sv-arrow flow-line" marker-end="url(#c1arr)"/>
+        <text x="305" y="72" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">refresh (1s)</text>
+        <rect x="345" y="48" width="240" height="80" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="465" y="74" text-anchor="middle" class="sv-label" font-size="12.5">새 Segment (OS 캐시)</text>
+        <text x="465" y="96" text-anchor="middle" class="sv-label-sm">아직 fsync 안 됨</text>
+        <text x="465" y="114" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">🔍 검색 가능! (NRT)</text>
+      </g>
+
+      <g data-show="4">
+        <rect x="620" y="48" width="210" height="80" rx="10" class="sv-box"/>
+        <text x="725" y="74" text-anchor="middle" class="sv-label" font-size="12.5">IndexReader 갱신</text>
+        <text x="725" y="96" text-anchor="middle" class="sv-label-sm">검색기가 새 segment를</text>
+        <text x="725" y="114" text-anchor="middle" class="sv-label-sm">보기 시작 → NRT 완성</text>
+        <path d="M 585 88 L 616 88" class="sv-arrow" marker-end="url(#c1arr)"/>
+      </g>
+
+      <!-- flush -->
+      <g data-show="5" data-active="5-6">
+        <path d="M 465 128 L 465 286" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="477" y="200" class="sv-label-sm" fill="var(--ok)">⑤ flush: fsync + commit point</text>
+        <rect x="345" y="290" width="240" height="70" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="465" y="316" text-anchor="middle" class="sv-label" font-size="12.5">영속화된 Segments</text>
+        <text x="465" y="338" text-anchor="middle" class="sv-label-sm">commit point가 활성 목록 기록</text>
+      </g>
+
+      <g data-show="6">
+        <rect x="620" y="290" width="210" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <text x="725" y="316" text-anchor="middle" class="sv-label" font-size="12.5">Translog 초기화 ♻️</text>
+        <text x="725" y="338" text-anchor="middle" class="sv-label-sm">replay할 양 감소 = 복구 빨라짐</text>
+        <path d="M 270 325 L 340 325" stroke="var(--warn)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <path d="M 585 325 L 616 325" stroke="var(--warn)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>색인 요청이 도착하면 문서는 <b>인메모리 버퍼</b>에 쌓입니다. 이 시점엔 검색되지 않습니다 — 아직 세그먼트가 아니니까요.</p>
+    <p>동시에 <b>translog</b>에 append + fsync됩니다. 클라이언트가 받는 색인 성공 응답은 "translog에 안전하게 기록됨"이라는 뜻입니다. 노드가 죽어도 재시작 시 translog를 replay해 복원합니다.</p>
+    <p>기본 1초마다 <b>refresh</b>가 일어나 버퍼 내용으로 <b>새 세그먼트</b>가 만들어집니다. 파일 시스템 캐시에만 있고 아직 fsync는 안 된 상태 — 하지만 <b style="color:var(--ok)">검색은 가능</b>해집니다.</p>
+    <p>새 IndexReader가 열리면서 검색기가 이 세그먼트를 보기 시작합니다. 이것이 <b>"near real-time"의 정체</b>입니다: 검색 가시성(refresh)과 디스크 영속성(fsync)을 분리한 것이죠.</p>
+    <p>translog가 512MB에 달하거나 30분이 지나면 <b>flush</b>: 쌓인 세그먼트를 전부 fsync하고, 어떤 세그먼트가 활성인지 기록하는 <b>commit point</b>를 갱신합니다.</p>
+    <p>flush가 끝나면 translog를 비우고 새로 시작합니다. 이제 재시작 시 replay할 양이 줄어듭니다 — flush의 가장 큰 목적은 <b>복구 시간 단축</b>입니다.</p>
+  </div>
+</div>
+
+<p>정리하면, 세 단어의 역할 분담은 이렇습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>동작</th><th>주기(기본)</th><th>하는 일</th><th>보장하는 것</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Refresh</strong></td><td>1초</td><td>buffer → 새 segment (OS 캐시)</td><td>검색 가시성 (durability 아님!)</td></tr>
+    <tr><td><strong>Translog 기록</strong></td><td>매 요청</td><td>append + fsync</td><td>내구성 (재시작 시 replay)</td></tr>
+    <tr><td><strong>Flush</strong></td><td>translog 512MB 또는 30분</td><td>segment fsync + commit point + translog 초기화</td><td>영속화 + 복구 시간 단축</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c"># refresh_interval 튜닝 — 색인 처리량의 가장 큰 변수</span>
+<span class="k">PUT</span> /my-index/_settings
+{ <span class="s">"index"</span>: { <span class="s">"refresh_interval"</span>: <span class="s">"30s"</span> } }   <span class="c"># 30s만 돼도 처리량 2~5배 흔함</span>
+
+<span class="c"># 대량 초기 적재: refresh 끄기 → 적재 → 복원</span>
+<span class="k">PUT</span> /logs-init/_settings
+{ <span class="s">"index"</span>: { <span class="s">"refresh_interval"</span>: <span class="s">"-1"</span> } }
+<span class="c"># ... bulk 적재 ...</span>
+<span class="k">PUT</span> /logs-init/_settings
+{ <span class="s">"index"</span>: { <span class="s">"refresh_interval"</span>: <span class="s">"1s"</span> } }
+<span class="k">POST</span> /logs-init/_refresh
+
+<span class="c"># translog 내구성 모드 — 의식적으로 선택하라</span>
+<span class="f">index.translog.durability</span>: <span class="s">request</span>   <span class="c"># 기본. 매 요청 fsync (안전, IOPS 부담)</span>
+<span class="f">index.translog.durability</span>: <span class="s">async</span>     <span class="c"># 5초 주기 fsync (빠름, 최대 5초 유실 가능)</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">워크로드별 translog 선택</div>
+    <p>대량 로그 적재처럼 몇 초의 유실이 허용되는 워크로드는 <code>async</code>로 처리량을 2~3배 올릴 수 있습니다. 결제·주문처럼 유실 불가 데이터는 반드시 기본값 <code>request</code>를 유지하세요.</p>
+  </div>
+</div>
+
+<h2 id="s6">3.6 삭제와 업데이트 — 불변 세그먼트에서 지우는 법</h2>
+
+<p>세그먼트가 불변이라면 DELETE는 어떻게 처리될까요? 답: <strong>지우지 않고 마킹만 합니다.</strong></p>
+
+<div class="anim" data-steps="4" data-title="DELETE의 진실 — 삭제는 마킹, 진짜 제거는 머지가" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <!-- 세그먼트 -->
+      <g data-active="1-3">
+        <rect x="60" y="60" width="300" height="160" rx="10" class="sv-box"/>
+        <text x="210" y="86" text-anchor="middle" class="sv-label" font-size="12.5">segment_A (immutable)</text>
+        <rect x="84" y="100" width="250" height="28" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="98" y="119" class="sv-label-sm sv-mono">doc 1: "구형 모델 상품"</text>
+        <rect x="84" y="136" width="250" height="28" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="98" y="155" class="sv-label-sm sv-mono">doc 2: "인기 상품"</text>
+        <rect x="84" y="172" width="250" height="28" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="98" y="191" class="sv-label-sm sv-mono">doc 3: "일반 상품"</text>
+      </g>
+
+      <g data-show="1">
+        <text x="210" y="256" text-anchor="middle" class="sv-label-sm">DELETE /products/_doc/1 요청 도착</text>
+      </g>
+
+      <!-- 마킹 -->
+      <g data-show="2" data-active="2-3">
+        <line x1="84" y1="114" x2="334" y2="114" stroke="var(--danger)" stroke-width="2.4"/>
+        <rect x="400" y="92" width="190" height="44" rx="8" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="495" y="110" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">.liv 파일에 deleted bit 마킹</text>
+        <text x="495" y="128" text-anchor="middle" class="sv-label-sm">세그먼트 본체는 그대로!</text>
+      </g>
+
+      <!-- 검색 시 필터 -->
+      <g data-show="3">
+        <rect x="400" y="160" width="190" height="60" rx="8" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="495" y="182" text-anchor="middle" class="sv-label-sm">검색 시 deleted bit가 켜진</text>
+        <text x="495" y="200" text-anchor="middle" class="sv-label-sm">문서는 결과에서 필터링</text>
+        <text x="495" y="248" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">⚠️ 디스크 공간은 계속 차지</text>
+      </g>
+
+      <!-- 머지 -->
+      <g data-show="4">
+        <rect x="640" y="80" width="130" height="130" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="705" y="110" text-anchor="middle" class="sv-label" font-size="12.5">🌀 Merge</text>
+        <text x="705" y="136" text-anchor="middle" class="sv-label-sm">머지 때 비로소</text>
+        <text x="705" y="154" text-anchor="middle" class="sv-label-sm">deleted docs가</text>
+        <text x="705" y="172" text-anchor="middle" class="sv-label-sm">진짜로 사라지고</text>
+        <text x="705" y="190" text-anchor="middle" class="sv-label-sm">공간 회수됨</text>
+        <path d="M 595 145 L 636 145" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>세그먼트 A에 문서 3개가 들어 있습니다. 이때 doc 1에 대한 DELETE 요청이 도착합니다.</p>
+    <p>세그먼트는 불변이므로 파일을 고칠 수 없습니다. 대신 별도의 <b>.liv 파일에 "doc 1은 삭제됨" 비트만 마킹</b>합니다. 같은 <code>_id</code>로 재색인(update)해도 마찬가지 — 기존 버전 마킹 + 새 세그먼트에 새 버전 추가입니다.</p>
+    <p>검색할 때는 deleted bit가 켜진 문서를 결과에서 걸러냅니다. 사용자는 삭제된 것으로 보지만, <b style="color:var(--warn)">디스크 공간은 그대로 차지</b>하고 있습니다.</p>
+    <p>진짜 제거는 <b>머지</b>의 몫입니다. 세그먼트들이 병합될 때 deleted docs를 빼고 새 세그먼트를 쓰므로, 그때 비로소 공간이 회수됩니다. <b>"대량 삭제 후 디스크가 안 줄어요"의 답이 여기 있습니다.</b></p>
+  </div>
+</div>
+
+<h2 id="s7">3.7 Merge — 세그먼트 정리반</h2>
+
+<p>refresh가 1초마다 새 세그먼트를 만들면 세그먼트가 빠르게 불어납니다. 세그먼트가 많을수록 검색이 모든 세그먼트를 순회해야 해서 느려지고, 파일 디스크립터와 메타데이터 메모리도 소모됩니다. 그래서 Lucene은 백그라운드에서 <strong>작은 세그먼트들을 큰 세그먼트로 병합</strong>합니다. 기본 정책은 <strong>TieredMergePolicy</strong>입니다.</p>
+
+<div class="anim" data-steps="5" data-title="TieredMergePolicy — 10개가 모이면 한 단계 위로" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="c2arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <text x="30" y="30" class="sv-label" font-size="13">Tier 0 — 작은 segment (~5MB)</text>
+
+      <!-- tier0 segments -->
+      <g data-show="1" data-active="1-2">
+        <rect x="30" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="84" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="138" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="192" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="140" y="66" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">seg×4</text>
+      </g>
+      <g data-show="2" data-active="2-2">
+        <rect x="246" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="300" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="354" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="408" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="462" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="516" y="44" width="46" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" class="pulse"/>
+        <text x="600" y="66" class="sv-label-sm" fill="var(--warn)">← 10개 도달!</text>
+      </g>
+
+      <!-- merge to tier1 -->
+      <g data-show="3" data-active="3-5">
+        <path d="M 296 82 L 296 130" stroke="var(--ok)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#c2arr)"/>
+        <text x="312" y="112" class="sv-label-sm" fill="var(--ok)">merge (deleted docs 제외하고 병합)</text>
+        <rect x="150" y="136" width="290" height="42" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="295" y="162" text-anchor="middle" class="sv-label sv-mono" font-size="12">Tier 1 segment (~50MB)</text>
+      </g>
+
+      <!-- tier1 fills up -->
+      <g data-show="4" data-active="4-5">
+        <rect x="460" y="136" width="90" height="42" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="505" y="162" text-anchor="middle" class="sv-label-sm sv-mono" font-size="10">×10...</text>
+        <path d="M 505 182 L 505 222" stroke="var(--ok)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#c2arr)"/>
+        <rect x="300" y="228" width="410" height="46" rx="9" fill="color-mix(in srgb, var(--es) 14%, transparent)" stroke="var(--es)" stroke-width="2"/>
+        <text x="505" y="256" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">Tier 2 segment (~500MB) ... 지수적으로 성장</text>
+      </g>
+
+      <g data-show="5">
+        <text x="400" y="308" text-anchor="middle" class="sv-label" font-size="13">🧱 자동 머지 상한 = max_merged_segment 5GB — 그 이상은 Force Merge로만</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>refresh가 돌 때마다 ~5MB짜리 작은 세그먼트가 Tier 0에 하나씩 추가됩니다.</p>
+    <p>세그먼트가 <b>10개</b>(<code>segments_per_tier</code> 기본값) 모이면 머지 대상이 됩니다.</p>
+    <p>10개의 작은 세그먼트가 <b>1개의 ~50MB 세그먼트</b>로 병합됩니다. 이때 deleted docs는 빼고 쓰므로 공간도 회수됩니다.</p>
+    <p>Tier 1 세그먼트도 10개가 모이면 다시 병합 → ~500MB Tier 2. 이렇게 <b>지수적으로 커지는 계단</b>이 만들어집니다.</p>
+    <p>단, 자동 머지는 <code>max_merged_segment</code>(기본 <b>5GB</b>)까지만 진행됩니다. 더 큰 세그먼트를 원하면 쓰기가 끝난 인덱스에 한해 <b>Force Merge</b>를 명시적으로 호출해야 합니다.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">Force Merge는 "쓰기가 끝난" 인덱스에만</div>
+    <p><code>POST /logs-2026.07.10/_forcemerge?max_num_segments=1</code>은 어제 자 로그처럼 더 이상 쓰지 않는 인덱스에는 훌륭한 최적화입니다. 하지만 <strong>쓰기 진행 중인 인덱스에 실행하면</strong> 5GB를 초과하는 거대 세그먼트가 생기고, 이후 deleted docs가 쌓여도 자동 머지 대상에서 빠져 <strong>디스크를 영영 회수하지 못하게</strong> 될 수 있습니다. ILM의 warm phase에서 자동화하는 것이 정석입니다.</p>
+  </div>
+</div>
+
+<h2 id="s8">3.8 운영 팁</h2>
+
+<ul>
+  <li><strong>Heap 32GB 룰</strong>: JVM heap이 32GB를 넘으면 compressed object pointer가 꺼져 메모리 효율이 급락합니다. <strong>heap = min(시스템 메모리의 50%, 30GB)</strong>가 표준. 나머지는 OS 캐시 몫입니다.</li>
+  <li><strong>세그먼트 수 모니터링</strong>: 한 샤드에 세그먼트가 100개를 넘으면 머지가 색인 속도를 따라잡지 못한다는 신호입니다.</li>
+  <li><strong>_id 자동 생성이 빠릅니다</strong>: <code>_id</code>를 직접 지정하면 같은 ID 존재 여부 확인 + 기존 버전 삭제 마킹이 필요해 더 비쌉니다.</li>
+</ul>
+
+<pre><code><span class="c"># 세그먼트 상태 확인</span>
+<span class="k">GET</span> /_cat/segments/logs-2026.07.11?v=true&amp;h=shard,segment,size,docs.count,docs.deleted
+
+<span class="c"># 샤드당 세그먼트 수</span>
+<span class="k">GET</span> /_cat/shards/logs-*?v=true&amp;h=index,shard,prirep,docs,store,segments.count
+
+<span class="c"># jvm.options — heap 30GB 고정</span>
+-Xms30g
+-Xmx30g</code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">refresh와 flush의 역할을 올바르게 설명한 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">refresh는 디스크 fsync, flush는 검색 가시성을 만든다</button>
+    <button type="button" data-correct>refresh는 buffer를 검색 가능한 세그먼트로 만들고(fsync 아님), flush는 세그먼트를 fsync하고 commit point를 갱신하며 translog를 비운다</button>
+    <button type="button">refresh와 flush는 같은 동작의 다른 이름이다</button>
+    <button type="button">flush가 일어나야 문서가 검색되기 시작한다</button>
+  </div>
+  <div class="quiz-expl">✅ <strong>refresh = 검색 가시성</strong>(buffer → OS 캐시의 세그먼트, 기본 1초), <strong>flush = 영속화</strong>(fsync + commit point + translog 초기화)입니다. refresh만 된 세그먼트는 아직 fsync 전이지만, 그 사이의 내구성은 translog가 책임집니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">대량의 문서를 DELETE했는데 디스크 사용량이 거의 줄지 않았습니다. 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">DELETE 요청이 translog에만 기록되고 아직 실행되지 않았다</button>
+    <button type="button">replica가 아직 삭제를 복제받지 못했다</button>
+    <button type="button" data-correct>세그먼트는 불변이라 삭제는 deleted bit 마킹일 뿐이며, 실제 공간 회수는 세그먼트 머지 때 일어난다</button>
+  </div>
+  <div class="quiz-expl">✅ 불변 세그먼트에서 삭제는 .liv 파일의 비트 마킹입니다. 검색 결과에서는 즉시 사라지지만 디스크의 데이터는 그대로 있고, 머지가 해당 세그먼트를 병합할 때 비로소 물리적으로 제거됩니다. PostgreSQL의 dead tuple + VACUUM과 닮은 구조입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch03_lucene_internals.md" target="_blank" rel="noopener">chapters/ch03_lucene_internals.md</a> — FST 구조 상세, merge policy 설정 표, 색인 파이프라인 전체 플로우가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch02.html"><span class="dir">← 이전</span><br><span class="title">2장. 클러스터 아키텍처</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch04.html"><span class="dir">다음 →</span><br><span class="title">4장. 인덱스와 샤드</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1장. Elasticsearch 개요 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch01">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>1장. Elasticsearch 개요 — 검색 엔진이라는 다른 세계</h1>
+<p class="lead">"MySQL 비슷한데 검색이 빠른 것"이라는 오해에서 벗어나는 것이 첫걸음입니다. 인덱스 자료구조가 다르면, 시스템의 모든 것이 달라집니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-basic">기초</span>
+  <span class="tag">⏱ 약 20분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 없음</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Elasticsearch의 정체성 = 분산 Lucene + REST ② RDB의 LIKE 검색과 역색인 검색은 무엇이 다른가 ③ NRT(near real-time)가 "느린 것"이 아니라 "의도된 설계"인 이유 ④ Elastic Stack의 구성과 분산 시스템 핵심 원칙</p>
+  </div>
+</div>
+
+<h2 id="s1">1.1 Elasticsearch는 어떤 시스템인가</h2>
+
+<p>Elasticsearch는 Apache Lucene 기반의 <strong>분산 검색·분석 엔진(Distributed Search and Analytics Engine)</strong>입니다. 공식 문서의 정의를 풀어보면 네 가지 키워드가 나옵니다.</p>
+
+<ul>
+  <li><strong>Distributed</strong> — 처음부터 여러 대의 서버(클러스터)로 동작하도록 설계됐습니다. 단일 노드는 사실상 개발용입니다.</li>
+  <li><strong>RESTful</strong> — 모든 조작이 HTTP + JSON입니다. 전용 드라이버 없이 <code>curl</code> 한 줄로 색인·검색·진단까지 가능합니다.</li>
+  <li><strong>Search and analytics</strong> — 풀텍스트 검색뿐 아니라 집계(aggregation), 시계열 분석, 벡터 검색까지 한 엔진에서 처리합니다.</li>
+  <li><strong>Lucene-based</strong> — 실제 인덱스 자료구조(역색인, 세그먼트, 머지)는 <strong>Lucene</strong>이라는 자바 검색 라이브러리가 담당합니다.</li>
+</ul>
+
+<p>마지막 항목이 핵심입니다. 한 줄로 요약하면 이렇게 이해해도 큰 무리가 없습니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">한 줄 요약</div>
+    <p><strong>Elasticsearch ≈ 분산 Lucene + REST API + 클러스터 관리.</strong> Lucene 인덱스를 여러 노드에 나눠 담고(샤딩), 복제하고, 요청을 라우팅해 주는 레이어가 Elasticsearch입니다. 그래서 3장에서 Lucene 내부를, 2·4장에서 분산 레이어를 다룹니다.</p>
+  </div>
+</div>
+
+<p>버전에 대한 기준도 정해둡시다. 이 가이드는 <strong>8.17 LTS를 baseline</strong>으로 하고, 9.x 고유 변경점은 박스로 따로 표기합니다. 9.x는 <strong>Lucene 10</strong> 기반(8.x는 Lucene 9)이며, SIMD 최적화·BBQ(Better Binary Quantization) GA 등 성능 향상 대부분이 Lucene 10에서 옵니다.</p>
+
+<h2 id="s2">1.2 RDB의 LIKE 검색 vs 역색인 검색</h2>
+
+<p>RDBMS의 인덱스는 보통 <strong>B-Tree</strong>입니다. B-Tree는 <code>WHERE name = 'Alice'</code> 같은 <em>정확한 값 매치</em>에 최적화되어 있습니다. 하지만 "본문에 'fox'라는 단어가 <em>포함된</em> 모든 문서"를 찾으려면 어떻게 될까요? <code>LIKE '%fox%'</code>는 인덱스를 쓰지 못하고 <strong>모든 행을 처음부터 끝까지 읽는 풀스캔</strong>이 됩니다.</p>
+
+<p>Elasticsearch(Lucene)는 <strong>역색인(Inverted Index)</strong>을 씁니다. "term → 그 term이 등장한 문서 목록(posting list)"을 미리 만들어 두는 것입니다. 책 뒤편의 '찾아보기' 페이지와 정확히 같은 원리입니다. 두 방식이 같은 검색을 처리하는 과정을 비교해 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="같은 검색, 다른 운명 — LIKE '%fox%' vs 역색인 룩업" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 900 350">
+      <defs>
+        <marker id="a1arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--es)"/>
+        </marker>
+      </defs>
+      <line x1="450" y1="16" x2="450" y2="330" class="sv-line" stroke-dasharray="4 6"/>
+
+      <!-- 왼쪽: RDB LIKE -->
+      <text x="225" y="28" text-anchor="middle" class="sv-label" font-size="15">🐢 RDB — LIKE '%fox%'</text>
+      <g>
+        <rect x="60" y="46" width="330" height="30" rx="6" class="sv-box"/>
+        <text x="74" y="66" class="sv-label-sm sv-mono">row 1: "the quick brown fox"</text>
+        <rect x="60" y="82" width="330" height="30" rx="6" class="sv-box"/>
+        <text x="74" y="102" class="sv-label-sm sv-mono">row 2: "the lazy dog"</text>
+        <rect x="60" y="118" width="330" height="30" rx="6" class="sv-box"/>
+        <text x="74" y="138" class="sv-label-sm sv-mono">row 3: "quick dog runs"</text>
+        <rect x="60" y="154" width="330" height="30" rx="6" class="sv-box"/>
+        <text x="74" y="174" class="sv-label-sm sv-mono">row 4 ... row 10,000,000</text>
+      </g>
+      <g data-show="2">
+        <rect x="60" y="46" width="330" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="74" y="66" class="sv-label-sm sv-mono">row 1: "the quick brown fox"</text>
+        <text x="404" y="66" class="sv-label-sm" fill="var(--warn)">← 스캔</text>
+      </g>
+      <g data-show="3">
+        <rect x="60" y="82" width="330" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <rect x="60" y="118" width="330" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <rect x="60" y="154" width="330" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)" class="blink"/>
+        <text x="74" y="102" class="sv-label-sm sv-mono">row 2: "the lazy dog"</text>
+        <text x="74" y="138" class="sv-label-sm sv-mono">row 3: "quick dog runs"</text>
+        <text x="74" y="174" class="sv-label-sm sv-mono">row 4 ... row 10,000,000</text>
+        <text x="225" y="215" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="14">⛔ 천만 행 전부 문자열 스캔</text>
+        <text x="225" y="238" text-anchor="middle" class="sv-label-sm">B-Tree 인덱스는 '%..%' 패턴에 무력</text>
+      </g>
+
+      <!-- 오른쪽: 역색인 -->
+      <text x="675" y="28" text-anchor="middle" class="sv-label" font-size="15">⚡ Elasticsearch — 역색인</text>
+      <g>
+        <rect x="510" y="46" width="330" height="140" rx="10" class="sv-box"/>
+        <text x="675" y="68" text-anchor="middle" class="sv-label-sm">term dictionary → posting list</text>
+        <text x="530" y="94" class="sv-label sv-mono" font-size="12">brown → doc1</text>
+        <text x="530" y="118" class="sv-label sv-mono" font-size="12">dog   → doc2, doc3</text>
+        <text x="530" y="142" class="sv-label sv-mono" font-size="12">fox   → doc1</text>
+        <text x="530" y="166" class="sv-label sv-mono" font-size="12">quick → doc1, doc3</text>
+      </g>
+      <g data-show="4">
+        <rect x="524" y="128" width="150" height="22" rx="5" fill="color-mix(in srgb, var(--ok) 20%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="530" y="142" class="sv-label sv-mono" font-size="12" fill="var(--ok)">fox   → doc1</text>
+        <text x="690" y="143" class="sv-label-sm" fill="var(--ok)">← 사전에서 바로 룩업!</text>
+      </g>
+      <g data-show="5">
+        <path d="M 600 150 Q 620 210 660 240" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#a1arr)"/>
+        <rect x="600" y="248" width="150" height="40" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="675" y="273" text-anchor="middle" class="sv-label" fill="var(--ok)">doc1 반환 ✨</text>
+        <text x="675" y="315" text-anchor="middle" class="sv-label-sm">문서 수가 천만이어도 룩업은 ms 단위</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>양쪽 모두 같은 질문을 받았습니다: <b>"fox가 포함된 문서를 모두 찾아라."</b> 왼쪽은 RDB 테이블, 오른쪽은 미리 만들어 둔 역색인입니다.</p>
+    <p>RDB의 <code>LIKE '%fox%'</code>는 첫 행부터 문자열을 훑기 시작합니다. 중간 어디에나 올 수 있는 패턴이라 B-Tree 인덱스를 탈 수 없기 때문입니다.</p>
+    <p>행이 천만 개면 <b style="color:var(--danger)">천만 번의 문자열 스캔</b>이 일어납니다. 데이터가 늘수록 검색은 선형으로 느려집니다.</p>
+    <p>Elasticsearch는 색인 시점에 이미 문서를 토큰으로 분해해 두었습니다. 검색은 정렬된 term 사전에서 <code>fox</code>를 <b style="color:var(--ok)">바로 찾는 룩업</b>일 뿐입니다.</p>
+    <p>posting list가 가리키는 doc1을 반환하면 끝. 원문은 한 글자도 읽지 않았습니다. <b>풀텍스트 검색이 곧 인덱스 룩업</b> — 이것이 검색 엔진의 본질입니다.</p>
+  </div>
+</div>
+
+<p>역색인이라는 자료구조에서 Elasticsearch의 성격이 그대로 따라 나옵니다.</p>
+
+<ul>
+  <li><strong>풀텍스트 검색이 본업</strong>입니다. 토큰 단위 검색 = 인덱스 룩업.</li>
+  <li><strong>세그먼트는 immutable(불변)</strong>입니다. B-Tree처럼 제자리 수정을 하지 않고, 변경 시 새 세그먼트를 만들어 백그라운드 머지로 정리합니다 (3장).</li>
+  <li><strong>관계형 JOIN은 약점</strong>입니다. 역색인은 단일 인덱스 안에서만 효율적입니다. 9.x에서 ES|QL JOIN이 GA됐지만 RDBMS의 임의 JOIN을 대체하지는 못합니다.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>RDBMS (B-Tree)</th><th>Elasticsearch (역색인)</th></tr></thead>
+  <tbody>
+    <tr><td>잘하는 것</td><td>정확 매치, 범위 검색, 트랜잭션, JOIN</td><td>풀텍스트 검색, 집계, 대규모 분산</td></tr>
+    <tr><td>부분 문자열 검색</td><td><code>LIKE '%..%'</code> = 풀스캔</td><td>토큰 룩업 = ms 단위</td></tr>
+    <tr><td>쓰기 방식</td><td>제자리 갱신(in-place)</td><td>불변 세그먼트 + 백그라운드 머지</td></tr>
+    <tr><td>검색 가시성</td><td>커밋 즉시</td><td>기본 1초 후 (NRT)</td></tr>
+    <tr><td>스키마</td><td>DDL로 엄격</td><td>매핑(mapping) — 유연하지만 함정 있음 (5장)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s3">1.3 Near-Real-Time — "1초 늦는 것"은 버그가 아니다</h2>
+
+<p>Elasticsearch에 문서를 색인하고 <em>곧바로</em> 검색하면, 그 문서가 안 보일 수 있습니다. 처음 겪으면 당황하는 현상이지만, 이는 <strong>NRT(near real-time) 검색</strong>이라는 의도된 설계입니다. 새 문서는 기본 1초 간격의 <code>refresh_interval</code>이 지나야 검색에 노출됩니다.</p>
+
+<div class="anim" data-steps="4" data-title="NRT 타임라인 — 색인 직후의 1초 동안 무슨 일이" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <defs>
+        <marker id="a2arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- 타임라인 -->
+      <line x1="60" y1="230" x2="740" y2="230" class="sv-line"/>
+      <text x="100" y="256" text-anchor="middle" class="sv-label-sm sv-mono">t = 0s</text>
+      <text x="400" y="256" text-anchor="middle" class="sv-label-sm sv-mono">t ≈ 0.5s</text>
+      <text x="660" y="256" text-anchor="middle" class="sv-label-sm sv-mono">t = 1s (refresh)</text>
+
+      <g data-show="1">
+        <rect x="40" y="50" width="200" height="66" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="140" y="74" text-anchor="middle" class="sv-label" font-size="12.5">① 색인 요청</text>
+        <text x="140" y="96" text-anchor="middle" class="sv-label-sm sv-mono">POST /products/_doc</text>
+        <path d="M 100 120 L 100 222" class="sv-arrow" marker-end="url(#a2arr)"/>
+        <circle cx="100" cy="230" r="6" fill="var(--accent)"/>
+        <text x="140" y="150" class="sv-label-sm">메모리 버퍼에 기록됨</text>
+        <text x="140" y="168" class="sv-label-sm">(+ translog로 디스크 보존)</text>
+      </g>
+
+      <g data-show="2">
+        <rect x="300" y="50" width="200" height="66" rx="9" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="400" y="74" text-anchor="middle" class="sv-label" font-size="12.5">② 즉시 검색해 보면?</text>
+        <text x="400" y="96" text-anchor="middle" class="sv-label-sm sv-mono">GET /_search "새상품"</text>
+        <path d="M 400 120 L 400 222" stroke="var(--danger)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <circle cx="400" cy="230" r="6" fill="var(--danger)"/>
+        <text x="400" y="150" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">❌ 결과 0건 — 아직 세그먼트가 아님</text>
+      </g>
+
+      <g data-show="3">
+        <rect x="560" y="50" width="200" height="66" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="660" y="74" text-anchor="middle" class="sv-label" font-size="12.5">③ refresh 발생!</text>
+        <text x="660" y="96" text-anchor="middle" class="sv-label-sm">버퍼 → 검색 가능한 세그먼트</text>
+        <path d="M 660 120 L 660 222" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <circle cx="660" cy="230" r="6" fill="var(--ok)"/>
+        <text x="660" y="150" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✅ 이제 검색에 노출됨</text>
+      </g>
+
+      <g data-show="4">
+        <text x="400" y="288" text-anchor="middle" class="sv-label" font-size="13.5">💡 매 문서마다 fsync하지 않고 1초 단위로 묶어 처리 → 색인 처리량 극대화</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>t=0</b>: 색인 요청이 도착하면 문서는 일단 <b>인메모리 버퍼</b>에 쌓입니다. 유실 방지를 위해 translog라는 로그 파일에도 기록됩니다(3장).</p>
+    <p>이 순간 바로 검색하면? <b style="color:var(--danger)">결과 0건</b>. 버퍼 속 문서는 아직 검색 가능한 세그먼트가 아니기 때문입니다.</p>
+    <p><b>t=1s</b>: refresh가 일어나 버퍼 내용이 새 세그먼트로 만들어지고, 검색기가 갱신됩니다. <b style="color:var(--ok)">이제 검색됩니다.</b></p>
+    <p>왜 이렇게 할까요? 매 색인마다 디스크 동기화와 인덱스 갱신을 하는 대신 <b>1초 단위로 묶어 처리</b>하면 색인 처리량이 극적으로 높아지기 때문입니다. NRT는 성능을 위한 의도된 트레이드오프입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">"방금 쓴 걸 바로 읽어야" 한다면</div>
+    <p>테스트 코드나 write-then-read 시나리오에서는 <code>?refresh=wait_for</code> 옵션으로 refresh를 기다리게 할 수 있습니다. 단, 운영 트래픽에서 남용하면 색인 성능이 크게 떨어집니다. Elasticsearch의 검색 경로는 기본적으로 <strong>strong consistency를 보장하지 않는다</strong>는 점을 기억하세요.</p>
+  </div>
+</div>
+
+<p>직접 확인해 봅시다. Elasticsearch는 RESTful이므로 curl만 있으면 됩니다.</p>
+
+<pre><code><span class="c"># 문서 색인 (인덱스가 없으면 자동 생성)</span>
+<span class="k">POST</span> /products/_doc
+{
+  <span class="s">"name"</span>: <span class="s">"quick brown fox 인형"</span>,
+  <span class="s">"price"</span>: <span class="n">15000</span>
+}
+
+<span class="c"># 풀텍스트 검색 — 1초 후에는 검색됨</span>
+<span class="k">GET</span> /products/_search
+{
+  <span class="s">"query"</span>: { <span class="s">"match"</span>: { <span class="s">"name"</span>: <span class="s">"fox"</span> } }
+}
+
+<span class="c"># 테스트용: refresh를 기다렸다가 응답 받기</span>
+<span class="k">POST</span> /products/_doc?refresh=wait_for
+{ <span class="s">"name"</span>: <span class="s">"바로 검색돼야 하는 문서"</span> }</code></pre>
+
+<h2 id="s4">1.4 무엇에 쓰는 물건인가 — 4대 사용 사례</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🔎 Full-Text Search</h4>
+    <p>상품 검색, 문서 검색, 사이트 내 검색. BM25 스코어링, 한국어 형태소 분석(<code>nori</code>), 자동완성(suggest)이 주무기입니다.</p>
+  </div>
+  <div class="card">
+    <h4>📈 Observability (로그·메트릭·트레이스)</h4>
+    <p>로그 분석의 사실상 표준. Beats/Elastic Agent로 수집해 시간 기반 인덱스(<code>logs-app-2026.07.11</code>)에 색인하고 Kibana로 시각화합니다.</p>
+  </div>
+  <div class="card">
+    <h4>🛡️ Security Analytics (SIEM)</h4>
+    <p>보안 이벤트를 색인하고 룰 기반 탐지(EQL), 행위 분석, 위협 헌팅을 수행하는 Elastic Security의 백엔드입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🧠 Vector Search (시맨틱 검색)</h4>
+    <p>8.x부터 <code>dense_vector</code> + kNN 검색 지원. 9.x에서 BBQ가 GA되어 메모리 32배 절감 + 8~30배 처리량. RAG·추천에 활용됩니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">1.5 Elastic Stack — 혼자 다니지 않는다</h2>
+
+<p>Elasticsearch는 보통 수집기·시각화 도구와 한 세트로 움직입니다. 데이터가 흐르는 경로를 봅시다.</p>
+
+<div class="anim" data-steps="4" data-title="Elastic Stack — 로그 한 줄이 대시보드가 되기까지" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <defs>
+        <marker id="a3arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--es)"/>
+        </marker>
+      </defs>
+
+      <g data-show="1">
+        <rect x="30" y="40" width="170" height="60" rx="9" class="sv-box"/>
+        <text x="115" y="65" text-anchor="middle" class="sv-label" font-size="12.5">🖥️ 애플리케이션 서버</text>
+        <text x="115" y="86" text-anchor="middle" class="sv-label-sm sv-mono">app.log 생성</text>
+        <rect x="30" y="130" width="170" height="60" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="115" y="155" text-anchor="middle" class="sv-label" font-size="12.5">Elastic Agent / Beats</text>
+        <text x="115" y="176" text-anchor="middle" class="sv-label-sm">경량 수집기 (Shipper)</text>
+        <path d="M 115 100 L 115 128" class="sv-arrow flow-line"/>
+      </g>
+
+      <g data-show="2">
+        <path d="M 200 160 L 275 160" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#a3arr)"/>
+        <rect x="280" y="120" width="180" height="80" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="370" y="148" text-anchor="middle" class="sv-label" font-size="12.5">Logstash (선택)</text>
+        <text x="370" y="170" text-anchor="middle" class="sv-label-sm">무거운 ETL: grok 파싱,</text>
+        <text x="370" y="188" text-anchor="middle" class="sv-label-sm">enrichment, 다중 출력</text>
+      </g>
+
+      <g data-show="3" data-active="3-4">
+        <path d="M 460 160 L 535 160" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#a3arr)"/>
+        <rect x="540" y="110" width="230" height="100" rx="10" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="2"/>
+        <text x="655" y="140" text-anchor="middle" class="sv-label" font-size="13.5">🔍 Elasticsearch</text>
+        <text x="655" y="164" text-anchor="middle" class="sv-label-sm">저장 + 검색 + 집계</text>
+        <text x="655" y="186" text-anchor="middle" class="sv-label-sm sv-mono">logs-app-2026.07.11</text>
+      </g>
+
+      <g data-show="4">
+        <path d="M 655 210 L 655 240" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#a3arr)"/>
+        <rect x="555" y="244" width="200" height="46" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="655" y="273" text-anchor="middle" class="sv-label" font-size="12.5">📊 Kibana — 시각화·관리 UI</text>
+        <text x="300" y="273" text-anchor="middle" class="sv-label-sm">대시보드, Dev Tools, 알림, Fleet(에이전트 중앙 관리)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>애플리케이션이 로그를 남기면, 서버에 설치된 <b>Elastic Agent</b>(또는 Filebeat 같은 Beats)가 이를 실시간으로 수집합니다.</p>
+    <p>복잡한 파싱·가공이 필요하면 <b>Logstash</b>를 중간에 둡니다. grok 파싱, 외부 데이터 enrichment 같은 무거운 ETL 담당입니다. 가벼운 전처리는 Elasticsearch의 ingest pipeline으로도 충분합니다.</p>
+    <p>데이터는 <b>Elasticsearch</b>의 시간 기반 인덱스에 색인됩니다. 여기가 저장·검색·집계의 중심입니다.</p>
+    <p>마지막으로 <b>Kibana</b>가 이 데이터를 대시보드로 시각화합니다. Kibana는 시각화뿐 아니라 클러스터 관리 UI와 Dev Tools 콘솔도 제공합니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>컴포넌트</th><th>역할</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Elasticsearch</strong></td><td>데이터 저장, 검색, 집계. 모든 것의 중심</td></tr>
+    <tr><td><strong>Kibana</strong></td><td>시각화, 대시보드, 클러스터 관리, Dev Tools</td></tr>
+    <tr><td><strong>Logstash</strong></td><td>무거운 ETL — grok 파싱, enrichment, 다중 출력</td></tr>
+    <tr><td><strong>Beats</strong></td><td>경량 수집기 (Filebeat, Metricbeat 등)</td></tr>
+    <tr><td><strong>Elastic Agent + Fleet</strong></td><td>Beats를 하나로 묶은 차세대 수집기 + 중앙 정책 관리. 신규 도입 표준</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s6">1.6 분산 시스템 핵심 원칙 — 미리보기</h2>
+
+<p>Elasticsearch가 Lucene 위에 얹는 분산 레이어의 핵심 개념 세 가지만 미리 잡아둡시다. 자세한 내용은 2장과 4장에서 다룹니다.</p>
+
+<ul>
+  <li><strong>샤드(shard)</strong>: 하나의 인덱스는 여러 샤드로 분할됩니다. 각 샤드는 독립적인 Lucene 인덱스이며 어느 노드에든 배치될 수 있습니다. <strong>인덱스는 논리, 샤드는 물리</strong>입니다.</li>
+  <li><strong>레플리카(replica)</strong>: 각 primary 샤드의 복제본. 노드가 죽으면 replica가 primary로 승격(고가용성)되고, 평소에는 검색 요청을 분담(읽기 처리량)합니다. primary와 replica는 <strong>절대 같은 노드에 배치되지 않습니다</strong>.</li>
+  <li><strong>일관성은 eventual</strong>: 검색 요청은 primary/replica 어느 쪽으로든 라우팅되며, refresh 지연과 복제 지연이 있어 방금 쓴 문서가 즉시 안 보일 수 있습니다.</li>
+</ul>
+
+<pre><code><span class="c"># 클러스터가 살아있는지, 샤드 상태는 어떤지 — 운영자의 첫 명령</span>
+<span class="k">GET</span> /_cluster/health
+
+{
+  <span class="s">"cluster_name"</span>: <span class="s">"prod-search"</span>,
+  <span class="s">"status"</span>: <span class="s">"green"</span>,          <span class="c">← green/yellow/red</span>
+  <span class="s">"number_of_nodes"</span>: <span class="n">6</span>,
+  <span class="s">"active_primary_shards"</span>: <span class="n">120</span>,
+  <span class="s">"active_shards"</span>: <span class="n">240</span>          <span class="c">← primary + replica</span>
+}</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">운영 원칙 미리보기 — 나중에 후회하지 않으려면</div>
+    <p>① primary 샤드 수는 생성 후 바꾸기 어렵습니다 (4장). ② 샤드가 너무 많으면 클러스터가 통째로 흔들립니다(oversharding). ③ 대량 색인은 반드시 bulk API로. ④ 운영 환경은 마스터 전용 노드 3대 분리(2장). ⑤ 업그레이드는 N → N+1 단위 — 8.x → 9.x는 8.19 경유 필수.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">RDB의 <code>LIKE '%fox%'</code>가 느리고 Elasticsearch의 같은 검색이 빠른 근본적인 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">Elasticsearch가 자바로 만들어져 JVM 최적화를 받기 때문</button>
+    <button type="button" data-correct>색인 시점에 문서를 토큰으로 분해해 역색인을 만들어 두어, 검색이 사전 룩업이 되기 때문</button>
+    <button type="button">Elasticsearch는 데이터를 전부 메모리에 올려두기 때문</button>
+    <button type="button">B-Tree보다 역색인의 쓰기 속도가 빠르기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 핵심은 자료구조입니다. B-Tree는 <code>'%..%'</code> 패턴에서 인덱스를 쓰지 못해 풀스캔이 되지만, 역색인은 "term → 문서 목록"을 미리 만들어 두므로 검색이 정렬된 사전에서의 룩업 + posting list 조회로 끝납니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">문서를 색인한 직후 검색했더니 결과에 나오지 않습니다. 가장 가능성 높은 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">색인 요청이 실패해서 데이터가 유실됐다</button>
+    <button type="button">클러스터 장애로 샤드가 내려갔다</button>
+    <button type="button" data-correct>기본 1초의 refresh_interval이 아직 지나지 않아 인메모리 버퍼의 문서가 세그먼트로 노출되지 않았다</button>
+  </div>
+  <div class="quiz-expl">✅ Elasticsearch는 NRT(near real-time) 검색입니다. 새 문서는 refresh가 일어나 세그먼트가 되어야 검색에 노출됩니다(기본 1초). 데이터 자체는 translog에 안전하게 기록되어 있으므로 유실이 아닙니다. 즉시 확인이 필요하면 <code>?refresh=wait_for</code>를 사용하세요.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch01_elasticsearch_overview.md" target="_blank" rel="noopener">chapters/ch01_elasticsearch_overview.md</a> — 9.x 변경점 전체 목록, eventual consistency의 상세 조건 등이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html"><span class="dir">← 이전</span><br><span class="title">학습 홈</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch02.html"><span class="dir">다음 →</span><br><span class="title">2장. 클러스터 아키텍처</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

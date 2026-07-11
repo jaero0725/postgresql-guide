@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6장. Text Analysis — Analyzer — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch06">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>6장. Text Analysis — Analyzer 파이프라인과 한국어 처리</h1>
+<p class="lead">"Quick"으로 검색했는데 "quick"이 담긴 문서가 나오는 이유. 문자열이 토큰으로 잘게 부서져 역색인의 키가 되는 과정 — 검색의 매칭 규칙은 전부 여기서 결정됩니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 매핑</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Char filter → Tokenizer → Token filter 3단계 파이프라인 ② 내장 analyzer와 custom analyzer 조립법 ③ 한국어 형태소 분석기 Nori와 decompound_mode ④ 동의어(synonym_graph)와 자동완성(edge_ngram) 실전 패턴</p>
+  </div>
+</div>
+
+<h2 id="s1">6.1 Analyzer 파이프라인 — 문자열이 토큰이 되기까지</h2>
+
+<p>text 필드에 넣은 문자열은 <strong>그대로 저장되지 않습니다</strong>. <strong>analyzer(분석기)</strong>라는 파이프라인을 거쳐 <strong>토큰(token)</strong>들로 분해되고, 각 토큰이 역색인(inverted index)의 키가 됩니다. 검색할 때 질의어도 <em>같은 analyzer</em>를 거치기 때문에, analyzer 설계는 곧 "무엇이 매칭되고 무엇이 매칭되지 않는지"를 결정합니다.</p>
+
+<p>모든 analyzer는 정확히 3단계로 구성됩니다.</p>
+
+<ul>
+  <li><strong>Character filter</strong> (0개 이상) — 문자 단위 전처리. HTML 태그 제거, 문자 치환 등</li>
+  <li><strong>Tokenizer</strong> (정확히 1개) — 문자열을 토큰으로 쪼개는 핵심 단계</li>
+  <li><strong>Token filter</strong> (0개 이상) — 토큰 단위 변환. 소문자화, 불용어 제거, 동의어, 어간 추출 등</li>
+</ul>
+
+<p>공식 문서의 유명한 예시 문자열로 전 과정을 따라가 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="Analyzer 파이프라인 — &lt;p&gt;The 2 Quick Brown-Foxes!&lt;/p&gt; 의 여행" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 400">
+      <!-- 입력 문자열 -->
+      <rect x="200" y="16" width="400" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="400" y="41" text-anchor="middle" class="sv-label sv-mono" font-size="13">"&lt;p&gt;The 2 Quick Brown-Foxes!&lt;/p&gt;"</text>
+
+      <!-- 파이프라인 스테이지 박스 (왼쪽) -->
+      <g data-active="2-2">
+        <rect x="30" y="90" width="210" height="52" class="sv-box"/>
+        <text x="135" y="112" text-anchor="middle" class="sv-label">① Char filter</text>
+        <text x="135" y="130" text-anchor="middle" class="sv-label-sm sv-mono">html_strip</text>
+      </g>
+      <g data-active="3-3">
+        <rect x="30" y="170" width="210" height="52" class="sv-box"/>
+        <text x="135" y="192" text-anchor="middle" class="sv-label">② Tokenizer</text>
+        <text x="135" y="210" text-anchor="middle" class="sv-label-sm sv-mono">standard (단어 경계)</text>
+      </g>
+      <g data-active="4-4">
+        <rect x="30" y="250" width="210" height="52" class="sv-box"/>
+        <text x="135" y="272" text-anchor="middle" class="sv-label">③ Token filter</text>
+        <text x="135" y="290" text-anchor="middle" class="sv-label-sm sv-mono">lowercase</text>
+      </g>
+      <path d="M 135 60 L 135 88" class="sv-line"/>
+      <path d="M 135 142 L 135 168" class="sv-line"/>
+      <path d="M 135 222 L 135 248" class="sv-line"/>
+
+      <!-- step2: html 제거 결과 -->
+      <g data-show="2">
+        <path d="M 240 116 L 292 116" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="300" y="96" width="380" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="490" y="121" text-anchor="middle" class="sv-label sv-mono" font-size="13">"The 2 Quick Brown-Foxes!"</text>
+        <text x="700" y="121" class="sv-label-sm" fill="var(--ok)">태그 제거</text>
+      </g>
+
+      <!-- step3: 토큰 분해 -->
+      <g data-show="3">
+        <path d="M 240 196 L 292 196" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <g class="rise" data-show="3">
+          <rect x="300" y="176" width="62" height="36" rx="8" class="sv-box"/>
+          <text x="331" y="199" text-anchor="middle" class="sv-label sv-mono" font-size="12">The</text>
+          <rect x="370" y="176" width="40" height="36" rx="8" class="sv-box"/>
+          <text x="390" y="199" text-anchor="middle" class="sv-label sv-mono" font-size="12">2</text>
+          <rect x="418" y="176" width="70" height="36" rx="8" class="sv-box"/>
+          <text x="453" y="199" text-anchor="middle" class="sv-label sv-mono" font-size="12">Quick</text>
+          <rect x="496" y="176" width="72" height="36" rx="8" class="sv-box"/>
+          <text x="532" y="199" text-anchor="middle" class="sv-label sv-mono" font-size="12">Brown</text>
+          <rect x="576" y="176" width="72" height="36" rx="8" class="sv-box"/>
+          <text x="612" y="199" text-anchor="middle" class="sv-label sv-mono" font-size="12">Foxes</text>
+        </g>
+        <text x="700" y="199" class="sv-label-sm">5개 토큰</text>
+      </g>
+
+      <!-- step4: lowercase -->
+      <g data-show="4">
+        <path d="M 240 276 L 292 276" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <g class="rise" data-show="4">
+          <rect x="300" y="256" width="62" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+          <text x="331" y="279" text-anchor="middle" class="sv-label sv-mono" font-size="12">the</text>
+          <rect x="370" y="256" width="40" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+          <text x="390" y="279" text-anchor="middle" class="sv-label sv-mono" font-size="12">2</text>
+          <rect x="418" y="256" width="70" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+          <text x="453" y="279" text-anchor="middle" class="sv-label sv-mono" font-size="12">quick</text>
+          <rect x="496" y="256" width="72" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+          <text x="532" y="279" text-anchor="middle" class="sv-label sv-mono" font-size="12">brown</text>
+          <rect x="576" y="256" width="72" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+          <text x="612" y="279" text-anchor="middle" class="sv-label sv-mono" font-size="12">foxes</text>
+        </g>
+      </g>
+
+      <!-- step5: 역색인 -->
+      <g data-show="5">
+        <path d="M 490 296 L 490 324" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="270" y="330" width="440" height="54" rx="10" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="490" y="352" text-anchor="middle" class="sv-label">📖 역색인 (inverted index)</text>
+        <text x="490" y="372" text-anchor="middle" class="sv-label-sm sv-mono">the → [doc1]   quick → [doc1]   brown → [doc1]   foxes → [doc1] ...</text>
+      </g>
+
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>원본 문자열 <code>"&lt;p&gt;The 2 Quick Brown-Foxes!&lt;/p&gt;"</code>이 analyzer 파이프라인에 들어갑니다. HTML 태그가 섞여 있네요.</p>
+    <p><b>① Char filter(html_strip)</b>가 문자 단위 전처리로 <b style="color:var(--ok)">HTML 태그를 벗겨냅니다</b>. 아직 토큰이 아니라 "문자열"인 상태입니다.</p>
+    <p><b>② Tokenizer(standard)</b>가 유니코드 단어 경계로 문자열을 쪼갭니다. 하이픈으로 연결된 <code>Brown-Foxes</code>도 두 토큰으로 분리 — <code>[The, 2, Quick, Brown, Foxes]</code>.</p>
+    <p><b>③ Token filter(lowercase)</b>가 각 토큰을 소문자로 변환합니다. 덕분에 <code>"Quick"</code>으로 검색하든 <code>"quick"</code>으로 검색하든 같은 키를 찾게 됩니다.</p>
+    <p>완성된 토큰들이 <b style="color:var(--purple)">역색인의 키</b>로 저장됩니다. 검색 시 질의어도 같은 파이프라인을 거치므로 "색인과 검색이 같은 언어로 대화"하게 됩니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">standard analyzer에 stop filter는 기본 꺼져 있다</div>
+    <p>기본 analyzer인 standard는 <code>"the"</code> 같은 불용어(stopword)도 그대로 색인합니다. 제거하고 싶으면 <code>stop</code> token filter를 명시적으로 추가해야 합니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">6.2 내장 Analyzer — 조립 완제품들</h2>
+
+<p>ES는 자주 쓰는 조합을 미리 만들어 제공합니다. 어떤 analyzer가 어떤 결과를 내는지는 <code>_analyze</code> API로 언제든 직접 확인할 수 있습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Analyzer</th><th>동작</th><th>용도</th></tr></thead>
+  <tbody>
+    <tr><td><code>standard</code> (기본)</td><td>유니코드 텍스트 분할 + lowercase</td><td>다국어 일반 검색</td></tr>
+    <tr><td><code>simple</code></td><td>영문자 외 모두 분할 + lowercase</td><td>단순 영문</td></tr>
+    <tr><td><code>whitespace</code></td><td>공백으로만 분할, lowercase 안 함</td><td>토큰 원형 보존 (코드 등)</td></tr>
+    <tr><td><code>stop</code></td><td>simple + 불용어 제거</td><td>영문 단순 검색</td></tr>
+    <tr><td><code>keyword</code></td><td>분석하지 않음 — 입력 전체가 토큰 1개</td><td>text인데 분석을 끄고 싶을 때</td></tr>
+    <tr><td><code>pattern</code></td><td>정규식으로 분할</td><td>커스텀 구분자</td></tr>
+    <tr><td><code>language</code></td><td>언어별 stemmer 등 (<code>english</code> 등)</td><td>언어 특화</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="k">POST</span> /_analyze
+{
+  <span class="s">"analyzer"</span>: <span class="s">"standard"</span>,
+  <span class="s">"text"</span>: <span class="s">"The 2 Quick Brown-Foxes!"</span>
+}
+<span class="c">// 결과 토큰: the, 2, quick, brown, foxes</span></code></pre>
+
+<h2 id="s3">6.3 Custom Analyzer — 부품을 직접 조립하기</h2>
+
+<p>내장 analyzer로 부족하면 char filter / tokenizer / token filter를 직접 조합합니다. "HTML을 벗기고, 표준 분할 후, 소문자화 + 영어 불용어 제거 + 어간 추출"을 하는 블로그용 analyzer는 이렇게 만듭니다.</p>
+
+<pre><code><span class="k">PUT</span> /blog
+{
+  <span class="s">"settings"</span>: {
+    <span class="s">"analysis"</span>: {
+      <span class="s">"char_filter"</span>: {
+        <span class="s">"strip_html"</span>: { <span class="s">"type"</span>: <span class="s">"html_strip"</span> }
+      },
+      <span class="s">"filter"</span>: {
+        <span class="s">"english_stop"</span>:    { <span class="s">"type"</span>: <span class="s">"stop"</span>, <span class="s">"stopwords"</span>: <span class="s">"_english_"</span> },
+        <span class="s">"english_stemmer"</span>: { <span class="s">"type"</span>: <span class="s">"stemmer"</span>, <span class="s">"language"</span>: <span class="s">"english"</span> }
+      },
+      <span class="s">"analyzer"</span>: {
+        <span class="s">"blog_text"</span>: {
+          <span class="s">"type"</span>:        <span class="s">"custom"</span>,
+          <span class="s">"char_filter"</span>: [<span class="s">"strip_html"</span>],
+          <span class="s">"tokenizer"</span>:   <span class="s">"standard"</span>,
+          <span class="s">"filter"</span>:      [<span class="s">"lowercase"</span>, <span class="s">"english_stop"</span>, <span class="s">"english_stemmer"</span>]
+        }
+      }
+    }
+  },
+  <span class="s">"mappings"</span>: {
+    <span class="s">"properties"</span>: {
+      <span class="s">"body"</span>: { <span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"analyzer"</span>: <span class="s">"blog_text"</span> }
+    }
+  }
+}</code></pre>
+
+<p><strong>핵심 원칙</strong>: <code>analyzer</code>는 <strong>색인 시점과 검색 시점 모두</strong>에 적용됩니다. 의도적으로 다르게 하려면 <code>search_analyzer</code>를 별도로 지정합니다.</p>
+
+<pre><code><span class="s">"body"</span>: {
+  <span class="s">"type"</span>: <span class="s">"text"</span>,
+  <span class="s">"analyzer"</span>:        <span class="s">"blog_text"</span>,    <span class="c">// 색인 시</span>
+  <span class="s">"search_analyzer"</span>: <span class="s">"blog_search"</span>   <span class="c">// 검색 시</span>
+}</code></pre>
+
+<p>대표적인 비대칭 사용 사례가 <strong>자동완성</strong>(색인 시 edge_ngram, 검색 시 standard)입니다. 6.6에서 애니메이션으로 봅니다.</p>
+
+<h2 id="s4">6.4 한국어 분석 — Nori 형태소 분석기</h2>
+
+<p>영어는 대체로 "공백 = 단어 경계"지만 한국어는 다릅니다. <code>"검색엔진을"</code>은 <code>"검색엔진" + "을(조사)"</code>로 분해되어야 <code>"검색엔진"</code>으로 검색했을 때 매칭됩니다. 이렇게 단어를 의미 단위(형태소)로 쪼개는 것이 <strong>형태소 분석(morphological analysis)</strong>이며, ES의 공식 한국어 플러그인이 <strong>Nori</strong>(mecab-ko-dic 기반)입니다.</p>
+
+<pre><code><span class="c"># 모든 노드에 설치 후 재시작 필요</span>
+bin/elasticsearch-plugin <span class="f">install</span> analysis-nori</code></pre>
+
+<p><code>nori</code> analyzer는 세 부품의 조합입니다: <code>nori_tokenizer</code>(형태소 분해) + <code>nori_part_of_speech</code>(조사·어미 등 제거) + <code>nori_readingform</code>(한자→한글 변환). 문장이 어떻게 처리되는지 봅시다.</p>
+
+<div class="anim" data-steps="4" data-title="Nori 형태소 분석 — &quot;검색엔진을 공부합니다&quot;" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 330">
+      <!-- 입력 -->
+      <rect x="230" y="16" width="320" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="390" y="41" text-anchor="middle" class="sv-label sv-mono" font-size="13">"검색엔진을 공부합니다"</text>
+
+      <!-- step1: 공백 분할의 문제 -->
+      <g data-show="1-1">
+        <text x="90" y="100" class="sv-label" font-size="13">공백으로 자르면?</text>
+        <rect x="230" y="80" width="140" height="36" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="300" y="103" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색엔진을</text>
+        <rect x="386" y="80" width="140" height="36" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="456" y="103" text-anchor="middle" class="sv-label sv-mono" font-size="12">공부합니다</text>
+        <text x="560" y="103" class="sv-label-sm" fill="var(--danger)">조사·어미가 붙은 채 색인 ❌</text>
+      </g>
+
+      <!-- step2: nori_tokenizer -->
+      <g data-show="2">
+        <rect x="40" y="140" width="200" height="46" class="sv-box"/>
+        <text x="140" y="160" text-anchor="middle" class="sv-label">nori_tokenizer</text>
+        <text x="140" y="177" text-anchor="middle" class="sv-label-sm">형태소 단위 분해</text>
+        <path d="M 240 163 L 288 163" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <g class="rise" data-show="2">
+          <rect x="296" y="144" width="60" height="38" rx="8" class="sv-box"/>
+          <text x="326" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색</text>
+          <rect x="364" y="144" width="60" height="38" rx="8" class="sv-box"/>
+          <text x="394" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">엔진</text>
+          <rect x="432" y="144" width="44" height="38" rx="8" class="sv-box"/>
+          <text x="454" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">을</text>
+          <rect x="484" y="144" width="60" height="38" rx="8" class="sv-box"/>
+          <text x="514" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">공부</text>
+          <rect x="552" y="144" width="44" height="38" rx="8" class="sv-box"/>
+          <text x="574" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">하</text>
+          <rect x="604" y="144" width="88" height="38" rx="8" class="sv-box"/>
+          <text x="648" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">ㅂ니다</text>
+        </g>
+      </g>
+
+      <!-- step3: POS filter -->
+      <g data-show="3">
+        <rect x="40" y="212" width="200" height="46" class="sv-box"/>
+        <text x="140" y="232" text-anchor="middle" class="sv-label">nori_part_of_speech</text>
+        <text x="140" y="249" text-anchor="middle" class="sv-label-sm">조사(J)·어미(E) 제거</text>
+        <path d="M 240 235 L 288 235" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <line x1="434" y1="142" x2="474" y2="184" stroke="var(--danger)" stroke-width="2.4"/>
+        <line x1="474" y1="142" x2="434" y2="184" stroke="var(--danger)" stroke-width="2.4"/>
+        <line x1="606" y1="142" x2="690" y2="184" stroke="var(--danger)" stroke-width="2.4"/>
+        <line x1="690" y1="142" x2="606" y2="184" stroke="var(--danger)" stroke-width="2.4"/>
+        <text x="310" y="240" class="sv-label-sm" fill="var(--danger)">"을"(조사)과 "ㅂ니다"(어미)는 stoptags로 탈락</text>
+      </g>
+
+      <!-- step4: 최종 토큰 -->
+      <g data-show="4">
+        <path d="M 390 262 L 390 284" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="200" y="288" width="380" height="36" rx="9" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="1.6"/>
+        <text x="390" y="311" text-anchor="middle" class="sv-label sv-mono" font-size="13">최종 토큰: [검색, 엔진, 공부, 하]</text>
+        <text x="640" y="311" class="sv-label-sm" fill="var(--es)">역색인으로 ✅</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>한국어를 공백으로만 자르면 <code>검색엔진을</code>처럼 <b style="color:var(--danger)">조사가 붙은 덩어리</b>가 색인됩니다. <code>"검색엔진"</code>으로 검색하면 매칭 실패!</p>
+    <p><b>nori_tokenizer</b>가 문장을 형태소 단위로 분해합니다. 복합명사 <code>검색엔진</code>도 <code>검색 + 엔진</code>으로 나뉩니다(decompound).</p>
+    <p><b>nori_part_of_speech</b> filter가 검색에 의미 없는 품사 — 조사 <code>을</code>(J), 어미 <code>ㅂ니다</code>(E) — 를 <b style="color:var(--danger)">stoptags 목록에 따라 제거</b>합니다.</p>
+    <p>최종 토큰 <code>[검색, 엔진, 공부, 하]</code>가 역색인에 저장됩니다. 이제 <code>"검색"</code>, <code>"엔진"</code>, <code>"공부"</code> 어느 것으로 검색해도 이 문서가 나옵니다.</p>
+  </div>
+</div>
+
+<h3>decompound_mode — 복합명사 처리 방식</h3>
+
+<p><code>nori_tokenizer</code>의 가장 중요한 파라미터입니다. 복합명사를 어떻게 쪼갤지 결정합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>모드</th><th>입력 <code>가곡역</code></th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td><code>none</code></td><td><code>[가곡역]</code></td><td>분해 안 함 — 부분 매칭 불가 (정밀도↑)</td></tr>
+    <tr><td><code>discard</code> (기본)</td><td><code>[가곡, 역]</code></td><td>분해하고 원본은 버림 (재현율↑)</td></tr>
+    <tr><td><code>mixed</code></td><td><code>[가곡역, 가곡, 역]</code></td><td>분해 + 원본도 유지 — <strong>운영 베이스라인 권장</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="k">PUT</span> /korean_news
+{
+  <span class="s">"settings"</span>: {
+    <span class="s">"analysis"</span>: {
+      <span class="s">"tokenizer"</span>: {
+        <span class="s">"korean_nori_tokenizer"</span>: {
+          <span class="s">"type"</span>: <span class="s">"nori_tokenizer"</span>,
+          <span class="s">"decompound_mode"</span>: <span class="s">"mixed"</span>,
+          <span class="s">"user_dictionary"</span>: <span class="s">"userdict_ko.txt"</span>   <span class="c">// 신조어·고유명사 사전</span>
+        }
+      },
+      <span class="s">"filter"</span>: {
+        <span class="s">"korean_pos_filter"</span>: {
+          <span class="s">"type"</span>: <span class="s">"nori_part_of_speech"</span>,
+          <span class="s">"stoptags"</span>: [<span class="s">"E"</span>, <span class="s">"IC"</span>, <span class="s">"J"</span>, <span class="s">"MAG"</span>, <span class="s">"MAJ"</span>, <span class="s">"MM"</span>,
+                       <span class="s">"SP"</span>, <span class="s">"SSC"</span>, <span class="s">"SSO"</span>, <span class="s">"SC"</span>, <span class="s">"SE"</span>,
+                       <span class="s">"XPN"</span>, <span class="s">"XSA"</span>, <span class="s">"XSN"</span>, <span class="s">"XSV"</span>, <span class="s">"UNA"</span>, <span class="s">"NA"</span>, <span class="s">"VSV"</span>]
+        }
+      },
+      <span class="s">"analyzer"</span>: {
+        <span class="s">"korean_analyzer"</span>: {
+          <span class="s">"type"</span>: <span class="s">"custom"</span>,
+          <span class="s">"tokenizer"</span>: <span class="s">"korean_nori_tokenizer"</span>,
+          <span class="s">"filter"</span>: [<span class="s">"korean_pos_filter"</span>, <span class="s">"nori_readingform"</span>, <span class="s">"lowercase"</span>]
+        }
+      }
+    }
+  },
+  <span class="s">"mappings"</span>: {
+    <span class="s">"properties"</span>: {
+      <span class="s">"title"</span>: { <span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"analyzer"</span>: <span class="s">"korean_analyzer"</span> },
+      <span class="s">"body"</span>:  { <span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"analyzer"</span>: <span class="s">"korean_analyzer"</span> }
+    }
+  }
+}</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">user_dictionary는 "핫 리로드"가 안 된다</div>
+    <p>파일 기반 사전(<code>config/userdict_ko.txt</code>)은 변경 시 노드 재시작이, <code>user_dictionary_rules</code>(매핑 내 직접 기재)는 인덱스 재생성이 필요합니다. 운영에서는 ILM rollover 시 신규 인덱스에 새 사전이 적용되는 패턴을 흔히 사용합니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">6.5 동의어 — synonym_graph와 검색 시점 적용</h2>
+
+<p>"노트북"과 "랩탑"을 같은 것으로 취급하려면 synonym filter를 씁니다. 두 종류가 있는데, multi-word 동의어(<code>new york</code> 등)를 정확히 처리하는 <strong><code>synonym_graph</code>를 권장</strong>합니다.</p>
+
+<pre><code><span class="s">"filter"</span>: {
+  <span class="s">"my_synonyms"</span>: {
+    <span class="s">"type"</span>: <span class="s">"synonym_graph"</span>,
+    <span class="s">"synonyms"</span>: [
+      <span class="s">"노트북, 랩탑, laptop"</span>,
+      <span class="s">"휴대폰, 핸드폰, 스마트폰"</span>,
+      <span class="s">"ai =&gt; 인공지능"</span>          <span class="c">// 단방향 매핑</span>
+    ]
+  }
+}</code></pre>
+
+<p>동의어를 <strong>어느 시점에 적용할지</strong>가 운영의 핵심 결정입니다.</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>색인 시점 적용</h4>
+    <p>+ 검색이 빠름 (이미 확장됨)<br>− 동의어 변경 시 <strong>재색인 필요</strong><br>− 사전이 색인에 박혀 있음</p>
+  </div>
+  <div class="card">
+    <h4>검색 시점 적용 (권장)</h4>
+    <p>+ 동의어 변경 즉시 반영<br>+ 운영 친화적<br>− 검색 시 매번 확장 → 약간 느림</p>
+  </div>
+</div>
+
+<p>8.x부터는 <strong>Synonyms API</strong>로 사전을 클러스터에 등록하고, <code>updateable: true</code> filter를 search_analyzer에만 사용하면 <strong>재색인 없이</strong> <code>POST /index/_reload_search_analyzers</code> 한 번으로 사전 변경이 반영됩니다. 이것이 8.x 운영 표준입니다.</p>
+
+<h2 id="s6">6.6 자동완성 — Edge N-gram과 비대칭 analyzer</h2>
+
+<p>자동완성은 "검"만 입력해도 "검색엔진"이 나와야 합니다. 비결은 색인 시점에 접두사(prefix) 토큰을 미리 만들어 두는 <strong>edge_ngram</strong>입니다.</p>
+
+<ul>
+  <li><strong>N-gram</strong>: <code>"검색" → [검, 색, 검색]</code> — 모든 위치의 조각. 강력하지만 색인 크기 폭증</li>
+  <li><strong>Edge N-gram</strong>: <code>"검색엔진" → [검, 검색, 검색엔, 검색엔진]</code> — 시작 부분의 prefix만. 자동완성에 최적</li>
+</ul>
+
+<div class="anim" data-steps="4" data-title="Edge N-gram 자동완성 — 색인과 검색의 비대칭 analyzer" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 330">
+      <!-- 색인 측 -->
+      <text x="30" y="26" class="sv-label" font-size="14">📥 색인 시 (edge_ngram)</text>
+      <rect x="30" y="40" width="150" height="38" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="105" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">"검색엔진"</text>
+
+      <g data-show="1">
+        <path d="M 180 59 L 226 59" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="234" y="40" width="52" height="38" rx="8" class="sv-box"/>
+        <text x="260" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">검</text>
+        <rect x="294" y="40" width="64" height="38" rx="8" class="sv-box"/>
+        <text x="326" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색</text>
+        <rect x="366" y="40" width="76" height="38" rx="8" class="sv-box"/>
+        <text x="404" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색엔</text>
+        <rect x="450" y="40" width="90" height="38" rx="8" class="sv-box"/>
+        <text x="495" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색엔진</text>
+        <text x="560" y="64" class="sv-label-sm">← prefix 토큰들이 역색인에</text>
+      </g>
+
+      <!-- 검색 측 -->
+      <g data-show="2">
+        <text x="30" y="130" class="sv-label" font-size="14">🔎 검색 시 (standard)</text>
+        <rect x="30" y="144" width="150" height="38" rx="8" fill="color-mix(in srgb, var(--warn) 15%, transparent)" stroke="var(--warn)"/>
+        <text x="105" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">입력: "검색"</text>
+        <path d="M 180 163 L 226 163" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="234" y="144" width="64" height="38" rx="8" fill="color-mix(in srgb, var(--warn) 15%, transparent)" stroke="var(--warn)"/>
+        <text x="266" y="168" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색</text>
+        <text x="312" y="168" class="sv-label-sm">토큰 1개 그대로</text>
+      </g>
+
+      <!-- 매칭 -->
+      <g data-show="3">
+        <path d="M 266 144 C 280 110 300 95 320 82" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="294" y="40" width="64" height="38" rx="8" fill="color-mix(in srgb, var(--es) 20%, transparent)" stroke="var(--es)" stroke-width="2"/>
+        <text x="326" y="64" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색</text>
+        <text x="430" y="115" class="sv-label" fill="var(--es)" font-size="13">✅ 매칭! "검색엔진" 문서가 자동완성 후보로</text>
+      </g>
+
+      <!-- 잘못된 구성 -->
+      <g data-show="4">
+        <line x1="30" y1="210" x2="750" y2="210" class="sv-line" stroke-dasharray="4 6"/>
+        <text x="30" y="238" class="sv-label" font-size="14" fill="var(--danger)">⚠️ 검색 시에도 edge_ngram을 쓰면?</text>
+        <rect x="30" y="252" width="150" height="38" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="105" y="276" text-anchor="middle" class="sv-label sv-mono" font-size="12">입력: "검색"</text>
+        <path d="M 180 271 L 226 271" stroke="var(--danger)" stroke-width="2" fill="none" marker-end="url(#arr2)"/>
+        <rect x="234" y="252" width="52" height="38" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="260" y="276" text-anchor="middle" class="sv-label sv-mono" font-size="12">검</text>
+        <rect x="294" y="252" width="64" height="38" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="326" y="276" text-anchor="middle" class="sv-label sv-mono" font-size="12">검색</text>
+        <text x="380" y="276" class="sv-label-sm" fill="var(--danger)">"검"으로 시작하는 모든 문서가 매칭 — 과매칭 폭발 ❌</text>
+      </g>
+
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--danger)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>색인 시</b>: <code>"검색엔진"</code>이 edge_ngram tokenizer를 거쳐 <code>[검, 검색, 검색엔, 검색엔진]</code> — 접두사 토큰들이 미리 역색인에 저장됩니다.</p>
+    <p><b>검색 시</b>: 사용자가 <code>"검색"</code>까지 입력한 순간, 검색어는 <b>standard analyzer</b>로 처리되어 토큰 <code>[검색]</code> 하나만 만듭니다.</p>
+    <p>토큰 <code>검색</code>이 역색인의 prefix 토큰과 <b style="color:var(--es)">정확히 매칭</b> → "검색엔진" 문서가 자동완성 후보로 반환됩니다. 색인은 넓게, 검색은 좁게!</p>
+    <p>만약 검색 시에도 edge_ngram을 쓰면 <code>"검색"</code>이 <code>[검, 검색]</code>으로 분해되어 <b style="color:var(--danger)">"검"만 담긴 문서까지 전부 매칭</b>됩니다. search_analyzer 분리가 필수인 이유입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">PUT</span> /autocomplete
+{
+  <span class="s">"settings"</span>: {
+    <span class="s">"analysis"</span>: {
+      <span class="s">"tokenizer"</span>: {
+        <span class="s">"edge_ngram_tokenizer"</span>: {
+          <span class="s">"type"</span>: <span class="s">"edge_ngram"</span>,
+          <span class="s">"min_gram"</span>: <span class="n">1</span>, <span class="s">"max_gram"</span>: <span class="n">20</span>,
+          <span class="s">"token_chars"</span>: [<span class="s">"letter"</span>, <span class="s">"digit"</span>]
+        }
+      },
+      <span class="s">"analyzer"</span>: {
+        <span class="s">"edge_ngram_index"</span>:  { <span class="s">"tokenizer"</span>: <span class="s">"edge_ngram_tokenizer"</span>, <span class="s">"filter"</span>: [<span class="s">"lowercase"</span>] },
+        <span class="s">"edge_ngram_search"</span>: { <span class="s">"tokenizer"</span>: <span class="s">"standard"</span>,              <span class="s">"filter"</span>: [<span class="s">"lowercase"</span>] }
+      }
+    }
+  },
+  <span class="s">"mappings"</span>: {
+    <span class="s">"properties"</span>: {
+      <span class="s">"name"</span>: {
+        <span class="s">"type"</span>: <span class="s">"text"</span>,
+        <span class="s">"analyzer"</span>:        <span class="s">"edge_ngram_index"</span>,
+        <span class="s">"search_analyzer"</span>: <span class="s">"edge_ngram_search"</span>
+      }
+    }
+  }
+}</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">대안: completion suggester</div>
+    <p>검색창 자동완성 전용으로는 FST 기반의 <code>completion</code> 필드 타입도 있습니다. 매우 빠르지만 색인 시점에 후보를 미리 등록해야 합니다. 7장에서 간단히 다룹니다.</p>
+  </div>
+</div>
+
+<h2 id="s7">6.7 <code>_analyze</code> API — 매칭이 안 될 때 첫 번째 디버깅 도구</h2>
+
+<p>"분명히 있는 문서인데 검색이 안 돼요"의 답은 거의 항상 토큰에 있습니다. 디버깅의 황금 패턴:</p>
+
+<ol>
+  <li>검색어를 <code>_analyze</code>로 토큰화해 본다</li>
+  <li>색인된 문서의 해당 필드도 <code>_analyze</code>로 토큰화해 본다</li>
+  <li>두 토큰 집합의 교집합을 확인한다 — <strong>교집합이 비어 있으면 매칭이 안 되는 게 당연</strong></li>
+</ol>
+
+<pre><code><span class="c">// 특정 필드에 지정된 analyzer로 테스트</span>
+<span class="k">POST</span> /korean_news/_analyze
+{
+  <span class="s">"field"</span>: <span class="s">"title"</span>,
+  <span class="s">"text"</span>:  <span class="s">"검색엔진을"</span>,
+  <span class="s">"explain"</span>: <span class="n">true</span>    <span class="c">// 단계별 토큰 변화·품사 태그까지 출력</span>
+}</code></pre>
+
+<p><code>explain: true</code>를 붙이면 tokenizer → 각 filter 단계별 토큰 변화와 position, offset, 품사 태그까지 볼 수 있어 동의어·품사 필터 디버깅에 특히 유용합니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">복잡한 analyzer는 색인 처리량을 깎는다</div>
+    <p>analyzer는 <strong>text 필드 1개당, 문서 1건당 1회</strong> 실행됩니다. 필드 수 × 문서 수만큼 비용이 곱해지므로, analyzer 변경 전후 bulk indexing 처리량을 벤치마크로 비교해 영향을 측정하세요.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">Analyzer 파이프라인의 3단계를 올바른 순서로 나열한 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">Tokenizer → Char filter → Token filter</button>
+    <button type="button" data-correct>Char filter → Tokenizer → Token filter</button>
+    <button type="button">Token filter → Tokenizer → Char filter</button>
+    <button type="button">Tokenizer → Token filter → Char filter</button>
+  </div>
+  <div class="quiz-expl">✅ 문자 단위 전처리(Char filter, 0개 이상) → 토큰 분해(Tokenizer, 정확히 1개) → 토큰 단위 변환(Token filter, 0개 이상) 순서입니다. Tokenizer가 정확히 1개만 온다는 것도 함께 기억하세요.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">자동완성용 edge_ngram 구성에서, 검색 시점 analyzer로 standard를 따로 지정해야 하는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">standard가 edge_ngram보다 처리 속도가 빨라서</button>
+    <button type="button">edge_ngram은 한국어를 지원하지 않아서</button>
+    <button type="button" data-correct>검색어까지 ngram으로 분해되면 짧은 조각 토큰이 과도한 문서와 매칭되기 때문</button>
+    <button type="button">search_analyzer 없이는 색인이 실패하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 검색 시에도 edge_ngram을 쓰면 "검색"이 [검, 검색]으로 분해되어 "검"만 있는 문서까지 전부 매칭됩니다. 색인은 prefix를 넓게 깔아두고(edge_ngram), 검색어는 그대로(standard) 매칭하는 비대칭 구성이 자동완성의 정석입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch06_text_analysis.md" target="_blank" rel="noopener">chapters/ch06_text_analysis.md</a> — Synonyms API 상세, 한·영 혼용 multi-fields 전략, analyzer 비용 측정 방법이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch05.html"><span class="dir">← 이전</span><br><span class="title">5장. 매핑과 필드 타입</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch07.html"><span class="dir">다음 →</span><br><span class="title">7장. Query DSL</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2장. 내부 컴포넌트와 쿼리 처리 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch02">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>2장. 내부 컴포넌트와 쿼리 처리</h1>
+<p class="lead">SELECT 한 줄이 결과가 되기까지 — Parser, Interpreter, Processor, Block이라는 부품들이 조립 라인처럼 맞물리는 과정을 따라갑니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 1장 개요</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① SQL → AST → QueryPipeline → 결과로 이어지는 전체 처리 흐름 ② 데이터 표현의 4총사: IColumn·Field·IDataType·Block ③ Processor DAG가 멀티코어를 활용하는 방법 ④ 벡터화 실행의 함정 — short-circuit 평가가 없는 이유</p>
+  </div>
+</div>
+
+<h2 id="s1">2.1 조감도 — 쿼리 하나가 통과하는 파이프라인</h2>
+
+<p>ClickHouse 내부를 이해하는 가장 좋은 방법은 쿼리 하나를 끝까지 따라가 보는 것입니다. 이 장 전체에서 아래 쿼리를 예시로 사용합니다.</p>
+
+<pre><code><span class="k">SELECT</span> event_type, <span class="f">max</span>(amount)
+<span class="k">FROM</span> user_events
+<span class="k">WHERE</span> user_id = <span class="n">123</span>
+<span class="k">GROUP BY</span> event_type;</code></pre>
+
+<div class="anim" data-steps="6" data-title="SQL 문자열이 결과가 되기까지 — 처리 파이프라인" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 330">
+      <defs>
+        <marker id="arrA" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- step1: SQL 문자열 -->
+      <g data-show="1">
+        <rect x="40" y="40" width="230" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="155" y="60" text-anchor="middle" class="sv-label">SQL 문자열</text>
+        <text x="155" y="77" text-anchor="middle" class="sv-label-sm sv-mono">"SELECT event_type, max(…)"</text>
+      </g>
+
+      <!-- step2: Parser → AST -->
+      <g data-show="2">
+        <path d="M 155 86 L 155 116" class="sv-arrow flow-line" marker-end="url(#arrA)"/>
+        <rect x="60" y="120" width="190" height="40" rx="9" class="sv-box"/>
+        <text x="155" y="145" text-anchor="middle" class="sv-label">Parser</text>
+        <path d="M 155 160 L 155 190" class="sv-arrow" marker-end="url(#arrA)"/>
+        <rect x="40" y="194" width="230" height="96" rx="9" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.4"/>
+        <text x="155" y="216" text-anchor="middle" class="sv-label">AST (구문 트리)</text>
+        <text x="155" y="238" text-anchor="middle" class="sv-label-sm sv-mono">SelectQuery</text>
+        <text x="155" y="256" text-anchor="middle" class="sv-label-sm sv-mono">├ columns ├ from</text>
+        <text x="155" y="274" text-anchor="middle" class="sv-label-sm sv-mono">├ where   └ groupBy</text>
+      </g>
+
+      <!-- step3: Interpreter -->
+      <g data-show="3">
+        <path d="M 272 240 L 320 240" class="sv-arrow flow-line" marker-end="url(#arrA)"/>
+        <rect x="324" y="212" width="170" height="56" rx="9" class="sv-box"/>
+        <text x="409" y="235" text-anchor="middle" class="sv-label">Interpreter</text>
+        <text x="409" y="254" text-anchor="middle" class="sv-label-sm">분석·최적화·플랜 생성</text>
+        <text x="409" y="288" text-anchor="middle" class="sv-label-sm sv-mono">AST → (QueryTree) → Pipeline</text>
+      </g>
+
+      <!-- step4: QueryPipeline -->
+      <g data-show="4">
+        <path d="M 496 240 L 544 240" class="sv-arrow flow-line" marker-end="url(#arrA)"/>
+        <rect x="548" y="184" width="230" height="112" rx="9" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="663" y="206" text-anchor="middle" class="sv-label">QueryPipeline (DAG)</text>
+        <rect x="564" y="218" width="88" height="26" rx="6" class="sv-box"/>
+        <text x="608" y="236" text-anchor="middle" class="sv-label-sm">Source</text>
+        <rect x="674" y="218" width="88" height="26" rx="6" class="sv-box"/>
+        <text x="718" y="236" text-anchor="middle" class="sv-label-sm">Filter</text>
+        <rect x="564" y="256" width="88" height="26" rx="6" class="sv-box"/>
+        <text x="608" y="274" text-anchor="middle" class="sv-label-sm">Aggregate</text>
+        <rect x="674" y="256" width="88" height="26" rx="6" class="sv-box"/>
+        <text x="718" y="274" text-anchor="middle" class="sv-label-sm">Output</text>
+      </g>
+
+      <!-- step5: Executor + Block 흐름 -->
+      <g data-show="5">
+        <rect x="548" y="110" width="230" height="44" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="663" y="129" text-anchor="middle" class="sv-label">PipelineExecutor</text>
+        <text x="663" y="147" text-anchor="middle" class="sv-label-sm">Block(~8,192행) 단위로 실행</text>
+        <path d="M 663 154 L 663 180" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- step6: 결과 -->
+      <g data-show="6">
+        <rect x="548" y="40" width="230" height="46" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="663" y="60" text-anchor="middle" class="sv-label">📦 클라이언트로 결과 전송</text>
+        <text x="663" y="77" text-anchor="middle" class="sv-label-sm sv-mono">Format → WriteBuffer → 소켓</text>
+        <path d="M 663 106 L 663 88" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 보낸 쿼리는 처음엔 그저 <b>문자열</b>입니다. 이 문자열이 실행 가능한 형태가 되려면 여러 단계를 거쳐야 합니다.</p>
+    <p><b>Parser</b>가 문자열을 분해해 <b style="color:var(--purple)">AST(추상 구문 트리)</b>를 만듭니다. SELECT의 컬럼 목록, FROM, WHERE, GROUP BY가 각각 트리의 가지가 됩니다.</p>
+    <p><b>Interpreter</b>가 AST를 분석합니다. "어떤 테이블에서, 어떤 컬럼만 읽고, 어떻게 필터·집계할지"를 결정하고 규칙 기반 최적화를 적용합니다. 새 분석기는 중간에 QueryTree 단계를 거칩니다.</p>
+    <p>결과물은 <b style="color:var(--ok)">QueryPipeline</b> — Processor들을 연결한 DAG(방향 비순환 그래프)입니다. 아직 실행 전의 "설계도" 상태입니다.</p>
+    <p><b style="color:var(--warn)">PipelineExecutor</b>가 설계도를 실행합니다. 데이터는 약 8,192행 묶음인 <b>Block</b> 단위로 Processor 사이를 흐릅니다.</p>
+    <p>마지막 Processor가 결과를 JSON/CSV 등으로 직렬화(Format)하고, WriteBuffer를 통해 클라이언트에 전송하면 끝입니다. 이제 각 부품을 하나씩 뜯어봅시다.</p>
+  </div>
+</div>
+
+<h2 id="s2">2.2 데이터 표현의 4총사 — IColumn · Field · IDataType · Block</h2>
+
+<p>파이프라인 속을 흐르는 데이터는 네 가지 자료구조로 표현됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>구조</th><th>역할</th><th>비유</th></tr></thead>
+  <tbody>
+    <tr><td><code>IColumn</code></td><td>메모리 상의 컬럼(청크). 거의 모든 연산이 <strong>immutable</strong> — 원본을 두고 새 컬럼을 생성</td><td>값들이 담긴 컨베이어 벨트 위 상자</td></tr>
+    <tr><td><code>Field</code></td><td>개별 값 하나 (UInt64 | Int64 | Float64 | String | Array의 discriminated union). 공식 문서가 "not very efficient"라고 명시</td><td>상자에서 꺼낸 낱개 물건</td></tr>
+    <tr><td><code>IDataType</code></td><td>직렬화/역직렬화 담당. 메타데이터만 저장하며 IColumn과 <strong>느슨하게 결합</strong></td><td>상자에 붙은 취급 설명서</td></tr>
+    <tr><td><code>Block</code></td><td><code>(IColumn, IDataType, 컬럼명)</code> 트리플의 집합. <strong>쿼리 실행의 데이터 전달 단위</strong></td><td>상자 여러 개를 실은 팔레트</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>IColumn</code>의 대표 연산이 그대로 SQL 절과 대응된다는 점이 재미있습니다.</p>
+
+<pre><code><span class="c">// IColumn의 연산 = SQL 절의 구현체</span>
+IColumn::<span class="f">filter</span>(mask)    <span class="c">// WHERE / HAVING</span>
+IColumn::<span class="f">permute</span>(perm)   <span class="c">// ORDER BY</span>
+IColumn::<span class="f">cut</span>(start, n)   <span class="c">// LIMIT</span>
+
+<span class="c">// 정수 컬럼은 연속 배열 → SIMD를 바로 적용 가능</span>
+<span class="c">// ColumnString은 데이터 벡터 + 오프셋 벡터의 2중 구조</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">Leaky Abstraction — 의도된 추상화 누수</div>
+    <p><code>IColumn</code> 인터페이스만으로는 모든 연산을 빠르게 구현할 수 없습니다. 그래서 ClickHouse는 <code>ColumnUInt64::getData()</code>처럼 <strong>내부 배열을 직접 노출</strong>해 외부 루틴이 메모리를 직접 읽고 쓰게 합니다. 공식 문서는 이를 "leaky abstractions to allow efficient specializations"라 부릅니다. 추상화의 순수성보다 성능을 택한 의도적 설계입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">2.3 Parser와 Interpreter — 문자열에서 실행 계획으로</h2>
+
+<p>ClickHouse의 파서는 <strong>손으로 작성한 재귀 하강 파서(hand-written recursive descent parser)</strong>입니다. yacc나 ANTLR 같은 파서 생성기를 쓰지 않는 덕에, 에러 메시지를 세밀하게 제어하고 독자적 SQL 확장을 유연하게 추가할 수 있습니다.</p>
+
+<p>Interpreter는 AST를 받아 <strong>QueryPipeline</strong>을 만듭니다. 파이프라인에는 세 가지 모드가 있습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>모드</th><th>동작</th><th>사용 예</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Pulling</strong></td><td>출력 포트에서 결과를 "당겨" 읽음</td><td><code>SELECT</code></td></tr>
+    <tr><td><strong>Pushing</strong></td><td>입력 포트에 데이터를 "밀어" 넣음</td><td><code>INSERT</code></td></tr>
+    <tr><td><strong>Completed</strong></td><td>입출력 없이 내부에서 자체 실행</td><td><code>INSERT SELECT</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>쿼리 분석·변환을 담당하던 <code>ExpressionAnalyzer</code>는 공식 문서 스스로 "quite messy and should be rewritten"이라 평가할 만큼 복잡해졌고, 이를 대체하기 위해 AST와 파이프라인 사이에 <strong>QueryTree</strong>라는 추상화 레이어를 둔 새 분석기가 도입됐습니다. <code>enable_analyzer</code> 설정으로 제어하며 <strong>기본값은 true</strong>입니다.</p>
+
+<pre><code><span class="c">-- 새 분석기(QueryTree 기반) 활성화 여부 확인</span>
+<span class="k">SELECT</span> name, value <span class="k">FROM</span> system.settings <span class="k">WHERE</span> name = <span class="s">'enable_analyzer'</span>;
+
+<span class="c">-- 동작 차이가 의심되면 쿼리 단위로 끄고 비교 가능</span>
+<span class="k">SELECT</span> ... <span class="k">SETTINGS</span> enable_analyzer = <span class="n">0</span>;</code></pre>
+
+<h2 id="s4">2.4 Processor DAG — 멀티코어를 채우는 병렬 실행</h2>
+
+<p>Processor는 <strong>포트(port)</strong>로 서로 연결되어 Block을 소비하고 생산하는 실행 단위입니다. 테이블의 <code>read</code> 메서드가 Processor를 여러 개 반환하면, 이들이 서로 다른 파트를 <strong>병렬로</strong> 읽습니다. 이것이 ClickHouse가 쿼리 하나로 모든 코어를 채우는 메커니즘입니다.</p>
+
+<div class="anim" data-steps="5" data-title="Processor DAG — 파트 3개를 병렬로 읽고 하나로 합치기" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <defs>
+        <marker id="arrB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- step1: 디스크 파트 -->
+      <g data-show="1">
+        <text x="90" y="30" class="sv-label-sm">💾 디스크</text>
+        <rect x="60" y="42" width="140" height="34" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="130" y="64" text-anchor="middle" class="sv-label-sm sv-mono">Part A</text>
+        <rect x="340" y="42" width="140" height="34" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="410" y="64" text-anchor="middle" class="sv-label-sm sv-mono">Part B</text>
+        <rect x="620" y="42" width="140" height="34" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="690" y="64" text-anchor="middle" class="sv-label-sm sv-mono">Part C</text>
+      </g>
+
+      <!-- step2: Source 병렬 읽기 -->
+      <g data-show="2">
+        <path d="M 130 76 L 130 104" class="sv-arrow flow-line"/>
+        <path d="M 410 76 L 410 104" class="sv-arrow flow-line"/>
+        <path d="M 690 76 L 690 104" class="sv-arrow flow-line"/>
+        <rect x="60" y="108" width="140" height="40" rx="8" class="sv-box"/>
+        <text x="130" y="128" text-anchor="middle" class="sv-label-sm">Source A</text>
+        <text x="130" y="142" text-anchor="middle" class="sv-label-sm sv-mono">코어 1</text>
+        <rect x="340" y="108" width="140" height="40" rx="8" class="sv-box"/>
+        <text x="410" y="128" text-anchor="middle" class="sv-label-sm">Source B</text>
+        <text x="410" y="142" text-anchor="middle" class="sv-label-sm sv-mono">코어 2</text>
+        <rect x="620" y="108" width="140" height="40" rx="8" class="sv-box"/>
+        <text x="690" y="128" text-anchor="middle" class="sv-label-sm">Source C</text>
+        <text x="690" y="142" text-anchor="middle" class="sv-label-sm sv-mono">코어 3</text>
+      </g>
+
+      <!-- step3: Filter -->
+      <g data-show="3">
+        <path d="M 130 148 L 130 176" class="sv-arrow flow-line"/>
+        <path d="M 410 148 L 410 176" class="sv-arrow flow-line"/>
+        <path d="M 690 148 L 690 176" class="sv-arrow flow-line"/>
+        <rect x="60" y="180" width="140" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="130" y="200" text-anchor="middle" class="sv-label-sm">Filter A</text>
+        <text x="130" y="214" text-anchor="middle" class="sv-label-sm sv-mono">user_id=123</text>
+        <rect x="340" y="180" width="140" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="410" y="200" text-anchor="middle" class="sv-label-sm">Filter B</text>
+        <text x="410" y="214" text-anchor="middle" class="sv-label-sm sv-mono">user_id=123</text>
+        <rect x="620" y="180" width="140" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="690" y="200" text-anchor="middle" class="sv-label-sm">Filter C</text>
+        <text x="690" y="214" text-anchor="middle" class="sv-label-sm sv-mono">user_id=123</text>
+      </g>
+
+      <!-- step4: Aggregation 합류 -->
+      <g data-show="4">
+        <path d="M 130 220 Q 150 260 336 272" class="sv-arrow flow-line"/>
+        <path d="M 410 220 L 410 256" class="sv-arrow flow-line"/>
+        <path d="M 690 220 Q 670 260 484 272" class="sv-arrow flow-line"/>
+        <rect x="310" y="260" width="200" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="410" y="279" text-anchor="middle" class="sv-label-sm">Aggregation Processor</text>
+        <text x="410" y="296" text-anchor="middle" class="sv-label-sm sv-mono">GROUP BY + max(amount)</text>
+      </g>
+
+      <!-- step5: Output -->
+      <g data-show="5">
+        <path d="M 514 282 L 596 282" class="sv-arrow flow-line" marker-end="url(#arrB)"/>
+        <rect x="600" y="260" width="160" height="44" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="680" y="279" text-anchor="middle" class="sv-label-sm">Output Processor</text>
+        <text x="680" y="296" text-anchor="middle" class="sv-label-sm">→ 클라이언트 📦</text>
+        <text x="410" y="336" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">Source~Filter는 파트별 병렬, Aggregation에서 합류 — 코어 수만큼 빨라진다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>테이블 데이터는 여러 개의 파트로 나뉘어 디스크에 있습니다(4장). 이 물리적 분할이 그대로 병렬 처리의 단위가 됩니다.</p>
+    <p><code>IStorage::read()</code>가 <b>Source Processor를 여러 개</b> 반환합니다. 각 Source가 서로 다른 파트를 맡아 <b>서로 다른 CPU 코어에서 동시에</b> 읽습니다.</p>
+    <p>각 lane에 독립적으로 <b>Filter Processor</b>가 연결됩니다. WHERE 조건은 <code>IColumn::filter(mask)</code> 호출로, 원본 Block은 건드리지 않고 새 Block을 만듭니다(immutable).</p>
+    <p>병렬 lane들의 결과가 <b style="color:var(--purple)">Aggregation Processor</b>에서 합류합니다. GROUP BY 키별 집계 상태(해시 테이블)가 여기서 병합됩니다.</p>
+    <p>마지막으로 Output Processor가 포맷 변환(JSON/CSV도 Processor입니다!)을 거쳐 클라이언트로 보냅니다. 읽기~필터는 병렬, 합류는 한 곳 — 이것이 수직 확장의 실체입니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">2.5 Functions — 강타입, 그리고 short-circuit이 없는 세계</h2>
+
+<p>일반 함수(ordinary functions)는 행 수를 바꾸지 않고 Block 단위로 벡터화 실행됩니다. 두 가지 특성에 주의해야 합니다.</p>
+
+<ul>
+  <li><strong>강타입(Strong Typing)</strong>: 암묵적 타입 변환이 없습니다. 지원하지 않는 타입 조합이면 예외를 던지며, 대신 <code>plus</code> 함수처럼 수많은 타입 조합의 오버로드를 제공합니다.</li>
+  <li><strong>Short-circuit 평가 없음</strong>: <code>WHERE f(x) AND g(y)</code>에서 <code>f(x)</code>가 false여도 <code>g(y)</code>가 계산됩니다.</li>
+</ul>
+
+<div class="anim" data-steps="4" data-title="short-circuit이 없다 — WHERE f(x) AND g(y)의 벡터화 평가" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 300">
+      <text x="410" y="26" text-anchor="middle" class="sv-label sv-mono" font-size="13">WHERE f(x) AND g(y)</text>
+
+      <!-- step1: 일반 DB -->
+      <g data-show="1" data-active="1-1">
+        <text x="200" y="58" text-anchor="middle" class="sv-label" font-size="14">일반 DB (행 단위 단락 평가)</text>
+        <rect x="70" y="72" width="260" height="30" rx="6" class="sv-box"/>
+        <text x="90" y="92" class="sv-label-sm sv-mono">row1: f=false → g 건너뜀 ⏭</text>
+        <rect x="70" y="108" width="260" height="30" rx="6" class="sv-box"/>
+        <text x="90" y="128" class="sv-label-sm sv-mono">row2: f=true  → g 계산</text>
+        <rect x="70" y="144" width="260" height="30" rx="6" class="sv-box"/>
+        <text x="90" y="164" class="sv-label-sm sv-mono">row3: f=false → g 건너뜀 ⏭</text>
+      </g>
+
+      <!-- step2: CH f 배열 계산 -->
+      <g data-show="2">
+        <text x="620" y="58" text-anchor="middle" class="sv-label" font-size="14">ClickHouse (배열 단위)</text>
+        <rect x="470" y="72" width="300" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="620" y="94" text-anchor="middle" class="sv-label-sm sv-mono">f: [0, 1, 0, 1, 0, 0, 1, …] 전체 계산</text>
+      </g>
+
+      <!-- step3: g 배열 계산 -->
+      <g data-show="3">
+        <rect x="470" y="116" width="300" height="34" rx="8" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6" class="blink"/>
+        <text x="620" y="138" text-anchor="middle" class="sv-label-sm sv-mono">g: [1, 1, 0, 1, 1, 0, 0, …] 전체 계산</text>
+        <text x="620" y="170" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">⚠️ f=false인 행에서도 g가 계산된다!</text>
+      </g>
+
+      <!-- step4: AND + 대응 -->
+      <g data-show="4">
+        <rect x="470" y="186" width="300" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="620" y="208" text-anchor="middle" class="sv-label-sm sv-mono">AND: [0, 1, 0, 1, 0, 0, 0, …]</text>
+        <text x="410" y="256" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">g(y)가 비싸다면? → f(x)로 먼저 필터링(서브쿼리)한 뒤 g(y)를 계산하는 멀티패스가 유리</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>행 단위로 실행하는 일반 DB는 <b>단락 평가(short-circuit)</b>가 가능합니다. <code>f(x)</code>가 false인 행에서는 <code>g(y)</code>를 아예 건너뛰죠.</p>
+    <p>ClickHouse는 조건 분기 없이 배열 전체를 한 번에 계산하는 벡터화 방식이므로, 우선 <code>f(x)</code>를 <b>모든 행에 대해</b> 계산합니다.</p>
+    <p>이어서 <code>g(y)</code>도 <b style="color:var(--warn)">모든 행에 대해</b> 계산합니다. f가 false인 행도 예외가 아닙니다. 이것이 벡터화의 대가입니다.</p>
+    <p>마지막에 두 배열을 AND로 결합합니다. 만약 <code>g(y)</code>가 매우 비싼 함수라면, <b style="color:var(--ok)">f로 먼저 필터링한 뒤 남은 행에만 g를 적용</b>하는 멀티패스 구조(서브쿼리)로 다시 쓰는 것이 효율적입니다.</p>
+  </div>
+</div>
+
+<p>한편 집계 함수(aggregate functions)는 <strong>상태를 가지는(stateful)</strong> 함수입니다. <code>count</code>의 상태는 UInt64 하나지만, <code>uniqCombined</code>는 선형 배열 + 해시 테이블 + HyperLogLog의 조합입니다. 고카디널리티 GROUP BY에서는 수많은 상태를 <strong>Arena(메모리 풀)</strong>에서 할당하고, 분산 쿼리에서는 이 상태를 직렬화해 네트워크로 전송합니다. 집계 상태를 테이블에 저장하는 <code>AggregatingMergeTree</code>의 증분 집계가 이 직렬화 위에 서 있습니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">AggregatingMergeTree 사용자는 업그레이드 주의</div>
+    <p>집계 상태의 직렬화 포맷은 현재 버전 관리되지 않습니다. <code>AggregatingMergeTree</code>로 증분 집계를 운영 중이라면, ClickHouse 버전 업그레이드 전에 집계 함수 직렬화 포맷의 호환성을 확인하세요.</p>
+  </div>
+</div>
+
+<h2 id="s6">2.6 IStorage와 I/O — 테이블 엔진의 경계</h2>
+
+<p>테이블은 <code>IStorage</code> 인터페이스로 표현되고, 그 구현체가 곧 테이블 엔진입니다(<code>StorageMergeTree</code>, <code>StorageMemory</code>, <code>StorageDistributed</code>…). 설계 원칙은 명확합니다 — <strong><code>read()</code>는 지정된 컬럼을 읽는 것까지만 담당</strong>하고, 이후 처리는 파이프라인에 위임합니다. 단 두 가지 예외가 있습니다.</p>
+
+<ol>
+  <li><strong>인덱스 활용</strong>: AST가 <code>read()</code>에 전달되므로 테이블 엔진이 인덱스로 읽기 범위를 줄일 수 있습니다.</li>
+  <li><strong>분산 푸시다운</strong>: <code>StorageDistributed</code>는 쿼리를 원격 서버로 보내 일정 단계까지 처리된 결과를 받아옵니다.</li>
+</ol>
+
+<p>바이트 수준 I/O는 C++ iostream 대신 자체 <code>ReadBuffer</code>/<code>WriteBuffer</code>를 씁니다. <code>CompressedWriteBuffer</code>(압축), <code>ConcatReadBuffer</code>(연결), <code>HashingWriteBuffer</code>(해시 계산)처럼 조합 가능한 부품들입니다.</p>
+
+<h2 id="s7">2.7 서버 인터페이스 — 무엇으로 접속해야 하나</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>인터페이스</th><th>용도</th><th>특징</th></tr></thead>
+  <tbody>
+    <tr><td><strong>HTTP</strong></td><td>외부 애플리케이션</td><td>단순, 사용 쉬움 — <strong>공식 권장</strong></td></tr>
+    <tr><td><strong>TCP (Native)</strong></td><td>네이티브 클라이언트, 서버 간 분산 쿼리</td><td>내부 Block 포맷에 강결합. C 라이브러리조차 없음</td></tr>
+    <tr><td><strong>Replication</strong></td><td>레플리카 간 데이터 전송</td><td>압축된 파트 단위 전송</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>서버 자체는 코루틴·파이버 없는 <strong>단순한 멀티스레드 서버</strong>입니다. 대량의 단순 쿼리가 아니라 <strong>소수의 복잡한 쿼리</strong>(각각 방대한 데이터 처리)를 위한 의도적 설계입니다. TCP 프로토콜은 전·후방 호환성을 유지하되, 약 1년 후 구버전 지원을 제거합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">설정 리로드의 에러 내성 — 양날의 검</div>
+    <p>설정 파일에 문법 오류가 있어도 서버는 죽지 않고 <strong>이전 설정으로 계속 동작</strong>합니다. 안전하지만, "설정을 바꿨는데 적용 안 된 채 운영"하는 상황을 놓치기 쉽습니다. 변경 후엔 <code>system.settings</code>로 실제 적용 여부를 확인하세요. 설정의 6단계 계층 구조는 3장에서 자세히 다룹니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">쿼리 실행 중 Processor 사이를 흐르는 데이터 단위인 Block의 구성은?</div>
+  <div class="quiz-opts">
+    <button type="button">압축된 바이트 스트림과 체크섬의 쌍</button>
+    <button type="button" data-correct>(IColumn, IDataType, 컬럼 이름) 트리플의 집합</button>
+    <button type="button">행 단위 튜플의 배열</button>
+    <button type="button">AST 노드와 실행 통계의 쌍</button>
+  </div>
+  <div class="quiz-expl">✅ Block = { (IColumn, IDataType, column_name), … }입니다. 함수 실행 결과는 Block에 새 컬럼으로 <strong>추가</strong>될 뿐 기존 컬럼은 수정되지 않는데(immutable), 이 성질이 공통 부분식 제거 같은 최적화를 쉽게 만듭니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q"><code>WHERE cheap_filter(x) AND expensive_func(y)</code> 쿼리가 예상보다 느립니다. 가장 가능성 높은 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">AND 연산자가 인덱스를 무효화하기 때문</button>
+    <button type="button">cheap_filter가 매번 디스크를 다시 읽기 때문</button>
+    <button type="button" data-correct>벡터화 실행에는 short-circuit이 없어 cheap_filter가 false인 행에서도 expensive_func가 계산되기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ ClickHouse는 배열 전체를 한 번에 계산하는 벡터화 방식이라 단락 평가가 없습니다. 선택성 높은 필터로 먼저 걸러낸 뒤(서브쿼리) 비싼 함수를 적용하는 멀티패스 구조로 바꾸면 개선됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch02_internal_components.md" target="_blank" rel="noopener">chapters/ch02_internal_components.md</a> — Field의 타입 소실 문제, ReadBuffer/WriteBuffer 조합, 쿼리 하나를 7단계로 따라가는 상세 다이어그램이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch01.html"><span class="dir">← 이전</span><br><span class="title">1장. ClickHouse 개요</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch03.html"><span class="dir">다음 →</span><br><span class="title">3장. Context · 스레드 · 동시성</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

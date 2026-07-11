@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3장. MVCC — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch03">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>3장. MVCC — PostgreSQL 동시성의 비밀</h1>
+<p class="lead">읽기가 쓰기를 막지 않고, 쓰기가 읽기를 막지 않는 마법. 그 대가로 생기는 Bloat와 VACUUM까지 — PostgreSQL 운영의 심장을 그림으로 이해합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2장 아키텍처</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 왜 MVCC인가 ② 튜플 헤더(xmin/xmax)로 버전을 기록하는 방법 ③ 스냅샷으로 "내게 보이는 버전"을 고르는 방법 ④ UPDATE가 남기는 dead tuple과 Bloat의 탄생</p>
+  </div>
+</div>
+
+<h2 id="s1">3.1 왜 MVCC인가 — "읽기는 쓰기를 막지 않는다"</h2>
+
+<p>전통적인 <strong>Two-Phase Locking(2PL)</strong> 방식에서는 읽기(shared lock)와 쓰기(exclusive lock)가 서로를 막습니다. 한 트랜잭션이 행을 읽는 동안 다른 트랜잭션의 UPDATE는 <em>줄을 서서 기다려야</em> 합니다.</p>
+
+<p>PostgreSQL의 선택은 다릅니다. <strong>데이터를 덮어쓰는 대신, 새 버전(version)을 만듭니다.</strong> 각 트랜잭션은 자신만의 일관된 <strong>스냅샷(snapshot)</strong>을 보기 때문에 락 경합 없이 동시에 일할 수 있습니다.</p>
+
+<div class="anim" data-steps="4" data-title="락 방식(2PL) vs MVCC — 같은 행을 동시에 읽고 쓸 때" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 왼쪽: 2PL -->
+      <text x="170" y="24" text-anchor="middle" class="sv-label" font-size="15">🔒 락 방식 (2PL)</text>
+      <rect x="110" y="120" width="120" height="44" class="sv-box"/>
+      <text x="170" y="147" text-anchor="middle" class="sv-label sv-mono">row: Alice</text>
+      <!-- reader -->
+      <g data-show="1">
+        <rect x="20" y="50" width="90" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="65" y="72" text-anchor="middle" class="sv-label-sm">읽기 TX</text>
+        <path d="M 90 84 Q 130 100 150 118" class="sv-arrow" marker-end="url(#arr)"/>
+      </g>
+      <!-- writer blocked -->
+      <g data-show="2">
+        <rect x="230" y="50" width="90" height="34" rx="8" fill="color-mix(in srgb, var(--danger) 15%, transparent)" stroke="var(--danger)"/>
+        <text x="275" y="72" text-anchor="middle" class="sv-label-sm">쓰기 TX</text>
+        <path d="M 260 84 Q 230 100 205 118" stroke="var(--danger)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="268" y="110" class="sv-label-sm" fill="var(--danger)">⛔ 대기!</text>
+      </g>
+      <!-- 오른쪽: MVCC -->
+      <line x1="380" y1="20" x2="380" y2="280" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="580" y="24" text-anchor="middle" class="sv-label" font-size="15">🌀 MVCC (PostgreSQL)</text>
+      <rect x="470" y="120" width="130" height="44" class="sv-box"/>
+      <text x="535" y="140" text-anchor="middle" class="sv-label sv-mono" font-size="12">v1: Alice</text>
+      <text x="535" y="156" text-anchor="middle" class="sv-label-sm sv-mono">xmin=100</text>
+      <g data-show="3">
+        <rect x="410" y="50" width="90" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="455" y="72" text-anchor="middle" class="sv-label-sm">읽기 TX</text>
+        <path d="M 470 84 Q 500 100 515 118" class="sv-arrow flow-line"/>
+        <text x="418" y="110" class="sv-label-sm" fill="var(--accent)">v1을 읽음</text>
+      </g>
+      <g data-show="4">
+        <rect x="620" y="50" width="90" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)"/>
+        <text x="665" y="72" text-anchor="middle" class="sv-label-sm">쓰기 TX</text>
+        <rect x="470" y="190" width="130" height="44" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="535" y="210" text-anchor="middle" class="sv-label sv-mono" font-size="12">v2: Alicia ✨</text>
+        <text x="535" y="226" text-anchor="middle" class="sv-label-sm sv-mono">xmin=101</text>
+        <path d="M 645 90 Q 640 160 605 205" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="628" y="150" class="sv-label-sm" fill="var(--ok)">새 버전 생성</text>
+      </g>
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>락 방식에서 <b>읽기 트랜잭션</b>이 행에 shared lock을 잡습니다.</p>
+    <p>이때 <b>쓰기 트랜잭션</b>이 오면? exclusive lock을 얻지 못해 <b style="color:var(--danger)">대기(블로킹)</b>합니다. 읽기가 쓰기를 막는 것이죠.</p>
+    <p>MVCC에서는 읽기 트랜잭션이 락 없이 현재 버전 <code>v1</code>을 읽습니다.</p>
+    <p>동시에 쓰기 트랜잭션은 v1을 건드리지 않고 <b style="color:var(--ok)">새 버전 v2를 만듭니다</b>. 아무도 기다리지 않습니다! 이것이 "reading never blocks writing"입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">공식 문서 한 문장 요약</div>
+    <p>"In MVCC ... <strong>reading never blocks writing and writing never blocks reading.</strong>" — postgresql.org/docs/current/mvcc-intro.html</p>
+  </div>
+</div>
+
+<p>그 결과:</p>
+<ul>
+  <li><strong>SELECT는 락을 잡지 않습니다</strong> (<code>FOR UPDATE</code>를 명시하지 않는 한).</li>
+  <li><strong>UPDATE는 새 버전을 씁니다</strong> → 이전 버전은 "dead tuple"로 남습니다.</li>
+  <li><strong>대가</strong>: Bloat, XID 관리, VACUUM 운영 오버헤드 (8장에서 자세히).</li>
+</ul>
+
+<h2 id="s2">3.2 튜플 헤더 — 버전은 어디에 기록되는가</h2>
+
+<p>MVCC를 떠받치는 것은 모든 heap 튜플 앞에 붙는 <strong>23바이트 헤더</strong>입니다. 이 중 버전 판단의 핵심은 네 가지입니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>필드</th><th>크기</th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td><code>t_xmin</code></td><td>4 B</td><td>이 행을 <strong>INSERT한 트랜잭션의 XID</strong></td></tr>
+    <tr><td><code>t_xmax</code></td><td>4 B</td><td>이 행을 <strong>DELETE/UPDATE한 XID</strong> (없으면 0)</td></tr>
+    <tr><td><code>t_cid</code></td><td>4 B</td><td>같은 트랜잭션 안에서의 명령 순번(Command ID)</td></tr>
+    <tr><td><code>t_ctid</code></td><td>6 B</td><td>현재 물리 주소, UPDATE 후에는 <strong>다음 버전을 가리키는 포인터</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>실제로 눈으로 확인해 봅시다. 숨겨진 시스템 컬럼을 SELECT하면 됩니다.</p>
+
+<pre><code><span class="c">-- xmin, xmax는 모든 테이블에 숨어있는 시스템 컬럼이다</span>
+<span class="k">SELECT</span> xmin, xmax, ctid, * <span class="k">FROM</span> users;
+
+ xmin | xmax | ctid  | id | name
+------+------+-------+----+-------
+  100 |    0 | (0,1) |  1 | Alice   <span class="c">← xmax=0: 아무도 안 지움 (살아있음)</span></code></pre>
+
+<p>이제 <strong>INSERT → UPDATE → DELETE</strong>가 헤더를 어떻게 바꾸는지 애니메이션으로 봅시다. PostgreSQL은 절대 제자리에서 덮어쓰지 않는다는 것이 포인트입니다.</p>
+
+<div class="anim" data-steps="5" data-title="INSERT → UPDATE → DELETE — 튜플 버전의 일생" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 330">
+      <text x="20" y="26" class="sv-label" font-size="14">heap 페이지 (block 0)</text>
+      <rect x="20" y="40" width="720" height="270" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+
+      <!-- v1 튜플 -->
+      <g data-show="1" data-active="1-2">
+        <rect x="50" y="70" width="420" height="52" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="66" y="92" class="sv-label sv-mono" font-size="12.5">ctid=(0,1)  xmin=100  <tspan class="v1xmax">xmax=0</tspan></text>
+        <text x="66" y="112" class="sv-label" font-size="13">데이터: "Alice"</text>
+      </g>
+      <g data-show="1-1">
+        <text x="500" y="100" class="sv-label-sm" fill="var(--accent)">← TX 100이 INSERT</text>
+      </g>
+
+      <!-- UPDATE: xmax 마킹 -->
+      <g data-show="2">
+        <rect x="330" y="76" width="132" height="20" rx="5" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)"/>
+        <text x="340" y="91" class="sv-label sv-mono" font-size="12" fill="var(--warn)">xmax=200 ✍️</text>
+      </g>
+      <g data-show="2-2">
+        <text x="500" y="100" class="sv-label-sm" fill="var(--warn)">← TX 200이 UPDATE 시작</text>
+      </g>
+
+      <!-- v2 튜플 -->
+      <g data-show="3" data-active="3-5">
+        <rect x="50" y="160" width="420" height="52" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="66" y="182" class="sv-label sv-mono" font-size="12.5">ctid=(0,2)  xmin=200  xmax=0</text>
+        <text x="66" y="202" class="sv-label" font-size="13">데이터: "Alicia" ✨ (새 버전)</text>
+        <path d="M 260 122 C 260 140 260 145 260 158" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="272" y="145" class="sv-label-sm" fill="var(--warn)">t_ctid가 새 버전을 가리킴</text>
+      </g>
+
+      <!-- v1 dead 처리 -->
+      <g data-show="4">
+        <rect x="50" y="70" width="420" height="52" rx="8" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="500" y="100" class="sv-label-sm" fill="var(--danger)">← dead tuple (아무에게도 안 보임)</text>
+      </g>
+
+      <!-- vacuum -->
+      <g data-show="5">
+        <text x="60" y="272" class="sv-label" font-size="14">🧹 VACUUM: dead tuple 공간을 회수 → 재사용 가능 공간으로</text>
+        <path d="M 90 250 Q 150 220 200 130" stroke="var(--purple)" stroke-width="2" fill="none" stroke-dasharray="6 5" class="flow-line"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>TX 100</b>이 INSERT: 튜플 헤더에 <code>xmin=100, xmax=0</code>이 기록됩니다. xmax=0은 "아직 살아있음"이라는 뜻.</p>
+    <p><b>TX 200</b>이 UPDATE를 시작하면, 기존 튜플을 지우는 대신 <code>xmax=200</code>으로 <b>"200번이 나를 무효화했다"고 표시만</b> 합니다.</p>
+    <p>그리고 새 버전 <code>(0,2)</code>가 만들어집니다(<code>xmin=200</code>). 이전 버전의 <code>t_ctid</code>는 새 버전을 가리키는 <b>버전 체인</b>이 됩니다.</p>
+    <p>TX 200이 커밋되면 이전 버전은 <b style="color:var(--danger)">dead tuple</b> — 어떤 트랜잭션에게도 보이지 않지만 <b>디스크 공간은 그대로 차지</b>합니다. 이것이 쌓이면 <b>Bloat</b>!</p>
+    <p>물리적 삭제는 <b>VACUUM</b>의 몫입니다. dead tuple을 회수해 그 공간을 재사용할 수 있게 만듭니다. (8장에서 계속)</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">DELETE는 지우지 않는다</div>
+    <p>DELETE도 마찬가지로 <code>xmax</code>만 기록합니다. <strong>PostgreSQL에서 즉시 지워지는 데이터는 없습니다.</strong> "지웠는데 디스크가 안 줄어요"라는 단골 질문의 답이 바로 여기에 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">3.3 스냅샷 — "내게 보이는 버전"을 고르는 법</h2>
+
+<p>버전이 여러 개라면, 각 트랜잭션은 어떤 버전을 봐야 할까요? 트랜잭션은 시작 시점(READ COMMITTED에서는 쿼리 시작 시점)에 <strong>스냅샷</strong>을 찍습니다. 스냅샷은 세 가지 정보로 구성됩니다.</p>
+
+<pre><code><span class="c">-- 현재 스냅샷 보기: xmin:xmax:xip_list 형식</span>
+<span class="k">SELECT</span> <span class="f">pg_current_snapshot</span>();
+
+ pg_current_snapshot
+---------------------
+ 100:105:101,103      <span class="c">← xmin=100, xmax=105, 진행 중=101,103</span></code></pre>
+
+<ul>
+  <li><code>xmin</code> = 100 : 100 <strong>미만</strong>의 XID는 모두 결과 확정 (커밋됐으면 보임)</li>
+  <li><code>xmax</code> = 105 : 105 <strong>이상</strong>의 XID는 스냅샷 이후 시작 → 무조건 안 보임</li>
+  <li><code>xip_list</code> = 101,103 : 스냅샷 시점에 <strong>아직 진행 중</strong>이던 트랜잭션 → 안 보임</li>
+</ul>
+
+<div class="anim" data-steps="4" data-title="스냅샷 가시성 판정기 — 어떤 버전이 보이는가?" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- 스냅샷 카드 -->
+      <rect x="250" y="16" width="260" height="56" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="380" y="39" text-anchor="middle" class="sv-label sv-mono" font-size="13">내 스냅샷: 100:105:101,103</text>
+      <text x="380" y="59" text-anchor="middle" class="sv-label-sm">"이 순간의 세상만 보겠다" 📸</text>
+
+      <!-- 튜플들 -->
+      <g data-active="1-1">
+        <rect x="40" y="120" width="160" height="64" rx="9" class="sv-box"/>
+        <text x="120" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">xmin=99 (커밋됨)</text>
+        <text x="120" y="165" text-anchor="middle" class="sv-label" font-size="13">"Alice"</text>
+      </g>
+      <g data-show="1">
+        <text x="120" y="215" text-anchor="middle" class="sv-label" font-size="15" fill="var(--ok)" data-show="1">✅ 보임</text>
+      </g>
+
+      <g data-active="2-2">
+        <rect x="220" y="120" width="160" height="64" rx="9" class="sv-box"/>
+        <text x="300" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">xmin=101 (진행 중)</text>
+        <text x="300" y="165" text-anchor="middle" class="sv-label" font-size="13">"Bob"</text>
+      </g>
+      <g data-show="2">
+        <text x="300" y="215" text-anchor="middle" class="sv-label" font-size="15" fill="var(--danger)">❌ 안 보임</text>
+        <text x="300" y="238" text-anchor="middle" class="sv-label-sm">xip_list에 있음 = 아직 커밋 안 됨</text>
+      </g>
+
+      <g data-active="3-3">
+        <rect x="400" y="120" width="160" height="64" rx="9" class="sv-box"/>
+        <text x="480" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">xmin=107 (미래)</text>
+        <text x="480" y="165" text-anchor="middle" class="sv-label" font-size="13">"Carol"</text>
+      </g>
+      <g data-show="3">
+        <text x="480" y="215" text-anchor="middle" class="sv-label" font-size="15" fill="var(--danger)">❌ 안 보임</text>
+        <text x="480" y="238" text-anchor="middle" class="sv-label-sm">xmax(105) 이후 시작된 미래 TX</text>
+      </g>
+
+      <g data-active="4-4">
+        <rect x="580" y="120" width="160" height="64" rx="9" class="sv-box"/>
+        <text x="660" y="140" text-anchor="middle" class="sv-label sv-mono" font-size="12">xmin=98, xmax=99</text>
+        <text x="660" y="158" text-anchor="middle" class="sv-label-sm sv-mono">(둘 다 커밋됨)</text>
+        <text x="660" y="175" text-anchor="middle" class="sv-label" font-size="13">"Dave"</text>
+      </g>
+      <g data-show="4">
+        <text x="660" y="215" text-anchor="middle" class="sv-label" font-size="15" fill="var(--danger)">❌ 안 보임 (dead)</text>
+        <text x="660" y="238" text-anchor="middle" class="sv-label-sm">지운 TX 99도 내 과거 → 삭제 확정</text>
+      </g>
+
+      <text x="380" y="300" text-anchor="middle" class="sv-label-sm">판정 규칙: xmin이 "내 과거의 커밋"이고, xmax가 없거나 아직 확정되지 않았을 때만 보인다</text>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>xmin=99</code>: 스냅샷 xmin(100)보다 과거이고 커밋됨 → <b style="color:var(--ok)">보입니다</b>.</p>
+    <p><code>xmin=101</code>: xip_list(진행 중 목록)에 있음 → 스냅샷 시점에 커밋되지 않았으므로 <b style="color:var(--danger)">안 보입니다</b>.</p>
+    <p><code>xmin=107</code>: 스냅샷 xmax(105) 이후에 시작된 "미래" 트랜잭션 → <b style="color:var(--danger)">안 보입니다</b>.</p>
+    <p><code>xmax=99</code>가 커밋됨: 내 스냅샷 기준 "과거에 이미 지워진" 튜플 → <b style="color:var(--danger)">안 보입니다</b>. 이렇게 4개 버전 중 내게 보이는 것은 단 1개!</p>
+  </div>
+</div>
+
+<h2 id="s4">3.4 직접 실험 — 두 세션으로 MVCC 관찰하기</h2>
+
+<p>터미널 두 개를 열고 직접 눈으로 확인해 보세요. MVCC는 실험으로 배우는 것이 가장 빠릅니다.</p>
+
+<pre><code><span class="c">-- [세션 A]</span>
+<span class="k">CREATE TABLE</span> t (id int, name text);
+<span class="k">INSERT INTO</span> t <span class="k">VALUES</span> (1, <span class="s">'Alice'</span>);
+<span class="k">BEGIN</span> <span class="k">ISOLATION LEVEL</span> REPEATABLE READ;
+<span class="k">SELECT</span> xmin, xmax, name <span class="k">FROM</span> t;   <span class="c">-- Alice가 보인다. 스냅샷 고정!</span>
+
+<span class="c">-- [세션 B] : A가 트랜잭션을 연 채로 실행</span>
+<span class="k">UPDATE</span> t <span class="k">SET</span> name = <span class="s">'Alicia'</span> <span class="k">WHERE</span> id = 1;   <span class="c">-- 블로킹 없이 즉시 성공!</span>
+<span class="k">SELECT</span> xmin, xmax, name <span class="k">FROM</span> t;   <span class="c">-- B에게는 Alicia (새 버전)</span>
+
+<span class="c">-- [세션 A] : 다시 조회</span>
+<span class="k">SELECT</span> xmin, xmax, name <span class="k">FROM</span> t;   <span class="c">-- 여전히 Alice! (내 스냅샷의 세상)</span>
+<span class="k">COMMIT</span>;
+<span class="k">SELECT</span> name <span class="k">FROM</span> t;               <span class="c">-- 이제 Alicia가 보인다</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">더 깊이 보고 싶다면</div>
+    <p><code>CREATE EXTENSION pageinspect;</code> 후 <code>SELECT * FROM heap_page_items(get_raw_page('t', 0));</code>로 페이지 안의 모든 버전(dead tuple 포함)을 볼 수 있습니다. 13장 Extension에서 자세히 다룹니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">3.5 MVCC의 청구서 — Bloat와 XID Wraparound</h2>
+
+<p>공짜 점심은 없습니다. MVCC의 대가는 두 가지이며, 둘 다 PostgreSQL 운영 사고의 단골 원인입니다.</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🎈 Table Bloat</h4>
+    <p>UPDATE/DELETE가 남긴 dead tuple이 회수되지 못하고 쌓이면 테이블이 실제 데이터보다 몇 배로 부풀어 오릅니다. 스캔이 느려지고 캐시 효율이 떨어집니다. → <a href="ch08.html">8장 VACUUM</a></p>
+  </div>
+  <div class="card">
+    <h4>🔄 XID Wraparound</h4>
+    <p>XID는 32비트(약 40억, 비교 가능 범위는 약 20억)입니다. 소진되기 전에 오래된 튜플을 "얼려서(freeze)" XID를 재활용해야 합니다. 실패하면 DB가 <strong>쓰기를 거부</strong>하는 최악의 장애가 됩니다. → <a href="../index.html#troubleshooting">트러블슈팅 케이스</a></p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">UPDATE가 실행될 때 PostgreSQL이 실제로 하는 일은?</div>
+  <div class="quiz-opts">
+    <button type="button">기존 튜플의 데이터를 제자리에서 덮어쓴다</button>
+    <button type="button" data-correct>기존 튜플에 xmax를 기록하고, 새 버전 튜플을 추가한다</button>
+    <button type="button">기존 튜플을 즉시 삭제하고 새 튜플을 삽입한다</button>
+    <button type="button">WAL에만 기록하고 heap은 건드리지 않는다</button>
+  </div>
+  <div class="quiz-expl">✅ PostgreSQL의 UPDATE = "기존 버전에 xmax 마킹" + "새 버전 INSERT"입니다. 기존 버전은 dead tuple로 남아 VACUUM을 기다립니다. 제자리 덮어쓰기(in-place update)를 하지 않는 것이 MVCC의 핵심입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">스냅샷이 <code>100:105:101,103</code>일 때, xmin=103인 (커밋된) 튜플이 보이지 않는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">xmin이 스냅샷 xmax보다 크기 때문</button>
+    <button type="button" data-correct>스냅샷 시점에 TX 103이 아직 진행 중(xip_list)이었기 때문</button>
+    <button type="button">튜플의 xmax가 설정되어 있기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 지금은 커밋되었더라도, <strong>내 스냅샷을 찍던 순간</strong>에 진행 중이었다면(xip_list 포함) 그 트랜잭션의 변경은 보이지 않습니다. 스냅샷은 "그 순간의 세상"을 고정하는 사진이기 때문입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch03_mvcc.md" target="_blank" rel="noopener">chapters/ch03_mvcc.md</a> — 힌트 비트, HOT 업데이트, CLOG 구조 등 심화 내용이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch02.html"><span class="dir">← 이전</span><br><span class="title">2장. 아키텍처</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch04.html"><span class="dir">다음 →</span><br><span class="title">4장. Storage · TOAST</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

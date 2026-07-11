@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11장. 백업과 PITR 복구 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch11">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>11장. 백업과 PITR — "어제 오후 1시 59분으로 되돌려 주세요"</h1>
+<p class="lead">실수로 DROP TABLE을 날린 순간에도 살아날 길은 있습니다. 베이스 백업 + WAL 아카이브의 조합으로 원하는 시점을 정확히 재현하는 Point-In-Time Recovery를 배웁니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 35분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 9장 WAL</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 논리 백업(pg_dump) vs 물리 백업(pg_basebackup)의 역할 분담 ② 연속 WAL 아카이브 파이프라인 구성 ③ PITR — 특정 시점으로 복구하는 타임라인과 절차 ④ archive 실패의 함정과 DR 드릴(RPO/RTO)</p>
+  </div>
+</div>
+
+<h2 id="s1">11.1 백업의 두 축 — SQL로 다시 만들기 vs 바이트로 되살리기</h2>
+
+<p>PostgreSQL 백업은 성격이 전혀 다른 두 축으로 나뉩니다. <strong>논리 백업</strong>은 "테이블을 다시 만들 수 있는 SQL"을 뽑아내고, <strong>물리 백업</strong>은 "데이터 디렉터리 자체"를 바이트 단위로 복사합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>구분</th><th>논리 백업 (pg_dump)</th><th>물리 백업 (pg_basebackup)</th></tr></thead>
+  <tbody>
+    <tr><td>단위</td><td>SQL 문 (DDL + COPY)</td><td>데이터 파일 (8KB 페이지)</td></tr>
+    <tr><td>복구 시간</td><td>큰 DB에서 <strong>매우 느림</strong> (인덱스 재생성)</td><td>빠름 (복사 + WAL 리플레이)</td></tr>
+    <tr><td>메이저 버전 업그레이드</td><td><strong>가능</strong></td><td>불가 (같은 major만)</td></tr>
+    <tr><td>객체 선택</td><td>테이블·스키마 단위 가능</td><td>클러스터 전체만</td></tr>
+    <tr><td>PITR</td><td>불가</td><td><strong>가능</strong> (+WAL 아카이브)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">운영 원칙: 둘 다 한다</div>
+    <p>논리 백업은 "테이블 하나를 실수로 날렸을 때 빠르게 되살리는 보험", 물리 백업+WAL은 "클러스터 전체 재해 복구와 PITR"용입니다. 그리고 <code>pg_dump</code>는 롤·테이블스페이스 같은 전역 객체를 포함하지 않으므로 <strong><code>pg_dumpall --globals-only</code>를 반드시 함께</strong> 백업하세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># 논리 백업 — custom 포맷(-Fc)이 가장 권장: 선택적·병렬 복구 가능</span>
+pg_dump -h db.example -U postgres -Fc -f app.dump app
+pg_dumpall --globals-only &gt; globals.sql          <span class="c"># 롤·전역 객체 (필수!)</span>
+
+<span class="c"># 복구 — 병렬 8개로</span>
+pg_restore -d app_restored --jobs=<span class="n">8</span> app.dump
+<span class="c"># 복구 후 반드시 ANALYZE — 통계 없으면 플랜이 망가진다</span></code></pre>
+
+<h2 id="s2">11.2 PITR의 재료 — 베이스 백업 + WAL 아카이브</h2>
+
+<p>PITR(Point-In-Time Recovery)의 원리는 9장의 크래시 리커버리와 똑같습니다. 다른 점은 단 하나 — <em>"어느 시점의 데이터 파일 + 어디까지의 WAL"을 우리가 고른다</em>는 것. 그러려면 두 가지 재료를 상시 준비해야 합니다.</p>
+
+<ol>
+  <li><strong>베이스 백업</strong> — 특정 시점의 데이터 디렉터리 스냅샷 (<code>pg_basebackup</code>, 주 1회 등)</li>
+  <li><strong>WAL 아카이브</strong> — 그 이후 생성된 <strong>모든</strong> WAL 세그먼트의 영구 보관</li>
+</ol>
+
+<div class="anim" data-steps="4" data-title="연속 아카이브 파이프라인 — 재료를 모으는 과정" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <!-- primary -->
+      <rect x="30" y="60" width="220" height="140" rx="12" fill="none" stroke="var(--pg-soft)" stroke-width="1.8"/>
+      <text x="140" y="48" text-anchor="middle" class="sv-label" font-size="14">🐘 운영 서버</text>
+      <rect x="50" y="80" width="180" height="46" rx="8" class="sv-box"/>
+      <text x="140" y="102" text-anchor="middle" class="sv-label sv-mono" font-size="12">PostgreSQL</text>
+      <text x="140" y="118" text-anchor="middle" class="sv-label-sm">트랜잭션 처리 중…</text>
+      <rect x="50" y="140" width="180" height="44" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+      <text x="140" y="161" text-anchor="middle" class="sv-label sv-mono" font-size="12">pg_wal/</text>
+      <text x="140" y="177" text-anchor="middle" class="sv-label-sm">16MB 세그먼트들</text>
+
+      <!-- backup storage -->
+      <rect x="500" y="40" width="250" height="110" rx="12" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="625" y="66" text-anchor="middle" class="sv-label" font-size="13" fill="var(--purple)">📦 베이스 백업 저장소</text>
+      <g data-show="1">
+        <rect x="520" y="80" width="100" height="52" rx="8" fill="var(--bg-inset)" stroke="var(--purple)" stroke-width="1.4"/>
+        <text x="570" y="102" text-anchor="middle" class="sv-label-sm sv-mono">base_0420</text>
+        <text x="570" y="120" text-anchor="middle" class="sv-label-sm">일요일 00:00</text>
+      </g>
+
+      <!-- archive storage -->
+      <rect x="500" y="180" width="250" height="120" rx="12" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+      <text x="625" y="206" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">🗃️ WAL 아카이브 (S3/NFS)</text>
+
+      <!-- step1: base backup -->
+      <g data-show="1">
+        <path d="M 255 100 Q 380 70 495 92" stroke="var(--purple)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr11a)"/>
+        <text x="370" y="60" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">pg_basebackup (주 1회)</text>
+      </g>
+
+      <!-- step2: archive_command per segment -->
+      <g data-show="2">
+        <path d="M 235 162 Q 370 200 495 232" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr11b)"/>
+        <text x="365" y="188" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">세그먼트가 찰 때마다 archive_command</text>
+        <rect x="520" y="222" width="52" height="30" rx="6" fill="var(--bg-inset)" stroke="var(--ok)"/>
+        <text x="546" y="242" text-anchor="middle" class="sv-label-sm sv-mono">B3</text>
+      </g>
+      <g data-show="3">
+        <rect x="580" y="222" width="52" height="30" rx="6" fill="var(--bg-inset)" stroke="var(--ok)"/>
+        <text x="606" y="242" text-anchor="middle" class="sv-label-sm sv-mono">B4</text>
+        <rect x="640" y="222" width="52" height="30" rx="6" fill="var(--bg-inset)" stroke="var(--ok)"/>
+        <text x="666" y="242" text-anchor="middle" class="sv-label-sm sv-mono">B5</text>
+        <text x="625" y="280" text-anchor="middle" class="sv-label-sm">끊김 없이 계속 쌓임 = "연속 아카이브"</text>
+      </g>
+
+      <!-- step4: equation -->
+      <g data-show="4">
+        <rect x="30" y="230" width="420" height="70" rx="10" class="sv-box"/>
+        <text x="240" y="258" text-anchor="middle" class="sv-label" font-size="13">복구 공식</text>
+        <text x="240" y="282" text-anchor="middle" class="sv-label-sm">📦 베이스 백업 + 🗃️ 그 이후의 WAL 전부 = <tspan fill="var(--accent)">임의 시점 재현 가능</tspan></text>
+      </g>
+      <defs>
+        <marker id="arr11a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+        <marker id="arr11b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>주기적으로(예: 주 1회) <code>pg_basebackup</code>이 데이터 디렉터리 전체를 <b style="color:var(--purple)">베이스 백업 저장소</b>로 복사합니다. 서비스는 멈추지 않습니다.</p>
+    <p>그 사이에도 트랜잭션은 계속 WAL을 만듭니다. 16MB 세그먼트가 가득 찰 때마다 <code>archive_command</code>가 호출되어 <b style="color:var(--ok)">아카이브 저장소</b>로 복사합니다.</p>
+    <p>세그먼트가 <b>하나도 빠짐없이</b> 쌓입니다. 이것이 "연속 아카이브(continuous archiving)" — 중간에 구멍이 하나라도 나면 그 이후 시점으로는 복구할 수 없습니다.</p>
+    <p>이제 공식이 완성됐습니다: <b>베이스 백업 + 그 이후의 WAL 전부 = 백업 이후 임의 시점을 재현 가능</b>. base만으로도, WAL만으로도 복구할 수 없습니다 — 반드시 조합입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># postgresql.conf — 아카이브 활성화</span>
+wal_level = replica              <span class="c"># minimal은 아카이브 불가</span>
+archive_mode = on                <span class="c"># 변경 시 재시작 필요</span>
+archive_command = <span class="s">'test ! -f /archive/%f &amp;&amp; cp %p /archive/%f'</span>
+<span class="c"># %p = WAL 파일 경로, %f = 파일명. 0 리턴 = 성공</span>
+
+<span class="c"># 베이스 백업 (주기 실행)</span>
+pg_basebackup -h primary.example -U replicator \
+  -D /backup/base_$(date +%Y%m%d) \
+  -Ft -z -X stream -P              <span class="c"># tar+gzip, 백업 중 WAL 동시 수집</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">위 archive_command 예시는 "교과서용"입니다</div>
+    <p>공식 문서의 <code>test ! -f && cp</code> 패턴은 내용 검증이 없어, 목적지에 손상된 동명 파일이 있으면 실패를 무한 반복합니다. 운영에서는 <strong>pgBackRest / wal-g / barman</strong> 같은 전용 도구를 쓰세요 — 원자적 업로드, 해시 검증, 병렬, 암호화, 보존 정책까지 기본 제공합니다. (v15+는 <code>archive_library</code>로 셸 오버헤드도 제거 가능)</p>
+  </div>
+</div>
+
+<h2 id="s3">11.3 PITR — 시간을 되감는 타임라인</h2>
+
+<p>시나리오: 4월 23일 14:00, 누군가 운영 DB에 실수로 <code>DROP TABLE orders</code>를 실행했습니다. 마지막 베이스 백업은 4월 20일. 목표는 <strong>사고 1분 전인 13:59로 되돌리는 것</strong>입니다.</p>
+
+<div class="anim" data-steps="5" data-title="PITR 타임라인 — 사고 직전으로 복구하기" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- timeline -->
+      <line x1="40" y1="80" x2="760" y2="80" class="sv-line" stroke-width="2"/>
+      <circle cx="100" cy="80" r="8" fill="var(--purple)"/>
+      <text x="100" y="58" text-anchor="middle" class="sv-label-sm sv-mono">4/20 00:00</text>
+      <text x="100" y="110" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">📦 base backup</text>
+      <circle cx="300" cy="80" r="5" fill="var(--ok)"/>
+      <text x="300" y="58" text-anchor="middle" class="sv-label-sm sv-mono">4/21</text>
+      <circle cx="450" cy="80" r="5" fill="var(--ok)"/>
+      <text x="450" y="58" text-anchor="middle" class="sv-label-sm sv-mono">4/22</text>
+      <text x="380" y="110" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">🗃️ WAL 아카이브 계속 쌓임</text>
+
+      <!-- accident -->
+      <g data-show="1">
+        <circle cx="620" cy="80" r="9" fill="var(--danger)" class="pulse"/>
+        <text x="620" y="58" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">4/23 14:00</text>
+        <text x="620" y="110" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">💥 DROP TABLE orders!</text>
+      </g>
+
+      <!-- target -->
+      <g data-show="2">
+        <line x1="596" y1="55" x2="596" y2="105" stroke="var(--accent)" stroke-width="2.5" stroke-dasharray="5 4"/>
+        <text x="560" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">🎯 target = 13:59</text>
+      </g>
+
+      <!-- recovery lane -->
+      <g data-show="3">
+        <rect x="40" y="160" width="230" height="60" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="155" y="185" text-anchor="middle" class="sv-label" font-size="12.5">① 새 서버에 base 복원</text>
+        <text x="155" y="205" text-anchor="middle" class="sv-label-sm sv-mono">tar -xf base_0420.tar</text>
+        <path d="M 100 92 Q 90 130 110 156" stroke="var(--purple)" stroke-width="2" stroke-dasharray="5 4" fill="none" class="flow-line"/>
+      </g>
+
+      <g data-show="4">
+        <rect x="300" y="160" width="260" height="60" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="430" y="185" text-anchor="middle" class="sv-label" font-size="12.5">② WAL 리플레이 ▶▶</text>
+        <text x="430" y="205" text-anchor="middle" class="sv-label-sm sv-mono">restore_command로 아카이브에서</text>
+        <path d="M 275 190 L 295 190" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr11c)"/>
+        <path d="M 380 110 Q 400 140 410 156" stroke="var(--ok)" stroke-width="2" stroke-dasharray="5 4" fill="none" class="flow-line"/>
+      </g>
+
+      <g data-show="5">
+        <rect x="590" y="160" width="180" height="60" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="680" y="185" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--accent)">③ 13:59에서 정지 ✋</text>
+        <text x="680" y="205" text-anchor="middle" class="sv-label-sm sv-mono">recovery_target_time</text>
+        <path d="M 565 190 L 585 190" stroke="var(--accent)" stroke-width="2" class="flow-line" marker-end="url(#arr11d)"/>
+        <rect x="180" y="250" width="440" height="66" rx="10" class="sv-box"/>
+        <text x="400" y="276" text-anchor="middle" class="sv-label" font-size="12.5">orders 테이블이 살아있는 세상 복원 완료 🎉</text>
+        <text x="400" y="298" text-anchor="middle" class="sv-label-sm">pause 상태에서 데이터 검증 → pg_promote()로 서비스 오픈 (새 타임라인)</text>
+      </g>
+      <defs>
+        <marker id="arr11c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr11d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>4/20 00:00 베이스 백업 이후 WAL이 계속 아카이브되고 있었습니다. 그런데 4/23 14:00, <b style="color:var(--danger)">실수의 DROP TABLE</b>이 실행됐습니다. 이 사고 자체도 WAL에 기록되어 있다는 점이 중요합니다.</p>
+    <p>목표 시점을 정합니다: 사고 <b>직전</b>인 <b style="color:var(--accent)">13:59</b>. 복구는 "사고 포함 전부"가 아니라 "사고 직전까지만" 재생하는 것이 핵심입니다.</p>
+    <p>별도 서버(또는 비운 데이터 디렉터리)에 <b style="color:var(--purple)">베이스 백업을 복원</b>합니다. 이 시점의 데이터는 4/20 00:00 상태입니다.</p>
+    <p><code>recovery.signal</code>을 만들고 기동하면, <code>restore_command</code>가 아카이브에서 WAL을 가져와 <b style="color:var(--ok)">순서대로 리플레이</b>합니다. 4/21… 4/22… 시간이 빨리감기로 흐릅니다.</p>
+    <p><code>recovery_target_time = '13:59'</code>에 도달하면 <b>리플레이를 멈춥니다</b>. DROP TABLE 레코드는 재생되지 않았으므로 orders는 살아 있습니다! 검증 후 <code>pg_promote()</code>로 쓰기를 열면 새 타임라인에서 서비스가 재개됩니다.</p>
+  </div>
+</div>
+
+<p>실제 절차는 설정 몇 줄입니다 (v12+ 기준 — <code>recovery.conf</code>는 v12에서 제거되었습니다).</p>
+
+<pre><code><span class="c"># 1) 데이터 디렉터리 비우고 base backup 복원</span>
+pg_ctl stop -D $PGDATA &amp;&amp; rm -rf $PGDATA/*
+tar -xf /backup/base_20260420.tar -C $PGDATA
+
+<span class="c"># 2) postgresql.conf에 복구 타겟 지정</span>
+restore_command = <span class="s">'cp /archive/%f %p'</span>
+recovery_target_time = <span class="s">'2026-04-23 13:59:00+09'</span>
+recovery_target_action = <span class="s">'pause'</span>     <span class="c"># pause | promote | shutdown</span>
+
+<span class="c"># 3) recovery.signal 생성 후 기동</span>
+touch $PGDATA/recovery.signal
+pg_ctl start -D $PGDATA
+
+<span class="c">-- 4) 타겟 도달 후 데이터 확인 → 서비스 오픈</span>
+<span class="k">SELECT</span> <span class="f">pg_wal_replay_resume</span>();   <span class="c">-- 또는 pg_promote()</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">타겟은 시간 말고도 지정할 수 있다</div>
+    <p><code>recovery_target_xid</code>(트랜잭션 ID), <code>recovery_target_lsn</code>, <code>recovery_target_name</code>(<code>pg_create_restore_point('before_migration')</code>으로 만든 이름표)도 가능합니다. <strong>큰 변경 작업 직전에 restore point를 만들어 두는 습관</strong>이 새벽의 당신을 구합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">11.4 아카이브가 조용히 실패하고 있다면</h2>
+
+<p>PITR 체계의 최대 적은 화려한 장애가 아니라 <strong>조용한 실패</strong>입니다. <code>archive_command</code>가 0이 아닌 값을 반환하면 PostgreSQL은 해당 WAL을 <code>pg_wal/</code>에 계속 보관하며 재시도합니다 — S3 인증 만료, 디스크 풀, 네트워크 단절이 흔한 원인입니다. 눈치채지 못하면 두 가지 재앙이 동시에 옵니다: <strong>복구 가능 시점이 멈추고(RPO 파괴), pg_wal이 차올라 서버가 PANIC 정지</strong>합니다.</p>
+
+<div class="anim" data-steps="4" data-title="archive_command 실패 — 조용한 실패가 재앙이 되기까지" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 300">
+      <rect x="40" y="60" width="240" height="180" rx="12" fill="none" stroke="var(--pg-soft)" stroke-width="1.8"/>
+      <text x="160" y="48" text-anchor="middle" class="sv-label" font-size="13">🐘 운영 서버 — pg_wal/</text>
+      <rect x="60" y="80" width="60" height="34" rx="6" class="sv-box"/>
+      <text x="90" y="102" text-anchor="middle" class="sv-label-sm sv-mono">B3</text>
+      <rect x="130" y="80" width="60" height="34" rx="6" class="sv-box"/>
+      <text x="160" y="102" text-anchor="middle" class="sv-label-sm sv-mono">B4</text>
+
+      <rect x="520" y="70" width="220" height="90" rx="12" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+      <text x="630" y="96" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">🗃️ 아카이브 (S3)</text>
+
+      <g data-show="1-1">
+        <path d="M 285 100 L 515 100" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr11e)"/>
+        <text x="400" y="90" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">정상: 복사 후 pg_wal에서 재활용</text>
+        <text x="630" y="130" text-anchor="middle" class="sv-label-sm sv-mono">… B1 B2 B3 ✓</text>
+      </g>
+
+      <g data-show="2">
+        <path d="M 285 100 L 400 100" stroke="var(--danger)" stroke-width="2" class="flow-line"/>
+        <line x1="400" y1="82" x2="430" y2="118" stroke="var(--danger)" stroke-width="3"/>
+        <line x1="430" y1="82" x2="400" y2="118" stroke="var(--danger)" stroke-width="3"/>
+        <text x="415" y="140" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">S3 인증 만료! 실패 리턴</text>
+      </g>
+
+      <g data-show="3">
+        <rect x="60" y="130" width="60" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="90" y="152" text-anchor="middle" class="sv-label-sm sv-mono">B5</text>
+        <rect x="130" y="130" width="60" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="160" y="152" text-anchor="middle" class="sv-label-sm sv-mono">B6</text>
+        <rect x="200" y="130" width="60" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="230" y="152" text-anchor="middle" class="sv-label-sm sv-mono">B7</text>
+        <rect x="60" y="180" width="60" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)" class="blink"/>
+        <text x="90" y="202" text-anchor="middle" class="sv-label-sm sv-mono">B8</text>
+        <text x="185" y="205" class="sv-label-sm" fill="var(--warn)">.ready 파일 적체…</text>
+        <text x="160" y="262" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">실패한 WAL은 지울 수 없어 계속 쌓임</text>
+      </g>
+
+      <g data-show="4">
+        <rect x="430" y="180" width="310" height="100" rx="11" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.7"/>
+        <text x="585" y="208" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">이중 재앙</text>
+        <text x="585" y="232" text-anchor="middle" class="sv-label-sm">① 복구 가능 시점이 B4에서 멈춤 (RPO 파괴)</text>
+        <text x="585" y="254" text-anchor="middle" class="sv-label-sm">② 디스크 풀 → PANIC 셧다운</text>
+        <text x="585" y="273" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--accent)">감시: pg_stat_archiver.failed_count</text>
+      </g>
+      <defs>
+        <marker id="arr11e" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>정상 상태: 세그먼트가 가득 차면 <code>archive_command</code>가 복사하고, 성공(0 리턴)하면 로컬 세그먼트는 재활용됩니다.</p>
+    <p>어느 날 S3 인증이 만료됩니다. <code>archive_command</code>가 실패를 반환하기 시작하지만 <b>서비스는 멀쩡해 보입니다</b> — 조용한 실패의 시작.</p>
+    <p>PostgreSQL은 아카이브 안 된 WAL을 지울 수 없으므로 <code>pg_wal/</code>에 계속 쌓아두고 재시도합니다. <code>archive_status/</code>의 <code>.ready</code> 파일이 수천 개로 불어납니다.</p>
+    <p>결과는 이중 재앙: <b style="color:var(--danger)">복구 가능 시점은 마지막 성공 지점에 멈춰 있고</b>(그 이후로는 PITR 불가), 디스크가 차면 <b style="color:var(--danger)">PANIC 셧다운</b>. <code>pg_stat_archiver.failed_count</code>를 일간 감시 항목에 반드시 넣으세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 아카이버 건강 검진 — failed_count는 꾸준히 0이어야 한다</span>
+<span class="k">SELECT</span> archived_count, failed_count,
+       last_archived_wal, last_archived_time,
+       last_failed_wal, last_failed_time
+<span class="k">FROM</span> pg_stat_archiver;</code></pre>
+
+<h2 id="s5">11.5 RPO / RTO — 그리고 "복구해본 적 없는 백업은 백업이 아니다"</h2>
+
+<p>백업 설계의 언어 두 가지: <strong>RPO</strong>(Recovery Point Objective — 어디까지의 데이터를 잃어도 되는가)와 <strong>RTO</strong>(Recovery Time Objective — 얼마나 빨리 복구해야 하는가)입니다. 구성에 따른 대략의 수준은 이렇습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>구성</th><th>대략적 RPO</th><th>대략적 RTO</th><th>비용</th></tr></thead>
+  <tbody>
+    <tr><td>주 1회 pg_dump만</td><td>최대 1주</td><td>수 시간</td><td>저</td></tr>
+    <tr><td>일 1회 base + 연속 WAL 아카이브</td><td>초 단위</td><td>1~수 시간</td><td>중</td></tr>
+    <tr><td>+ 비동기 스트리밍 replica</td><td>초 단위</td><td>수 분 (페일오버)</td><td>중~고</td></tr>
+    <tr><td>+ 동기 스트리밍 replica</td><td><strong>0</strong></td><td>수 분</td><td>고</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">DR 드릴 — 월 1회, 실제로 복구해 보라</div>
+    <p>복구 절차가 문서로만 존재하면 새벽 2시에 반드시 무너집니다. 월 1회 별도 환경에서 <strong>최신 백업 → PITR → 쿼리 검증 → 소요 시간 기록</strong>까지 실제로 수행하세요. 자주 빠뜨리는 것: <code>pg_dumpall --globals-only</code>(롤 없으면 앱 접속 실패), 아카이브를 운영 서버와 같은 디스크에 저장(DR 요건 미달), 복구 후 <code>ANALYZE</code> 누락.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">PITR(Point-In-Time Recovery)을 수행하기 위해 반드시 필요한 재료의 조합은?</div>
+  <div class="quiz-opts">
+    <button type="button">최신 pg_dump 파일 하나면 충분하다</button>
+    <button type="button">WAL 아카이브만 있으면 된다 — WAL이 모든 변경을 담고 있으므로</button>
+    <button type="button" data-correct>베이스 백업 + 그 이후의 연속 WAL 아카이브</button>
+    <button type="button">recovery.conf 파일과 pg_hba.conf</button>
+  </div>
+  <div class="quiz-expl">✅ WAL은 "변경의 증분 기록"이라 출발점(베이스 백업)이 없으면 재생할 대상이 없고, 베이스 백업만으로는 백업 시점 이후로 갈 수 없습니다. 둘의 조합이어야 "백업 이후 임의 시점" 복구가 가능합니다. pg_dump는 덤프 시점 하나로만 복구 가능하며 PITR은 불가능합니다. (참고로 recovery.conf는 v12에서 제거되었습니다.)</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">14:00에 실수로 DROP TABLE이 실행됐습니다. PITR로 복구할 때 <code>recovery_target_time</code>은 어떻게 잡아야 할까요?</div>
+  <div class="quiz-opts">
+    <button type="button">14:00 정각 — 사고 시점을 정확히 재현해야 하므로</button>
+    <button type="button" data-correct>13:59 등 사고 직전 — DROP이 기록된 WAL 레코드가 재생되기 전에 멈춰야 하므로</button>
+    <button type="button">가장 최신 시각 — WAL을 끝까지 재생해야 데이터가 온전하므로</button>
+  </div>
+  <div class="quiz-expl">✅ 사고(DROP TABLE)도 WAL에 기록되어 있으므로, WAL을 끝까지 재생하면 사고까지 그대로 재현됩니다. 타겟을 사고 직전으로 잡아 그 레코드가 리플레이되기 전에 멈추는 것이 PITR의 핵심입니다. <code>recovery_target_action = 'pause'</code>로 멈춘 뒤 데이터를 확인하고 promote하는 것이 안전한 순서입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch11_backup_recovery.md" target="_blank" rel="noopener">chapters/ch11_backup_recovery.md</a> — pg_dump/pg_restore 전체 옵션, pgBackRest·wal-g 등 외부 도구 비교, DR 드릴 체크리스트, 자주 만나는 함정 7가지가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch10.html"><span class="dir">← 이전</span><br><span class="title">10장. Replication — 복제</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch12.html"><span class="dir">다음 →</span><br><span class="title">12장. 파티셔닝</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

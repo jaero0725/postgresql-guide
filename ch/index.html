@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClickHouse 학습 홈 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>⚡ ClickHouse 학습 가이드</h1>
+<p class="lead">"세상에서 가장 빠른 분석 DB"는 어떻게 만들어졌을까요? 컬럼 저장, immutable 파트, 백그라운드 머지, 희소 인덱스 — ClickHouse의 심장을 애니메이션으로 하나씩 열어봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag">📚 총 11개 챕터</span>
+  <span class="tag">🎬 챕터마다 애니메이션 2~3개</span>
+  <span class="tag">✅ 완료 <span data-progress-of="ch/">0</span> / 11장</span>
+</div>
+
+<h2 id="overview">한눈에 보는 ClickHouse — 데이터의 일생</h2>
+
+<p>ClickHouse의 거의 모든 동작은 단 하나의 스토리로 요약됩니다. <strong>INSERT는 immutable 파트를 만들고, 백그라운드 머지가 파트를 합치고, SELECT는 희소 인덱스로 건너뛰며 읽습니다.</strong> 이 30초 애니메이션이 앞으로 11개 챕터에서 배울 전체 그림입니다.</p>
+
+<div class="anim" data-steps="6" data-title="INSERT → immutable 파트 → 백그라운드 머지 → SELECT" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 340">
+      <defs>
+        <marker id="arrHome" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- 디스크 영역 -->
+      <rect x="30" y="120" width="500" height="190" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="46" y="144" class="sv-label-sm">💾 디스크 (MergeTree 테이블)</text>
+
+      <!-- step1: INSERT 배치 -->
+      <g data-show="1">
+        <rect x="40" y="30" width="150" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="115" y="49" text-anchor="middle" class="sv-label">INSERT 배치</text>
+        <text x="115" y="66" text-anchor="middle" class="sv-label-sm">수만 행을 한 번에</text>
+        <path d="M 115 76 L 115 118" class="sv-arrow flow-line" marker-end="url(#arrHome)"/>
+      </g>
+
+      <!-- step2: 파트 1 -->
+      <g data-show="2" class="rise">
+        <rect x="55" y="165" width="110" height="60" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="110" y="190" text-anchor="middle" class="sv-label sv-mono" font-size="12">all_1_1_0</text>
+        <text x="110" y="210" text-anchor="middle" class="sv-label-sm">정렬·압축된 파트</text>
+      </g>
+      <g data-show="2-3">
+        <text x="110" y="250" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">immutable — 수정 불가!</text>
+      </g>
+
+      <!-- step3: 파트 2, 3 -->
+      <g data-show="3" class="rise">
+        <rect x="185" y="165" width="110" height="60" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="240" y="190" text-anchor="middle" class="sv-label sv-mono" font-size="12">all_2_2_0</text>
+        <rect x="315" y="165" width="110" height="60" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="370" y="190" text-anchor="middle" class="sv-label sv-mono" font-size="12">all_3_3_0</text>
+        <text x="305" y="215" text-anchor="middle" class="sv-label-sm">INSERT마다 새 파트가 쌓임</text>
+      </g>
+
+      <!-- step4: 머지 -->
+      <g data-show="4">
+        <path d="M 110 228 Q 110 275 220 285" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 240 228 L 240 280" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 370 228 Q 370 275 260 285" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="130" y="270" width="220" height="34" rx="8" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="240" y="292" text-anchor="middle" class="sv-label sv-mono" font-size="12">all_1_3_1 (머지된 큰 파트)</text>
+        <text x="450" y="290" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">🔧 백그라운드 머지</text>
+      </g>
+
+      <!-- step5: SELECT + sparse index -->
+      <g data-show="5">
+        <rect x="600" y="30" width="180" height="46" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="690" y="49" text-anchor="middle" class="sv-label">SELECT 쿼리</text>
+        <text x="690" y="66" text-anchor="middle" class="sv-label-sm sv-mono">WHERE town='LONDON'</text>
+        <rect x="580" y="120" width="210" height="150" rx="10" class="sv-box"/>
+        <text x="600" y="145" class="sv-label-sm">primary.idx (희소 인덱스)</text>
+        <rect x="600" y="158" width="170" height="20" rx="4" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--border)"/>
+        <text x="685" y="173" text-anchor="middle" class="sv-label-sm">granule 0 — 건너뜀</text>
+        <rect x="600" y="184" width="170" height="20" rx="4" fill="color-mix(in srgb, var(--ok) 22%, transparent)" stroke="var(--ok)" class="pulse"/>
+        <text x="685" y="199" text-anchor="middle" class="sv-label-sm">granule 1 — 여기만 읽음 ✅</text>
+        <rect x="600" y="210" width="170" height="20" rx="4" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--border)"/>
+        <text x="685" y="225" text-anchor="middle" class="sv-label-sm">granule 2 — 건너뜀</text>
+        <rect x="600" y="236" width="170" height="20" rx="4" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--border)"/>
+        <text x="685" y="251" text-anchor="middle" class="sv-label-sm">granule 3 — 건너뜀</text>
+        <path d="M 690 76 L 690 118" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 578 194 Q 500 250 352 285" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- step6: 결론 -->
+      <g data-show="6">
+        <rect x="580" y="285" width="210" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="685" y="310" text-anchor="middle" class="sv-label">⚡ 결과 반환 — 수 ms</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>ClickHouse에는 데이터를 <b>배치(batch)</b>로 모아서 INSERT합니다. 메모리 버퍼(MEMTABLE)도 WAL도 없습니다.</p>
+    <p>INSERT는 정렬·압축을 거쳐 <b>즉시 디스크에 새 "파트(part)"</b>를 만듭니다. 한 번 만들어진 파트는 <b style="color:var(--warn)">절대 수정되지 않습니다(immutable)</b>.</p>
+    <p>INSERT가 반복될 때마다 파트가 하나씩 쌓입니다. 파트가 너무 많아지면 읽기가 비효율적이겠죠?</p>
+    <p>그래서 <b style="color:var(--purple)">백그라운드 머지</b>가 작은 파트들을 큰 파트 하나로 합칩니다. 중복 제거·집계 같은 무거운 작업도 이 시점으로 미룹니다.</p>
+    <p>SELECT는 파트 안의 <b style="color:var(--ok)">희소 인덱스(sparse index)</b>로 조건에 맞는 granule(8,192행 묶음)만 골라 읽고, 나머지는 <b>디스크에서 읽지도 않습니다</b>.</p>
+    <p>"읽지 않는 것이 가장 빠르다" — 이 한 문장이 ClickHouse의 설계 철학입니다. 이제 챕터별로 각 단계를 깊이 들어가 봅시다!</p>
+  </div>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 가이드를 읽는 방법</div>
+    <p>PostgreSQL 같은 행 지향 DB를 써본 경험이 있다면 더 재미있게 읽을 수 있지만, 필수는 아닙니다. 각 챕터는 애니메이션 → 개념 설명 → 실행 가능한 SQL → 퀴즈 순서로 구성되어 있습니다. 챕터 끝의 "완료로 표시" 버튼으로 진도를 관리하세요.</p>
+  </div>
+</div>
+
+<h2 id="group-basic">기초 — ClickHouse라는 세계관</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4><a href="ch01.html">01. ClickHouse 개요 — 왜 빠른가</a></h4>
+    <p>행 저장 vs 열 저장, 벡터화 실행, MergeTree의 설계 철학. 모든 것의 출발점입니다.</p>
+    <p><span class="tag lv-basic">기초</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch02.html">02. 내부 컴포넌트와 쿼리 처리</a></h4>
+    <p>SQL 한 줄이 Parser → Interpreter → Processor 파이프라인을 통과해 결과가 되기까지.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch03.html">03. Context · 스레드 · 동시성</a></h4>
+    <p>설정 6단계 머지, 스레드 풀 계층, CPU slot 기반 동시성 제어. 서버 내부의 교통정리.</p>
+    <p><span class="tag lv-adv">고급</span></p>
+  </div>
+</div>
+
+<h2 id="group-mergetree">MergeTree 핵심 — 스토리지 엔진 해부</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4><a href="ch04.html">04. Table Parts — 파트 구조</a></h4>
+    <p>INSERT가 만드는 immutable 파트의 내부: column.bin, 마크 파일, primary.idx.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch05.html">05. Table Partitions — 파티션</a></h4>
+    <p>PARTITION BY의 진짜 용도는 쿼리 최적화가 아니라 데이터 lifecycle 관리입니다.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch06.html">06. Part Merges — 백그라운드 머지</a></h4>
+    <p>작은 파트들이 큰 파트로 합쳐지는 과정과 merge-time computation의 마법.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch07.html">07. Primary Index — 희소 인덱스</a></h4>
+    <p>수조 행에서도 인덱스가 메모리에 다 올라가는 비밀, granule과 이진 탐색.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+</div>
+
+<h2 id="group-ops">분산과 운영 — 프로덕션으로</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4><a href="ch08.html">08. Shards &amp; Replicas</a></h4>
+    <p>수평 확장과 고가용성. 샤딩·복제 아키텍처와 "자동 리밸런싱 없음"의 의미.</p>
+    <p><span class="tag lv-adv">고급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch09.html">09. INSERT 전략</a></h4>
+    <p>배치 INSERT, async insert, 중복 제거. "Too many parts"를 피하는 실전 기법.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch10.html">10. 안티패턴 모음</a></h4>
+    <p>소량 빈번 INSERT, 과도한 파티셔닝, 잘못된 ORDER BY… 남들이 밟은 지뢰 모음.</p>
+    <p><span class="tag lv-basic">기초</span></p>
+  </div>
+  <div class="card">
+    <h4><a href="ch11.html">11. 모니터링과 트러블슈팅</a></h4>
+    <p>system 테이블로 서버 들여다보기. 장애 상황별 진단 쿼리와 대응 절차.</p>
+    <p><span class="tag lv-mid">중급</span></p>
+  </div>
+</div>
+
+<h2 id="path">추천 학습 경로</h2>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>🚀 빠른 시작 (반나절)</h4>
+    <p>ClickHouse가 처음이라면: <a href="ch01.html">1장</a> → <a href="ch04.html">4장</a> → <a href="ch07.html">7장</a> → <a href="ch09.html">9장</a>. "왜 빠른가"와 "어떻게 넣어야 하는가"만 먼저 잡습니다.</p>
+  </div>
+  <div class="card">
+    <h4>🧠 엔진 이해 코스</h4>
+    <p>내부 구조가 궁금하다면 순서대로 정독: <a href="ch01.html">1장</a> → <a href="ch02.html">2장</a> → <a href="ch03.html">3장</a> → <a href="ch04.html">4장</a>~<a href="ch07.html">7장</a>. MergeTree의 전체 수명주기가 연결됩니다.</p>
+  </div>
+  <div class="card">
+    <h4>🛠 운영자 코스</h4>
+    <p>이미 운영 중이라면: <a href="ch05.html">5장</a> → <a href="ch09.html">9장</a> → <a href="ch10.html">10장</a> → <a href="ch11.html">11장</a>. 파트 폭증·머지 지연 같은 실전 문제 중심입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">📦</span>
+  <div>
+    <div class="callout-title">원문 저장소의 부록 자료</div>
+    <p>이 가이드의 원문 저장소에는 챕터 외에도 실습 자료가 있습니다 —
+    <a href="https://github.com/jaero0725/clickhouse-guide/tree/main/examples" target="_blank" rel="noopener">examples (실습 예제)</a> ·
+    <a href="https://github.com/jaero0725/clickhouse-guide/tree/main/troubleshooting" target="_blank" rel="noopener">troubleshooting (장애 사례)</a> ·
+    <a href="https://github.com/jaero0725/clickhouse-guide/tree/main/cheatsheets" target="_blank" rel="noopener">cheatsheets (치트시트)</a></p>
+  </div>
+</div>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

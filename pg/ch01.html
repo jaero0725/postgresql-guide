@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1장. PostgreSQL 개요와 철학 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch01">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>1장. PostgreSQL 개요와 철학</h1>
+<p class="lead">"가장 앞선 오픈소스 RDBMS"라는 평가는 마케팅이 아니라 30년 설계 결정의 누적입니다. PostgreSQL이 무엇이고, 왜 그렇게 만들어졌는지부터 시작합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-basic">기초</span>
+  <span class="tag">⏱ 약 20분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: SQL 기본 문법</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① PostgreSQL의 정체(ORDBMS)와 Berkeley 기원 ② 세 가지 설계 가치 — 표준 준수·확장성·신뢰성 ③ MySQL·Oracle·ClickHouse와 갈라지는 지점 ④ "선택할 이유" 일곱 가지와 릴리즈 정책</p>
+  </div>
+</div>
+
+<h2 id="s1">1.1 PostgreSQL은 무엇인가 — "객체-관계형"의 의미</h2>
+
+<p>PostgreSQL은 <strong>객체-관계형 데이터베이스 관리 시스템(ORDBMS)</strong>입니다. 그냥 RDBMS가 아니라 앞에 "객체"가 붙는 이유는, 처음부터 <strong>사용자 정의 타입·함수·연산자·인덱스를 일급 시민</strong>으로 다루도록 설계되었기 때문입니다. 쉽게 말해 "DB 엔진이 모르는 데이터도 규칙만 알려주면 저장·검색·인덱싱해 주는" 구조입니다.</p>
+
+<p>역사도 짧지 않습니다.</p>
+<ul>
+  <li><strong>1986년</strong> — UC Berkeley의 Michael Stonebraker가 이끄는 <strong>POSTGRES</strong> 프로젝트로 출발.</li>
+  <li><strong>1994년</strong> — SQL 인터프리터가 추가되어 <strong>Postgres95</strong>로 공개.</li>
+  <li><strong>1996년</strong> — 오픈소스 커뮤니티로 이관되며 지금의 이름 <strong>PostgreSQL</strong>이 됨.</li>
+  <li><strong>2026년 현재</strong> — PostgreSQL <strong>18</strong>(2025-09 릴리스)이 최신 안정 버전, 17도 주요 운영 라인.</li>
+</ul>
+
+<p>Stonebraker의 목표였던 "관계형 모델 + 객체 지향적 확장성"이라는 유산이 오늘날의 <strong>Extension 모델</strong>, <strong>함수형 인덱스</strong>, <strong>사용자 정의 타입</strong>의 뿌리입니다.</p>
+
+<h2 id="s2">1.2 타협 없는 ACID — DDL도 롤백된다</h2>
+
+<p>PostgreSQL은 ACID(원자성·일관성·격리성·내구성)를 완전히 준수합니다. 특히 인상적인 부분은 <strong>DDL(스키마 변경)조차 트랜잭션 안에서 되돌릴 수 있다</strong>는 점입니다. MySQL에서는 DDL이 묵시적 커밋을 일으키기 때문에 불가능한 일이죠. 아래 애니메이션으로 그 차이를 확인해 보세요.</p>
+
+<div class="anim" data-steps="5" data-title="DDL 트랜잭션 — CREATE·ALTER를 통째로 되돌리기" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- 트랜잭션 박스 -->
+      <rect x="30" y="40" width="420" height="240" rx="12" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-dasharray="7 5"/>
+      <text x="46" y="30" class="sv-label" fill="var(--accent)">🧾 트랜잭션 (BEGIN … )</text>
+
+      <!-- step1: BEGIN -->
+      <g data-show="1">
+        <rect x="56" y="62" width="180" height="36" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="146" y="85" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">BEGIN;</text>
+      </g>
+
+      <!-- step2: CREATE TABLE -->
+      <g data-show="2" class="rise">
+        <rect x="56" y="112" width="240" height="36" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="176" y="135" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">CREATE TABLE orders …</text>
+      </g>
+      <g data-show="2-3">
+        <rect x="500" y="100" width="220" height="60" rx="10" class="sv-box"/>
+        <text x="610" y="126" text-anchor="middle" class="sv-label">📦 orders 테이블</text>
+        <text x="610" y="146" text-anchor="middle" class="sv-label-sm">(아직 이 트랜잭션에만 보임)</text>
+      </g>
+
+      <!-- step3: ALTER -->
+      <g data-show="3" class="rise">
+        <rect x="56" y="162" width="290" height="36" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="201" y="185" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">ALTER TABLE … ADD COLUMN</text>
+      </g>
+      <g data-show="3-3">
+        <rect x="500" y="170" width="220" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 18%, transparent)" stroke="var(--ok)"/>
+        <text x="610" y="192" text-anchor="middle" class="sv-label-sm sv-mono">+ created_at 컬럼</text>
+      </g>
+
+      <!-- step4: ROLLBACK -->
+      <g data-show="4">
+        <rect x="56" y="212" width="180" height="36" rx="8" fill="color-mix(in srgb, var(--danger) 14%, transparent)" stroke="var(--danger)"/>
+        <text x="146" y="235" text-anchor="middle" class="sv-label sv-mono" font-size="12.5" fill="var(--danger)">ROLLBACK;</text>
+        <path d="M 240 230 Q 400 250 520 200" stroke="var(--danger)" stroke-width="2" fill="none" stroke-dasharray="5 4" class="flow-line"/>
+      </g>
+      <g data-show="4-4">
+        <text x="610" y="240" text-anchor="middle" class="sv-label" fill="var(--danger)">💨 테이블·컬럼 모두 소멸!</text>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <rect x="480" y="86" width="260" height="130" rx="12" fill="color-mix(in srgb, var(--danger) 6%, transparent)" stroke="var(--danger)" stroke-width="1.4" stroke-dasharray="4 4"/>
+        <text x="610" y="145" text-anchor="middle" class="sv-label" font-size="15">아무 일도 없었다</text>
+        <text x="610" y="168" text-anchor="middle" class="sv-label-sm">CREATE도 ALTER도 흔적 없이 원상 복구</text>
+        <text x="380" y="306" text-anchor="middle" class="sv-label-sm">MySQL이라면? CREATE TABLE 시점에 묵시적 COMMIT — 롤백 불가</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>BEGIN</code>으로 트랜잭션을 엽니다. 지금부터 일어나는 모든 일은 "가계약" 상태입니다.</p>
+    <p><code>CREATE TABLE</code>을 실행합니다. 테이블이 만들어지지만 <b>아직 이 트랜잭션 안에서만 보이는</b> 상태입니다.</p>
+    <p><code>ALTER TABLE</code>로 컬럼도 추가합니다. 스키마 변경(DDL)이 트랜잭션 안에 차곡차곡 쌓입니다.</p>
+    <p>문제가 생겨 <code>ROLLBACK</code>! 데이터 변경뿐 아니라 <b style="color:var(--danger)">CREATE·ALTER까지 전부 되돌아갑니다</b>.</p>
+    <p>결과: 아무 일도 없었던 것처럼 깨끗합니다. 이 성질 덕분에 Flyway·Alembic 같은 마이그레이션 도구가 "실패하면 전부 롤백"이라는 안전한 전략을 쓸 수 있습니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">BEGIN</span>;
+<span class="k">CREATE TABLE</span> orders (id bigserial <span class="k">PRIMARY KEY</span>, amount numeric);
+<span class="k">ALTER TABLE</span> orders <span class="k">ADD COLUMN</span> created_at timestamptz <span class="k">DEFAULT</span> <span class="f">now</span>();
+<span class="c">-- 뭔가 잘못됐다면? ROLLBACK 한 번으로 CREATE까지 전부 되돌림</span>
+<span class="k">ROLLBACK</span>;</code></pre>
+
+<h2 id="s3">1.3 세 가지 설계 가치 — 표준 준수 · 확장성 · 신뢰성</h2>
+
+<p>PostgreSQL 커뮤니티가 공개적으로 내세우는 가치는 세 가지입니다.</p>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>📐 SQL 표준 준수</h4>
+    <p>SQL:2023까지의 주요 기능을 선도적으로 구현. Window Function(8.4부터), CTE·Recursive CTE, LATERAL JOIN, SQL/JSON 경로 표현식 모두 표준을 따릅니다.</p>
+  </div>
+  <div class="card">
+    <h4>🧩 확장성</h4>
+    <p>커널을 고치지 않고 타입·연산자·함수·인덱스 access method를 추가할 수 있는 구조. <code>CREATE EXTENSION</code> 한 줄이 그 정점입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🛡 신뢰성</h4>
+    <p>"데이터는 절대 잃지 않는다." WAL 기반 내구성, fsync·full_page_writes 기본 ON, 체크섬 옵션(<code>initdb -k</code>)까지.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">신뢰성은 공짜가 아닙니다</div>
+    <p>예를 들어 <code>full_page_writes</code>는 WAL 크기를 키우지만, 끄면 정전 시 페이지가 반쯤만 기록되는 torn page 위험이 있습니다. PostgreSQL은 이런 상황에서 <strong>항상 안전한 쪽을 기본값으로</strong> 택합니다.</p>
+  </div>
+</div>
+
+<h3>확장성의 실체 — 3계층 구조</h3>
+
+<p>확장성이 어떻게 동작하는지 애니메이션으로 봅시다. 핵심은 <strong>작고 안정적인 Core 위에, 커널 수정 없이 기능이 얹히는</strong> 그림입니다.</p>
+
+<div class="anim" data-steps="4" data-title="CREATE EXTENSION 한 줄 — Core를 건드리지 않는 기능 확장" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 330">
+      <!-- Core -->
+      <rect x="230" y="220" width="300" height="80" rx="12" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="380" y="252" text-anchor="middle" class="sv-label" font-size="15">🐘 PostgreSQL Core</text>
+      <text x="380" y="274" text-anchor="middle" class="sv-label-sm">Parser · Planner · Executor · Storage(Heap+WAL)</text>
+
+      <!-- step2: extension 설치 -->
+      <g data-show="2">
+        <rect x="60" y="120" width="200" height="44" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="160" y="139" text-anchor="middle" class="sv-label sv-mono" font-size="12">CREATE EXTENSION</text>
+        <text x="160" y="156" text-anchor="middle" class="sv-label sv-mono" font-size="12">pgvector;</text>
+        <path d="M 200 166 Q 240 200 280 218" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- step3: 여러 extension -->
+      <g data-show="3" class="rise">
+        <rect x="290" y="120" width="130" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="355" y="146" text-anchor="middle" class="sv-label-sm">🗺 PostGIS (공간)</text>
+        <rect x="440" y="120" width="150" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="515" y="140" text-anchor="middle" class="sv-label-sm">📊 pg_stat_statements</text>
+        <text x="515" y="155" text-anchor="middle" class="sv-label-sm">(쿼리 통계)</text>
+        <rect x="610" y="120" width="120" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="670" y="146" text-anchor="middle" class="sv-label-sm">⏱ TimescaleDB</text>
+        <path d="M 355 166 L 355 216" class="sv-line" stroke-dasharray="4 4"/>
+        <path d="M 515 166 Q 480 200 450 218" class="sv-line" stroke-dasharray="4 4"/>
+        <path d="M 670 166 Q 600 210 532 232" class="sv-line" stroke-dasharray="4 4"/>
+      </g>
+
+      <!-- step4: 사용자 정의 계층 -->
+      <g data-show="4" class="rise">
+        <rect x="120" y="36" width="520" height="46" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="380" y="56" text-anchor="middle" class="sv-label">🙋 사용자 정의 계층</text>
+        <text x="380" y="74" text-anchor="middle" class="sv-label-sm sv-mono">CREATE TYPE · CREATE FUNCTION(PL/pgSQL·PL/Python) · CREATE OPERATOR</text>
+        <path d="M 380 82 L 380 116" class="sv-line" stroke-dasharray="4 4"/>
+      </g>
+
+      <g data-show="1-1">
+        <text x="380" y="190" text-anchor="middle" class="sv-label-sm">Core는 작고 안정적으로 유지 — 기능은 이 위에 얹는다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>맨 아래에 <b>PostgreSQL Core</b>가 있습니다. 파서·플래너·실행기·스토리지 엔진 — 작고 안정적으로 유지되는 심장부입니다.</p>
+    <p><code>CREATE EXTENSION pgvector;</code> 한 줄로 벡터 검색(AI 임베딩) 기능이 추가됩니다. <b style="color:var(--ok)">커널 코드는 한 줄도 바꾸지 않았습니다.</b></p>
+    <p>같은 방식으로 PostGIS(지리정보), pg_stat_statements(쿼리 통계), TimescaleDB(시계열)… 거대한 생태계가 Core 위에 얹힙니다.</p>
+    <p>맨 위에는 사용자 정의 계층 — <code>CREATE TYPE</code>·<code>CREATE FUNCTION</code>·<code>CREATE OPERATOR</code>로 여러분의 코드도 같은 구조에 참여합니다. 이 3계층이 PostgreSQL 유연성의 정체입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 한 줄씩이 곧 "새 기능 설치"</span>
+<span class="k">CREATE EXTENSION</span> pg_stat_statements;  <span class="c">-- 쿼리 성능 분석</span>
+<span class="k">CREATE EXTENSION</span> pg_trgm;              <span class="c">-- 유사도 검색</span>
+<span class="k">CREATE EXTENSION</span> postgis;              <span class="c">-- 지리정보</span>
+<span class="k">CREATE EXTENSION</span> pgvector;             <span class="c">-- 벡터 임베딩(AI/ML)</span>
+<span class="k">CREATE EXTENSION</span> pgcrypto;             <span class="c">-- 암호화</span></code></pre>
+
+<h2 id="s4">1.4 다른 DB와 어디서 갈라지나</h2>
+
+<p>모든 데이터베이스는 OLTP(단건 트랜잭션) ↔ OLAP(분석) 스펙트럼 위에 놓입니다. PostgreSQL은 <strong>OLTP 중앙에 있으면서 가벼운 분석까지 수용하는 범용(general-purpose)</strong> 포지션입니다. "일단 PostgreSQL로 시작하라"는 업계 격언의 근거죠.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>항목</th><th>PostgreSQL</th><th>MySQL(InnoDB)</th></tr></thead>
+  <tbody>
+    <tr><td>MVCC 구현</td><td><strong>In-heap 다중 버전</strong> (새 버전을 테이블에 append)</td><td><strong>Undo log</strong> (변경 전 이미지를 별도 영역에)</td></tr>
+    <tr><td>UPDATE 비용</td><td>새 버전 생성 → Bloat → VACUUM 필요</td><td>Undo 영역 기록 → 주기적 purge</td></tr>
+    <tr><td>DDL 트랜잭션</td><td><strong>완전 지원</strong></td><td>대부분 묵시적 커밋(8.0 Atomic DDL로 개선)</td></tr>
+    <tr><td>기본 저장 구조</td><td><strong>Heap + B-tree</strong> (모든 인덱스가 대등)</td><td><strong>Clustered index</strong> (PK가 곧 데이터 순서)</td></tr>
+    <tr><td>표준 준수도</td><td>매우 높음</td><td>느슨한 편</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Oracle과 비교하면 라이선스(무료 BSD 유사 vs 상용)와 <strong>RAC(공유 디스크 클러스터)의 부재</strong>가 가장 큰 차이입니다. ClickHouse는 아예 범주가 다릅니다 — 컬럼형 OLAP 전용이라 "둘 중 하나"가 아니라 <strong>서비스는 PostgreSQL, 분석은 ClickHouse</strong>로 둘 다 쓰는 아키텍처가 표준입니다. SQLite는 서버리스 임베디드 DB로 용도 자체가 다릅니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">Heap 구조는 양날의 검</div>
+    <p>PostgreSQL의 모든 인덱스는 대등하게 heap을 참조하므로 secondary index 조회가 MySQL보다 유리합니다. 반면 UPDATE가 새 튜플을 만들기 때문에 <strong>VACUUM 운영(8장)이 필수</strong>가 됩니다. 이 트레이드오프가 3·4·8장의 배경입니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">1.5 PostgreSQL을 선택할 일곱 가지 이유</h2>
+
+<ol>
+  <li><strong>Extension 생태계</strong> — PostGIS, TimescaleDB, pgvector, Citus, pg_trgm…</li>
+  <li><strong>풍부한 기본 타입</strong> — <code>JSONB</code>, <code>UUID</code>, <code>ARRAY</code>, <code>RANGE</code>, <code>INET</code>, <code>TSVECTOR</code> 등이 네이티브.</li>
+  <li><strong>6종 인덱스</strong> — B-tree 외에 Hash·GIN·GiST·SP-GiST·BRIN(5장 상세).</li>
+  <li><strong>강력한 SQL 표현력</strong> — CTE·Recursive·Window·LATERAL.</li>
+  <li><strong>Row-Level Security</strong> — SaaS 멀티테넌시의 표준 패턴.</li>
+  <li><strong>함수형·부분 인덱스</strong> — 인덱스를 "조건부·표현식 기반"으로.</li>
+  <li><strong>다중 프로시저 언어</strong> — PL/pgSQL, PL/Python, C 함수까지.</li>
+</ol>
+
+<pre><code><span class="c">-- (5) RLS: 쿼리마다 WHERE tenant_id를 안 붙여도 격리가 강제된다</span>
+<span class="k">ALTER TABLE</span> orders <span class="k">ENABLE ROW LEVEL SECURITY</span>;
+<span class="k">CREATE POLICY</span> tenant_isolation <span class="k">ON</span> orders
+    <span class="k">USING</span> (tenant_id = <span class="f">current_setting</span>(<span class="s">'app.current_tenant'</span>)::int);
+
+<span class="c">-- (6) 부분 인덱스: "활성 사용자만" 인덱싱 → 크기·쓰기 비용 절감</span>
+<span class="k">CREATE INDEX</span> idx_active_users <span class="k">ON</span> users (created_at)
+    <span class="k">WHERE</span> status = <span class="s">'active'</span>;</code></pre>
+
+<h2 id="s6">1.6 버전과 릴리즈 정책 — 예측 가능한 1년 주기</h2>
+
+<ul>
+  <li><strong>메이저 버전</strong>: 매년 9~10월 출시 (예: 16 → 17 → 18).</li>
+  <li><strong>지원 기간</strong>: 각 메이저 버전은 최초 릴리즈 후 <strong>5년</strong> 지원, 이후 EOL.</li>
+  <li><strong>마이너 버전</strong>: 분기별 버그·보안 수정. <strong>재시작만 필요</strong>, dump/restore 불필요.</li>
+  <li><strong>메이저 업그레이드</strong>: <code>pg_upgrade</code>로 in-place, 또는 logical replication으로 무중단.</li>
+</ul>
+
+<div class="callout tip">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">운영 원칙</div>
+    <p>프로덕션에는 <strong>최신 메이저에서 하나 뒤</strong>(예: 18 출시 시 17)를 쓰는 편이 보수적입니다. 단, <strong>마이너 버전은 항상 최신</strong>으로 유지하세요 — 보안 패치 누락은 금물입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">PostgreSQL에서 <code>BEGIN; CREATE TABLE t (...); ROLLBACK;</code>을 실행하면 어떻게 될까요?</div>
+  <div class="quiz-opts">
+    <button type="button">CREATE TABLE은 DDL이므로 즉시 커밋되어 테이블이 남는다</button>
+    <button type="button" data-correct>테이블 생성까지 전부 롤백되어 아무 흔적도 남지 않는다</button>
+    <button type="button">에러가 발생한다 — DDL은 트랜잭션 안에서 실행할 수 없다</button>
+    <button type="button">테이블은 남지만 빈 상태로 초기화된다</button>
+  </div>
+  <div class="quiz-expl">✅ PostgreSQL은 DDL도 트랜잭션에 포함되므로 ROLLBACK 시 CREATE TABLE까지 전부 되돌아갑니다. MySQL이라면 CREATE TABLE 시점에 묵시적 커밋이 발생해 테이블이 남습니다. 이 차이가 마이그레이션 도구의 안전성을 좌우합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">PostgreSQL의 확장성(Extensibility) 모델에 대한 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">새 기능을 추가하려면 커널 소스를 수정해 재컴파일해야 한다</button>
+    <button type="button">Extension은 읽기 전용 기능만 추가할 수 있다</button>
+    <button type="button" data-correct>Core를 수정하지 않고 타입·연산자·인덱스 방식까지 외부 모듈로 추가할 수 있다</button>
+  </div>
+  <div class="quiz-expl">✅ Core / Extension / 사용자 정의의 3계층 구조 덕분에 <code>CREATE EXTENSION</code> 한 줄로 PostGIS(공간 타입+인덱스), pgvector(벡터 타입+인덱스) 같은 깊은 수준의 기능이 추가됩니다. 이것이 Berkeley POSTGRES 시절부터 이어진 "객체-관계형" 설계의 유산입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch01_postgresql_overview.md" target="_blank" rel="noopener">chapters/ch01_postgresql_overview.md</a> — SQL 표준 준수 세부 항목, MySQL·Oracle·SQLite 비교표 전체, 릴리즈 정책 상세가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html"><span class="dir">← 이전</span><br><span class="title">학습 홈</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch02.html"><span class="dir">다음 →</span><br><span class="title">2장. 아키텍처 — 프로세스와 메모리</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

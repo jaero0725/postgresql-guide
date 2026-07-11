@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2장. 아키텍처 — 프로세스와 메모리 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch02">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>2장. 아키텍처 — 프로세스와 메모리</h1>
+<p class="lead">PostgreSQL은 스레드가 아니라 프로세스로 일합니다. 접속 하나에 프로세스 하나 — 이 40년째 유지되는 결정이 왜 내려졌고, 서버 안에서 쿼리가 어떤 길을 걷는지 해부합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-basic">기초</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 1장 개요</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① postmaster와 backend — fork 기반 프로세스 모델 ② shared buffers를 중심으로 한 공유 메모리 구성 ③ 쿼리가 처리되는 4단계(Parse→Rewrite→Plan→Execute) ④ 커넥션 풀링이 필수인 이유와 PGDATA·설정 계층</p>
+  </div>
+</div>
+
+<h2 id="s1">2.1 프로세스 모델 — postmaster는 감독관이다</h2>
+
+<p>MySQL·Oracle이 스레드 기반인 것과 달리, PostgreSQL은 <strong>프로세스 기반 멀티태스킹 DBMS</strong>입니다. 서버를 시작(<code>pg_ctl start</code>)하면 <strong>postmaster</strong>라는 최상위 프로세스가 뜹니다. postmaster의 역할은 단 하나 — <strong>감독관(supervisor)</strong>. 쿼리는 직접 처리하지 않고, 접속 요청이 오면 자식 프로세스(backend)를 <code>fork()</code>하고, 자식이 죽으면 뒷수습을 합니다.</p>
+
+<div class="anim" data-steps="5" data-title="postmaster의 fork — 접속 하나, 프로세스 하나" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 350">
+      <!-- postmaster -->
+      <rect x="290" y="24" width="180" height="52" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="380" y="46" text-anchor="middle" class="sv-label">👮 postmaster</text>
+      <text x="380" y="64" text-anchor="middle" class="sv-label-sm">5432 포트 감시 중</text>
+
+      <!-- 백그라운드 프로세스 (step1) -->
+      <g data-show="1">
+        <rect x="560" y="110" width="180" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="650" y="100" text-anchor="middle" class="sv-label-sm">백그라운드 프로세스들</text>
+        <rect x="574" y="122" width="152" height="24" rx="6" class="sv-box"/>
+        <text x="650" y="139" text-anchor="middle" class="sv-label-sm sv-mono">checkpointer</text>
+        <rect x="574" y="152" width="152" height="24" rx="6" class="sv-box"/>
+        <text x="650" y="169" text-anchor="middle" class="sv-label-sm sv-mono">background writer</text>
+        <rect x="574" y="182" width="152" height="24" rx="6" class="sv-box"/>
+        <text x="650" y="199" text-anchor="middle" class="sv-label-sm sv-mono">walwriter</text>
+        <rect x="574" y="212" width="152" height="24" rx="6" class="sv-box"/>
+        <text x="650" y="229" text-anchor="middle" class="sv-label-sm sv-mono">autovacuum launcher</text>
+        <path d="M 472 60 Q 560 70 610 106" class="sv-line" stroke-dasharray="4 4"/>
+      </g>
+
+      <!-- client A + fork (step2) -->
+      <g data-show="2">
+        <rect x="30" y="110" width="110" height="42" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="85" y="136" text-anchor="middle" class="sv-label-sm">💻 클라이언트 A</text>
+        <path d="M 142 126 Q 220 100 288 62" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="180" y="180" width="130" height="46" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="245" y="200" text-anchor="middle" class="sv-label-sm">⚙️ backend A</text>
+        <text x="245" y="216" text-anchor="middle" class="sv-label-sm sv-mono">약 5~10MB</text>
+        <path d="M 330 80 Q 280 130 255 176" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="300" y="130" class="sv-label-sm" fill="var(--accent)">fork()</text>
+      </g>
+
+      <!-- client B + fork (step3) -->
+      <g data-show="3" class="rise">
+        <rect x="30" y="180" width="110" height="42" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)"/>
+        <text x="85" y="206" text-anchor="middle" class="sv-label-sm">💻 클라이언트 B</text>
+        <rect x="350" y="180" width="130" height="46" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="415" y="200" text-anchor="middle" class="sv-label-sm">⚙️ backend B</text>
+        <text x="415" y="216" text-anchor="middle" class="sv-label-sm sv-mono">별도 프로세스</text>
+        <path d="M 400 80 Q 415 130 415 176" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="428" y="130" class="sv-label-sm" fill="var(--accent)">fork()</text>
+      </g>
+
+      <!-- crash (step4) -->
+      <g data-show="4">
+        <text x="245" y="256" text-anchor="middle" class="sv-label" font-size="17" fill="var(--danger)">💥 backend A 크래시!</text>
+        <rect x="180" y="180" width="130" height="46" rx="9" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8" stroke-dasharray="5 4"/>
+      </g>
+      <g data-show="4-4">
+        <text x="415" y="256" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">B는 멀쩡 ✓ (프로세스 격리)</text>
+      </g>
+
+      <!-- conclusion (step5) -->
+      <g data-show="5">
+        <rect x="120" y="284" width="520" height="48" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="380" y="304" text-anchor="middle" class="sv-label">🛡 크래시 격리: 한 연결의 죽음이 다른 연결을 해치지 않는다</text>
+        <text x="380" y="322" text-anchor="middle" class="sv-label-sm">postmaster가 공유 메모리 오염 여부를 판단, 필요 시에만 전체 재시작</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>서버 시작. postmaster가 5432 포트를 감시하고, <b>checkpointer·background writer·walwriter·autovacuum launcher</b> 같은 백그라운드 일꾼들을 거느립니다.</p>
+    <p>클라이언트 A가 접속하면 postmaster가 <code>fork()</code>로 <b style="color:var(--ok)">backend A</b>를 만듭니다. 이후 A와 backend A는 직접 통신 — postmaster는 손을 뗍니다. 프로세스 하나당 약 5~10MB 메모리를 씁니다.</p>
+    <p>클라이언트 B가 오면 또 하나의 backend. <b>연결 1개 = 프로세스 1개</b>, 이것이 PostgreSQL의 규칙입니다.</p>
+    <p>backend A가 SIGSEGV로 죽어도 <b style="color:var(--ok)">backend B는 멀쩡</b>합니다. 스레드 모델이었다면 한 스레드의 메모리 오염이 서버 전체를 흔들었을 것입니다.</p>
+    <p>이것이 "왜 프로세스인가"의 답 — <b>크래시 격리</b>입니다. 안정성(격리) vs 성능(컨텍스트 스위치)의 트레이드오프에서 PostgreSQL은 안정성을 택했습니다.</p>
+  </div>
+</div>
+
+<p>실제 서버에서 <code>ps</code>로 보면 이 구조가 그대로 보입니다.</p>
+
+<pre><code><span class="c">$ ps -ef | grep postgres</span>
+postgres  1001    1  ... /usr/pgsql-17/bin/postgres -D /var/lib/pgsql/data  <span class="c">← postmaster</span>
+postgres  1005 1001  ... postgres: checkpointer
+postgres  1006 1001  ... postgres: background writer
+postgres  1007 1001  ... postgres: walwriter
+postgres  1008 1001  ... postgres: autovacuum launcher
+postgres  2001 1001  ... postgres: myuser mydb 10.0.0.5(54321) idle  <span class="c">← backend</span></code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>보조 프로세스</th><th>역할</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Checkpointer</strong></td><td>주기적으로 shared buffers의 dirty page를 디스크에 반영(체크포인트, 9장)</td></tr>
+    <tr><td><strong>Background Writer</strong></td><td>오래된 dirty page를 선제적으로 디스크에 기록</td></tr>
+    <tr><td><strong>WAL Writer</strong></td><td>WAL buffer를 <code>pg_wal/</code>로 flush (COMMIT 시엔 backend가 직접 fsync)</td></tr>
+    <tr><td><strong>Autovacuum Launcher/Worker</strong></td><td>dead tuple이 쌓인 테이블을 찾아 VACUUM·ANALYZE 수행(8장)</td></tr>
+    <tr><td><strong>Archiver</strong></td><td><code>archive_mode=on</code>일 때 WAL 세그먼트를 외부로 복사</td></tr>
+    <tr><td><strong>WAL Sender / Receiver</strong></td><td>스트리밍 복제의 발신·수신측(10장)</td></tr>
+    <tr><td><strong>Parallel Worker</strong></td><td>병렬 쿼리 실행 시 동적으로 생성</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s2">2.2 Shared Memory — 모두가 공유하는 작업대</h2>
+
+<p>프로세스는 서로 메모리를 공유하지 않는 게 원칙이지만, DB는 모든 backend가 <strong>같은 데이터 페이지·같은 트랜잭션 상태</strong>를 봐야 합니다. 그래서 시작 시 <strong>공유 메모리(shared memory)</strong> 영역을 만들어 모두가 붙습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>영역</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td><code>shared_buffers</code></td><td><strong>8KB 디스크 페이지의 캐시.</strong> 기본 128MB, 프로덕션은 물리 RAM의 20~25%가 출발점</td></tr>
+    <tr><td>WAL Buffers</td><td>COMMIT 전 WAL 레코드의 임시 저장소. 기본 <code>shared_buffers/32</code>, 최대 16MB</td></tr>
+    <tr><td>CLOG (pg_xact)</td><td>모든 트랜잭션 ID의 커밋 상태를 비트 2개로 저장 — MVCC 가시성 판단의 필수 경로(3장)</td></tr>
+    <tr><td>Lock Table</td><td>테이블 락 등 heavy-weight lock의 해시 테이블(7장)</td></tr>
+    <tr><td>ProcArray</td><td><strong>지금 살아 있는 트랜잭션 XID 목록.</strong> 스냅샷을 뜰 때마다 스캔</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>이 중 주인공은 단연 <code>shared_buffers</code>입니다. 쿼리가 이 캐시를 어떻게 통과하는지 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="쿼리가 shared buffers를 통과하는 흐름 — 읽기와 쓰기" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 330">
+      <!-- backend -->
+      <rect x="30" y="120" width="130" height="56" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+      <text x="95" y="144" text-anchor="middle" class="sv-label">⚙️ backend</text>
+      <text x="95" y="162" text-anchor="middle" class="sv-label-sm sv-mono">SELECT / UPDATE</text>
+
+      <!-- shared buffers -->
+      <rect x="260" y="70" width="240" height="180" rx="12" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="380" y="94" text-anchor="middle" class="sv-label">🧠 shared buffers</text>
+      <!-- 버퍼 슬롯 -->
+      <rect x="280" y="110" width="90" height="34" rx="6" class="sv-box"/>
+      <text x="325" y="132" text-anchor="middle" class="sv-label-sm sv-mono">page 3</text>
+      <rect x="390" y="110" width="90" height="34" rx="6" class="sv-box"/>
+      <text x="435" y="132" text-anchor="middle" class="sv-label-sm sv-mono">page 12</text>
+      <g data-show="2">
+        <rect x="280" y="156" width="90" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="325" y="178" text-anchor="middle" class="sv-label-sm sv-mono">page 7 ✨</text>
+      </g>
+      <g data-show="3">
+        <rect x="280" y="156" width="90" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)" stroke-width="1.8" class="blink"/>
+        <text x="325" y="204" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">dirty!</text>
+      </g>
+
+      <!-- 디스크 -->
+      <rect x="600" y="110" width="130" height="90" rx="10" class="sv-box"/>
+      <text x="665" y="140" text-anchor="middle" class="sv-label">💾 디스크</text>
+      <text x="665" y="160" text-anchor="middle" class="sv-label-sm sv-mono">base/… heap</text>
+      <text x="665" y="178" text-anchor="middle" class="sv-label-sm sv-mono">pg_wal/</text>
+
+      <!-- step1: 요청 + miss -->
+      <g data-show="1">
+        <path d="M 162 148 L 256 148" class="sv-arrow flow-line"/>
+        <text x="168" y="112" class="sv-label-sm" fill="var(--accent)">① page 7 주세요</text>
+      </g>
+      <g data-show="1-1">
+        <text x="380" y="278" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">② 캐시에 없음 (cache miss)</text>
+      </g>
+
+      <!-- step2: 디스크 로드 -->
+      <g data-show="2">
+        <path d="M 598 176 Q 480 210 374 184" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="470" y="222" class="sv-label-sm" fill="var(--accent)">③ 디스크에서 로드</text>
+      </g>
+
+      <!-- step3: update + WAL -->
+      <g data-show="3">
+        <path d="M 162 148 Q 210 170 276 172" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="120" y="210" class="sv-label-sm" fill="var(--warn)">④ UPDATE는 버퍼에서 수정</text>
+        <path d="M 380 252 Q 500 280 640 202" stroke="var(--danger)" stroke-width="2" fill="none" stroke-dasharray="5 4" class="flow-line"/>
+        <text x="430" y="288" class="sv-label-sm" fill="var(--danger)">⑤ WAL 레코드 먼저 기록 (9장)</text>
+      </g>
+
+      <!-- step4: flush -->
+      <g data-show="4">
+        <path d="M 502 140 L 596 140" stroke="var(--purple)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="500" y="120" class="sv-label-sm" fill="var(--purple)">⑥ checkpointer가 나중에 flush</text>
+      </g>
+
+      <!-- step5: hit -->
+      <g data-show="5">
+        <text x="325" y="60" text-anchor="middle" class="sv-label" fill="var(--ok)" font-size="14">⑦ 다음 조회는 캐시 히트 — 디스크 I/O 없음 🎉</text>
+        <rect x="280" y="156" width="90" height="34" rx="6" fill="color-mix(in srgb, var(--ok) 20%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>backend가 page 7이 필요합니다. 무조건 디스크로 가는 게 아니라 <b style="color:var(--purple)">shared buffers부터</b> 확인합니다. 지금은 없네요 — cache miss.</p>
+    <p>디스크에서 8KB 페이지를 읽어 버퍼의 빈 슬롯에 올립니다. 이제 page 7은 모든 backend가 공유하는 캐시에 있습니다.</p>
+    <p>UPDATE도 <b>디스크가 아니라 버퍼 안의 페이지를 수정</b>합니다. 수정된 페이지는 <b style="color:var(--warn)">dirty</b> 상태가 되고, 변경 내역은 먼저 WAL에 기록됩니다(Write-Ahead!).</p>
+    <p>dirty page는 즉시 디스크에 안 씁니다. <b style="color:var(--purple)">checkpointer·background writer</b>가 나중에 모아서 효율적으로 flush합니다.</p>
+    <p>같은 페이지를 다시 조회하면? 캐시 히트 — 디스크 I/O 없이 즉시 응답. 이 캐시 적중률이 PostgreSQL 성능의 뼈대입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">shared_buffers는 왜 RAM의 25%인가</div>
+    <p>PostgreSQL은 OS 페이지 캐시 위에 자체 캐시를 하나 더 두는 이중 구조입니다. shared_buffers를 너무 키우면 같은 페이지가 두 캐시에 중복 저장되는 낭비가 커지므로, <strong>20~25%에서 시작해 워크로드로 검증</strong>하는 것이 통설입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">2.3 쿼리의 4단계 — Parse → Rewrite → Plan → Execute</h2>
+
+<p>backend 안에서 SELECT 한 문장은 네 단계를 거칩니다. (이 파이프라인의 애니메이션은 <a href="ch06.html">6장</a>에서 자세히 다룹니다.)</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>단계</th><th>하는 일</th><th>산출물</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Parse</strong></td><td>Lexer+Parser(yacc)가 문자열을 분석. 문법 오류는 여기서 검출</td><td>Parse Tree</td></tr>
+    <tr><td><strong>Rewrite</strong></td><td>Rule System이 View를 기반 테이블 쿼리로 치환</td><td>Query Tree</td></tr>
+    <tr><td><strong>Plan</strong></td><td>통계 기반으로 Seq Scan/Index Scan, 조인 순서·방식을 비용 비교로 결정</td><td>Plan Tree</td></tr>
+    <tr><td><strong>Execute</strong></td><td>Volcano(iterator) 모델 — 노드가 튜플을 하나씩 위로 올림</td><td>결과 튜플</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- Rewrite 단계의 실체: 뷰는 "펼쳐진다"</span>
+<span class="k">CREATE VIEW</span> active_users <span class="k">AS</span> <span class="k">SELECT</span> * <span class="k">FROM</span> users <span class="k">WHERE</span> status = <span class="s">'active'</span>;
+
+<span class="k">SELECT</span> id <span class="k">FROM</span> active_users <span class="k">WHERE</span> country = <span class="s">'KR'</span>;
+<span class="c">-- Rewriter가 아래로 치환한 뒤 Planner에게 전달:</span>
+<span class="c">-- SELECT id FROM users WHERE status = 'active' AND country = 'KR';</span></code></pre>
+
+<h2 id="s4">2.4 커넥션 풀링 — "연결 = 프로세스"의 청구서</h2>
+
+<p>연결 하나가 프로세스 하나라는 구조는 <strong>연결 급증을 허용하지 않습니다</strong>. 10,000 커넥션 = 10,000 프로세스 = 수십 GB 메모리에, ProcArray·Lock 스캔까지 급격히 나빠집니다. 커뮤니티 합의는 명확합니다 — <strong><code>max_connections</code>는 200~500 수준으로 두고, 그 앞에 pooler(pgBouncer 등)를 세운다.</strong></p>
+
+<div class="anim" data-steps="4" data-title="pgBouncer — 수천 클라이언트가 20개 backend를 나눠 쓰는 법" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 300">
+      <!-- 클라이언트 무리 -->
+      <g>
+        <rect x="30" y="60" width="120" height="30" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="80" text-anchor="middle" class="sv-label-sm">앱 서버 #1</text>
+        <rect x="30" y="100" width="120" height="30" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="120" text-anchor="middle" class="sv-label-sm">앱 서버 #2</text>
+        <rect x="30" y="140" width="120" height="30" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="160" text-anchor="middle" class="sv-label-sm">앱 서버 #3</text>
+        <text x="90" y="196" text-anchor="middle" class="sv-label-sm">… 클라이언트 3,000개</text>
+      </g>
+
+      <!-- step1: 직접 연결의 재앙 -->
+      <g data-show="1-1">
+        <path d="M 152 75 L 560 100" stroke="var(--danger)" stroke-width="1.6" fill="none"/>
+        <path d="M 152 115 L 560 130" stroke="var(--danger)" stroke-width="1.6" fill="none"/>
+        <path d="M 152 155 L 560 160" stroke="var(--danger)" stroke-width="1.6" fill="none"/>
+        <text x="340" y="60" text-anchor="middle" class="sv-label" fill="var(--danger)">😱 직접 연결: 프로세스 3,000개 = 수십 GB</text>
+      </g>
+
+      <!-- pgBouncer (step2~) -->
+      <g data-show="2">
+        <rect x="300" y="100" width="150" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="375" y="128" text-anchor="middle" class="sv-label">🚦 pgBouncer</text>
+        <text x="375" y="148" text-anchor="middle" class="sv-label-sm">transaction 모드</text>
+        <path d="M 152 75 Q 230 90 296 116" class="sv-arrow flow-line"/>
+        <path d="M 152 115 L 296 130" class="sv-arrow flow-line"/>
+        <path d="M 152 155 Q 230 160 296 148" class="sv-arrow flow-line"/>
+      </g>
+
+      <!-- PG backends -->
+      <g data-show="3">
+        <rect x="560" y="70" width="170" height="150" rx="10" fill="none" stroke="var(--border)" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="645" y="60" text-anchor="middle" class="sv-label-sm">PostgreSQL</text>
+        <rect x="576" y="86" width="138" height="26" rx="6" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="645" y="104" text-anchor="middle" class="sv-label-sm sv-mono">backend 1</text>
+        <rect x="576" y="120" width="138" height="26" rx="6" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="645" y="138" text-anchor="middle" class="sv-label-sm sv-mono">backend 2</text>
+        <rect x="576" y="154" width="138" height="26" rx="6" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="645" y="172" text-anchor="middle" class="sv-label-sm sv-mono">backend 3</text>
+        <text x="645" y="204" text-anchor="middle" class="sv-label-sm sv-mono">… 총 20개</text>
+        <path d="M 452 120 L 572 100" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 452 135 L 572 133" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 452 150 L 572 166" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="505" y="90" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">트랜잭션 끝나면 즉시 반납</text>
+      </g>
+
+      <!-- 결론 -->
+      <g data-show="4">
+        <rect x="100" y="234" width="560" height="48" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="380" y="254" text-anchor="middle" class="sv-label">클라이언트 3,000 : backend 20 — 메모리는 1/150, 처리량은 유지</text>
+        <text x="380" y="272" text-anchor="middle" class="sv-label-sm">주의: transaction 모드에선 SET·LISTEN/NOTIFY·명시적 PREPARE 같은 세션 상태가 깨질 수 있음</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트 3,000개가 DB에 <b style="color:var(--danger)">직접</b> 붙으면? backend 프로세스 3,000개, 수십 GB 메모리, 그리고 스냅샷 계산까지 느려지는 재앙입니다.</p>
+    <p>중간에 <b style="color:var(--warn)">pgBouncer</b>를 세웁니다. 클라이언트는 모두 pgBouncer에 접속하고, pgBouncer는 뒤로 소수의 실제 연결만 유지합니다.</p>
+    <p><b>transaction 모드</b>의 핵심: 트랜잭션이 끝나는 순간 backend를 회수해 다음 클라이언트에게 빌려줍니다. 20개의 backend로 3,000 클라이언트를 감당할 수 있는 이유입니다.</p>
+    <p>결과: 메모리 절약 + 안정적인 동시성. 단, backend가 계속 바뀌므로 <code>SET</code> 같은 세션 상태에 의존하는 코드는 주의해야 합니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>pgBouncer 모드</th><th>backend 재할당 단위</th><th>비고</th></tr></thead>
+  <tbody>
+    <tr><td>session</td><td>세션 종료 시</td><td>풀 효과 미미</td></tr>
+    <tr><td><strong>transaction</strong></td><td>트랜잭션 종료 시</td><td><strong>권장.</strong> 세션 변수·prepared statement 제약 주의</td></tr>
+    <tr><td>statement</td><td>쿼리 하나마다</td><td>멀티 문장 트랜잭션 불가, 거의 안 씀</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s5">2.5 PGDATA — 데이터 디렉터리 지도</h2>
+
+<p><code>initdb</code>가 만드는 데이터 디렉터리(<code>$PGDATA</code>)의 핵심 구조입니다. 장애 대응 때 "어디에 뭐가 있는지"를 알면 절반은 이긴 겁니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>경로</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td><code>base/&lt;db_oid&gt;/&lt;filenode&gt;</code></td><td><strong>테이블·인덱스 본체.</strong> 1GB 단위로 분할(<code>.1</code>, <code>.2</code>…)</td></tr>
+    <tr><td><code>base/…/_fsm</code>, <code>_vm</code></td><td>Free Space Map · Visibility Map (4장)</td></tr>
+    <tr><td><code>global/</code></td><td><code>pg_database</code>, <code>pg_authid</code> 등 클러스터 공통 카탈로그</td></tr>
+    <tr><td><code>pg_wal/</code></td><td>WAL 세그먼트(기본 16MB/파일)</td></tr>
+    <tr><td><code>pg_xact/</code></td><td>CLOG — 트랜잭션 커밋 상태 비트맵</td></tr>
+    <tr><td><code>postgresql.conf</code> / <code>postgresql.auto.conf</code></td><td>메인 설정 / <code>ALTER SYSTEM</code>이 기록하는 오버라이드(<strong>conf보다 우선</strong>)</td></tr>
+    <tr><td><code>pg_hba.conf</code></td><td>접속 인증 규칙(어느 IP·사용자·DB가 어떤 방식으로)</td></tr>
+    <tr><td><code>postmaster.pid</code></td><td>실행 중인 postmaster의 PID·포트</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 특정 테이블의 실제 파일 경로 찾기</span>
+<span class="k">SELECT</span> <span class="f">pg_relation_filepath</span>(<span class="s">'orders'</span>);
+<span class="c">-- base/16384/24576</span></code></pre>
+
+<h2 id="s6">2.6 설정 계층 — 같은 파라미터, 다른 우선순위</h2>
+
+<p>동일 파라미터가 여러 곳에서 지정될 수 있고, 우선순위는 명확합니다: <strong>SET(세션) &gt; ALTER ROLE … SET &gt; ALTER DATABASE … SET &gt; postgresql.auto.conf &gt; postgresql.conf</strong>.</p>
+
+<pre><code><span class="c">-- 현재 세션만</span>
+<span class="k">SET</span> work_mem = <span class="s">'256MB'</span>;
+
+<span class="c">-- 특정 사용자 접속 시 항상 적용</span>
+<span class="k">ALTER ROLE</span> analyst <span class="k">SET</span> work_mem = <span class="s">'512MB'</span>;
+
+<span class="c">-- 서버 전역 (postgresql.auto.conf에 기록)</span>
+<span class="k">ALTER SYSTEM SET</span> shared_buffers = <span class="s">'4GB'</span>;
+<span class="k">SELECT</span> <span class="f">pg_reload_conf</span>();
+
+<span class="c">-- 재시작이 필요한지 reload로 충분한지 확인</span>
+<span class="k">SELECT</span> name, setting, context <span class="k">FROM</span> pg_settings
+<span class="k">WHERE</span> name <span class="k">IN</span> (<span class="s">'shared_buffers'</span>, <span class="s">'work_mem'</span>);
+<span class="c">--  shared_buffers | context = postmaster ← 재시작 필요</span>
+<span class="c">--  work_mem       | context = user       ← SET으로도 가능</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">postgresql.conf를 고쳤는데 안 바뀌어요?</div>
+    <p><code>ALTER SYSTEM</code>으로 기록된 <code>postgresql.auto.conf</code>가 <strong>postgresql.conf를 덮어씁니다</strong>. 설정이 안 먹을 때 가장 먼저 auto.conf를 확인하세요. <code>pg_settings</code>의 <code>source</code> 컬럼이 어느 파일에서 온 값인지 알려줍니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">PostgreSQL이 스레드 대신 프로세스 모델을 유지하는 가장 큰 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">프로세스가 스레드보다 컨텍스트 스위치가 빠르기 때문</button>
+    <button type="button" data-correct>한 연결의 크래시·메모리 오염이 다른 연결로 번지지 않는 격리성 때문</button>
+    <button type="button">스레드는 공유 메모리를 사용할 수 없기 때문</button>
+    <button type="button">프로세스가 메모리를 더 적게 사용하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 핵심은 <strong>크래시 격리</strong>입니다. backend 하나가 SIGSEGV로 죽어도 다른 연결은 살아남습니다. 대가는 연결당 5~10MB의 메모리와 fork 비용 — 그래서 pgBouncer 같은 커넥션 풀러가 사실상 필수가 됩니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">UPDATE가 실행되었을 때 변경된 페이지가 디스크에 반영되는 시점은?</div>
+  <div class="quiz-opts">
+    <button type="button">UPDATE 문이 실행되는 즉시 heap 파일에 기록된다</button>
+    <button type="button">COMMIT 순간 heap 파일에 기록된다</button>
+    <button type="button" data-correct>버퍼에서 dirty 상태로 있다가 checkpointer/bgwriter가 나중에 기록한다 (WAL은 먼저 기록)</button>
+  </div>
+  <div class="quiz-expl">✅ 데이터 페이지는 shared buffers 안에서 수정되어 dirty 상태로 머물고, 디스크 반영은 checkpointer·background writer의 몫입니다. 대신 변경 내역은 <strong>WAL에 먼저</strong> 기록·fsync되므로(9장) 크래시가 나도 커밋된 데이터는 잃지 않습니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch02_architecture.md" target="_blank" rel="noopener">chapters/ch02_architecture.md</a> — CLOG·SUBTRANS·MultiXact 등 SLRU 구조, PGDATA 전체 트리, 설정 context 표가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch01.html"><span class="dir">← 이전</span><br><span class="title">1장. PostgreSQL 개요와 철학</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch03.html"><span class="dir">다음 →</span><br><span class="title">3장. MVCC — 동시성의 비밀</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

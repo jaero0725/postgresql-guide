@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9장. 인덱싱 전략 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch09">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>9장. 인덱싱 전략 — 처리량과 내구성의 설계</h1>
+<p class="lead">색인은 "문서를 저장한다"가 아닙니다. segment 생성, refresh, translog, merge가 맞물려 도는 기계이며 — 잘못 돌리면 처리량 붕괴와 검색 지연 폭주로 직결됩니다. 8.x/9.x 기준의 내부 동작과 운영 정석을 그림으로 잡습니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 32분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 3장 Lucene · 4장 샤드</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Bulk API — 왜 단건 색인은 처리량이 1/100인가 ② refresh와 translog — NRT 검색과 내구성의 내부 파이프라인 ③ ILM과 rollover — 시계열 인덱스를 자동으로 자르고 옮기는 법 ④ hot-warm-cold 티어와 force merge의 원칙</p>
+  </div>
+</div>
+
+<h2 id="s1">9.1 단건 vs Bulk — 요청당 오버헤드는 같다</h2>
+
+<p>단건 색인 요청 하나에도 HTTP 라운드트립, primary 샤드 라우팅, replica 복제 대기, translog fsync가 <em>전부</em> 발생합니다. 핵심은 이것입니다: <strong>1건을 쓰든 1,000건을 쓰든 요청당 라우팅·acking 오버헤드는 거의 동일합니다.</strong> 그래서 단건 색인의 처리량은 bulk 대비 1/100 이하로 떨어집니다.</p>
+
+<pre><code><span class="k">POST</span> /_bulk
+{ <span class="s">"index"</span> : { <span class="s">"_index"</span> : <span class="s">"logs"</span>, <span class="s">"_id"</span> : <span class="s">"1"</span> } }
+{ <span class="s">"field1"</span> : <span class="s">"value1"</span> }
+{ <span class="s">"create"</span> : { <span class="s">"_index"</span> : <span class="s">"logs"</span>, <span class="s">"_id"</span> : <span class="s">"2"</span> } }
+{ <span class="s">"field1"</span> : <span class="s">"value2"</span> }
+{ <span class="s">"delete"</span> : { <span class="s">"_index"</span> : <span class="s">"logs"</span>, <span class="s">"_id"</span> : <span class="s">"3"</span> } }
+<span class="c">// NDJSON 포맷: 액션 줄 + 문서 줄(delete는 액션만). 마지막 줄 끝에도 개행 필수</span></code></pre>
+
+<ul>
+  <li><strong>권장 페이로드: 5~15 MiB</strong> (공식 권장 시작점). 문서 수로는 보통 1,000~10,000건</li>
+  <li>너무 작으면 오버헤드 비율↑, 너무 크면(&gt;20MiB) coordinating node 메모리 압박·GC 유발</li>
+  <li>클라이언트 배칭은 <strong>크기(10MiB) / 건수(1000) / 시간(1s) 셋 중 하나라도 차면 flush</strong> — 자바 <code>BulkProcessor</code>/<code>BulkIngester</code>의 표준 패턴</li>
+</ul>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">Bulk 응답의 status 200을 믿지 마라</div>
+    <p>Bulk 응답은 <strong>항목별로 성공/실패가 섞여</strong> 옵니다. <code>"errors": true</code>면 반드시 항목을 순회해서 429(<code>es_rejected_execution_exception</code>)·503은 exponential backoff로 재시도하세요. 전체 status 200만 보고 안심하면 데이터 유실로 직결됩니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">9.2 색인의 내부 파이프라인 — refresh와 translog</h2>
+
+<p>"색인했는데 왜 바로 검색이 안 되죠?"와 "장애가 나면 방금 쓴 데이터는요?"의 답이 모두 이 파이프라인에 있습니다. Lucene은 segment 단위로만 검색할 수 있고, segment를 디스크에 완전히 커밋(fsync)하는 것은 비싸기 때문에, ES는 중간 단계들을 둡니다.</p>
+
+<div class="anim" data-steps="5" data-title="색인 파이프라인 — buffer → refresh → segment → flush" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 370">
+      <!-- 요청 -->
+      <rect x="20" y="20" width="150" height="42" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="95" y="38" text-anchor="middle" class="sv-label" font-size="12.5">색인 요청</text>
+      <text x="95" y="55" text-anchor="middle" class="sv-label-sm sv-mono">bulk 10MiB</text>
+
+      <!-- in-memory buffer -->
+      <rect x="250" y="20" width="200" height="60" rx="9" class="sv-box"/>
+      <text x="350" y="45" text-anchor="middle" class="sv-label" font-size="12.5">🧠 in-memory buffer</text>
+      <text x="350" y="64" text-anchor="middle" class="sv-label-sm">아직 검색 불가</text>
+      <path d="M 170 45 L 242 45" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+
+      <!-- translog -->
+      <rect x="250" y="120" width="200" height="56" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="350" y="143" text-anchor="middle" class="sv-label" font-size="12.5">📜 translog (WAL)</text>
+      <text x="350" y="162" text-anchor="middle" class="sv-label-sm">매 요청 fsync (durability: request)</text>
+      <path d="M 350 80 L 350 118" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+
+      <!-- step2: 응답 -->
+      <g data-show="2">
+        <path d="M 250 148 C 190 148 140 110 120 70" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="130" y="120" class="sv-label-sm" fill="var(--ok)">✓ 클라이언트 응답</text>
+        <text x="130" y="138" class="sv-label-sm">(translog 기록 후)</text>
+      </g>
+
+      <!-- step3: refresh → segment -->
+      <g data-show="3" data-active="3-5">
+        <path d="M 450 50 L 528 50" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <text x="489" y="38" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">refresh (1s)</text>
+        <rect x="536" y="24" width="120" height="50" rx="9" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="1.6"/>
+        <text x="596" y="45" text-anchor="middle" class="sv-label" font-size="12">new segment</text>
+        <text x="596" y="63" text-anchor="middle" class="sv-label-sm" fill="var(--es)">🔍 검색 가능!</text>
+      </g>
+
+      <!-- step4: segment 누적 + merge -->
+      <g data-show="4">
+        <rect x="536" y="90" width="56" height="34" rx="7" class="sv-box"/>
+        <rect x="600" y="90" width="56" height="34" rx="7" class="sv-box"/>
+        <rect x="664" y="90" width="56" height="34" rx="7" class="sv-box"/>
+        <text x="628" y="112" text-anchor="middle" class="sv-label-sm">seg…</text>
+        <path d="M 628 130 L 628 158" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="560" y="164" width="140" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)"/>
+        <text x="630" y="184" text-anchor="middle" class="sv-label" font-size="12">background merge</text>
+        <text x="630" y="201" text-anchor="middle" class="sv-label-sm">작은 segment → 큰 것으로</text>
+      </g>
+
+      <!-- step5: flush -->
+      <g data-show="5">
+        <rect x="20" y="240" width="760" height="70" rx="10" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="400" y="266" text-anchor="middle" class="sv-label" font-size="13.5">💾 Flush = Lucene commit(디스크 fsync) + translog 비우기</text>
+        <text x="400" y="290" text-anchor="middle" class="sv-label-sm">기본 30분마다 또는 translog 512MiB 도달 시 · 장애 시엔 마지막 commit 이후의 translog를 replay해 복원</text>
+        <text x="400" y="340" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">⚡ 장애 시나리오: buffer는 날아가도 translog가 있으면 데이터는 안전</text>
+      </g>
+
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>색인 요청이 들어오면 문서는 우선 <b>in-memory buffer</b>에 쌓입니다. 이 상태에서는 아직 검색되지 않습니다.</p>
+    <p>동시에 <b style="color:var(--warn)">translog(WAL)</b>에 기록·fsync된 뒤에야 클라이언트에 응답합니다(기본 <code>durability: request</code>). 응답을 받았다면 노드가 죽어도 그 데이터는 안전합니다.</p>
+    <p>기본 1초마다 <b>refresh</b>가 buffer를 새 segment로 만들어 <b style="color:var(--es)">검색 가능</b> 상태로 엽니다. "색인 후 최대 1초 내 검색 노출" — 이것이 Near Real Time의 실체입니다.</p>
+    <p>refresh가 반복되며 작은 segment가 누적되고, <b style="color:var(--purple)">background merge</b>가 이를 큰 segment로 합칩니다. 소량 색인이 잦으면 merge가 CPU·I/O를 잡아먹는 이유가 여기 있습니다.</p>
+    <p><b>Flush</b>가 Lucene commit(진짜 디스크 fsync)을 수행하고 translog를 비웁니다. 장애가 나면 마지막 commit 이후의 translog를 replay해 복원 — buffer는 휘발성이어도 데이터는 지켜집니다.</p>
+  </div>
+</div>
+
+<h3>refresh_interval 트레이드오프</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th><code>refresh_interval</code></th><th>검색 신선도</th><th>색인 처리량</th><th>segment 수</th></tr></thead>
+  <tbody>
+    <tr><td><code>1s</code> (기본)</td><td>1초 내</td><td>기준</td><td>많음</td></tr>
+    <tr><td><code>30s</code></td><td>30초 내</td><td>+30~50%</td><td>줄어듦</td></tr>
+    <tr><td><code>-1</code> (비활성)</td><td>수동 refresh 시</td><td>최대 2~3배</td><td>최소화</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">// 대량 backfill/reindex의 정석: refresh와 replica를 끄고 넣는다</span>
+<span class="k">PUT</span> /target/_settings
+{ <span class="s">"refresh_interval"</span>: <span class="s">"-1"</span>, <span class="s">"number_of_replicas"</span>: <span class="n">0</span> }
+
+<span class="c">... (bulk indexing) ...</span>
+
+<span class="k">PUT</span> /target/_settings
+{ <span class="s">"refresh_interval"</span>: <span class="s">"1s"</span>, <span class="s">"number_of_replicas"</span>: <span class="n">1</span> }
+<span class="k">POST</span> /target/_forcemerge?max_num_segments=1</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">translog durability: async는 "의식적 선택"</div>
+    <p><code>index.translog.durability: async</code>로 바꾸면 fsync를 <code>sync_interval</code>(기본 5s)마다만 수행해 처리량이 20~50% 오르지만, <strong>응답을 받은 데이터도 노드 크래시 시 최대 interval 분량 유실</strong>될 수 있습니다. 로그·메트릭처럼 소량 유실이 무해한 데이터에만, 명시적으로 선택하세요. 원칙은 <code>request</code> 유지입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">9.3 Rollover와 Data Stream — 시계열 인덱스를 자르는 법</h2>
+
+<p>로그·메트릭 같은 시계열 데이터를 하나의 인덱스에 계속 쌓으면 shard가 무한히 커집니다. 해법은 일정 기준마다 <strong>새 인덱스로 갈아타는 rollover</strong>입니다. <strong>Data stream</strong>은 이 패턴을 빌트인으로 자동화한 것으로, 사용자에게는 단일 이름(<code>logs</code>)으로 보이지만 내부적으로 <code>.ds-logs-…-000001</code> 같은 backing index들이 자동 관리됩니다.</p>
+
+<div class="anim" data-steps="4" data-title="시계열 인덱스 롤오버 — write index가 갈아타는 순간" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <!-- data stream -->
+      <rect x="20" y="20" width="180" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="110" y="40" text-anchor="middle" class="sv-label" font-size="12.5">data stream: logs</text>
+      <text x="110" y="58" text-anchor="middle" class="sv-label-sm">색인은 항상 이 이름으로</text>
+
+      <!-- backing 000001 -->
+      <rect x="60" y="120" width="220" height="90" rx="10" class="sv-box"/>
+      <text x="170" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">.ds-logs-000001</text>
+      <!-- 게이지 -->
+      <rect x="84" y="160" width="172" height="14" rx="7" fill="none" stroke="var(--border)"/>
+      <rect x="84" y="160" width="90" height="14" rx="7" fill="var(--es)" data-active="1-1"/>
+      <g data-show="2">
+        <rect x="84" y="160" width="172" height="14" rx="7" fill="var(--warn)"/>
+      </g>
+      <text x="170" y="196" text-anchor="middle" class="sv-label-sm sv-mono">primary shard: 26GB → 50GB</text>
+
+      <!-- write pointer step1-2 -->
+      <g data-show="1-2">
+        <path d="M 130 66 C 140 90 155 100 165 116" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
+        <text x="95 " y="98" class="sv-label-sm" fill="var(--accent)">write ✍️</text>
+      </g>
+
+      <!-- step2: 조건 충족 -->
+      <g data-show="2-2">
+        <rect x="300" y="130" width="230" height="60" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)"/>
+        <text x="415" y="155" text-anchor="middle" class="sv-label" font-size="12.5">rollover 조건 충족!</text>
+        <text x="415" y="175" text-anchor="middle" class="sv-label-sm sv-mono">max_primary_shard_size: 50gb</text>
+      </g>
+
+      <!-- step3: 새 인덱스 -->
+      <g data-show="3">
+        <rect x="520" y="120" width="220" height="90" rx="10" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)" stroke-width="1.6"/>
+        <text x="630" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="12">.ds-logs-000002</text>
+        <rect x="544" y="160" width="172" height="14" rx="7" fill="none" stroke="var(--border)"/>
+        <rect x="544" y="160" width="14" height="14" rx="7" fill="var(--es)"/>
+        <text x="630" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--es)">새 write index</text>
+        <path d="M 150 66 C 300 70 500 80 610 116" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
+        <text x="400" y="70" class="sv-label-sm" fill="var(--es)">write 포인터 이동 ✍️</text>
+        <text x="170" y="240" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">000001은 read-only로 (색인 중단)</text>
+      </g>
+
+      <!-- step4: 검색 -->
+      <g data-show="4">
+        <rect x="20" y="264" width="760" height="42" rx="9" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="400" y="290" text-anchor="middle" class="sv-label" font-size="13">🔍 검색은 data stream 이름 하나로 — 모든 backing index(000001 + 000002)를 대상으로 실행</text>
+      </g>
+
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>애플리케이션은 늘 <code>logs</code>라는 data stream 이름으로만 색인합니다. 실제 쓰기는 현재 <b>write index</b>인 <code>.ds-logs-000001</code>로 들어가고, shard가 점점 차오릅니다.</p>
+    <p>primary shard가 <b style="color:var(--warn)">50GB에 도달 — rollover 조건 충족</b>. 조건은 <code>max_age</code>, <code>max_primary_shard_size</code>, <code>max_primary_shard_docs</code> 중 <b>하나라도</b> 차면 발동합니다.</p>
+    <p>새 backing index <code>000002</code>가 만들어지고 <b style="color:var(--es)">write 포인터가 이동</b>합니다. 000001은 더 이상 쓰이지 않는 read-only가 되어 force merge·티어 이동의 대상이 됩니다.</p>
+    <p>검색은 여전히 <code>logs</code> 하나로 — 모든 backing index가 자동으로 검색 대상에 포함됩니다. 애플리케이션 코드는 rollover를 전혀 몰라도 됩니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">왜 50GB인가</div>
+    <p>Lucene merge 비용은 segment 크기에 비례하고, 너무 큰 shard는 force merge·snapshot·장애 복구 시간이 길어집니다. <strong>primary shard 10~50GB</strong>가 경험칙으로 검증된 sweet spot이며, 8.x부터 <code>max_primary_shard_size: 50gb</code>가 권장 1차 rollover 조건입니다.</p>
+  </div>
+</div>
+
+<p>Data stream의 제약: 모든 문서에 <code>@timestamp</code> 필수, append-only(<code>_id</code>로 update/delete 불가), 인덱스 템플릿 + ILM 정책과 한 세트로 동작합니다.</p>
+
+<h2 id="s4">9.4 ILM — hot·warm·cold 티어를 흐르는 데이터의 일생</h2>
+
+<p><strong>ILM(Index Lifecycle Management)</strong>은 rollover된 인덱스를 나이에 따라 싼 하드웨어로 옮기고 결국 삭제하는 자동화입니다. "최근 데이터는 비싸고 빠르게, 오래된 데이터는 싸고 느리게"가 설계 철학입니다.</p>
+
+<div class="anim" data-steps="5" data-title="ILM — 인덱스가 hot → warm → cold → frozen → delete로 흘러가는 일생" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <!-- 티어 레인 -->
+      <rect x="20" y="60" width="180" height="150" rx="10" fill="color-mix(in srgb, var(--danger) 7%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+      <text x="110" y="86" text-anchor="middle" class="sv-label">🔥 hot</text>
+      <text x="110" y="104" text-anchor="middle" class="sv-label-sm">NVMe SSD · 고RAM</text>
+
+      <rect x="220" y="60" width="180" height="150" rx="10" fill="color-mix(in srgb, var(--warn) 8%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+      <text x="310" y="86" text-anchor="middle" class="sv-label">🌤 warm</text>
+      <text x="310" y="104" text-anchor="middle" class="sv-label-sm">SSD · 검색만</text>
+
+      <rect x="420" y="60" width="180" height="150" rx="10" fill="color-mix(in srgb, var(--accent) 8%, transparent)" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="510" y="86" text-anchor="middle" class="sv-label">🧊 cold / frozen</text>
+      <text x="510" y="104" text-anchor="middle" class="sv-label-sm">HDD · object storage</text>
+
+      <rect x="620" y="60" width="160" height="150" rx="10" fill="none" stroke="var(--border)" stroke-width="1.4" stroke-dasharray="6 5"/>
+      <text x="700" y="86" text-anchor="middle" class="sv-label">🗑 delete</text>
+      <text x="700" y="104" text-anchor="middle" class="sv-label-sm">365일 후</text>
+
+      <!-- 인덱스 박스: 각 단계 -->
+      <g data-show="1-1">
+        <rect x="45" y="130" width="130" height="52" rx="9" fill="var(--bg-inset)" stroke="var(--danger)" stroke-width="1.8" class="pulse"/>
+        <text x="110" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">.ds-logs-000001</text>
+        <text x="110" y="170" text-anchor="middle" class="sv-label-sm">색인 + 검색 활발</text>
+      </g>
+      <g data-show="2-2">
+        <rect x="245" y="130" width="130" height="52" rx="9" fill="var(--bg-inset)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="310" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">.ds-logs-000001</text>
+        <text x="310" y="170" text-anchor="middle" class="sv-label-sm">forcemerge + shrink</text>
+        <path d="M 175 156 L 237 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
+      </g>
+      <g data-show="3-3">
+        <rect x="445" y="130" width="130" height="52" rx="9" fill="var(--bg-inset)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="510" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">.ds-logs-000001</text>
+        <text x="510" y="170" text-anchor="middle" class="sv-label-sm">searchable snapshot</text>
+        <path d="M 375 156 L 437 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
+      </g>
+      <g data-show="4-4">
+        <rect x="645" y="130" width="110" height="52" rx="9" fill="none" stroke="var(--text-faint)" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <text x="700" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">000001</text>
+        <text x="700" y="170" text-anchor="middle" class="sv-label-sm">영구 삭제</text>
+        <path d="M 575 156 L 637 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
+      </g>
+
+      <!-- 타임라인 -->
+      <line x1="30" y1="240" x2="770" y2="240" class="sv-line"/>
+      <text x="110" y="262" text-anchor="middle" class="sv-label-sm sv-mono">0~7d</text>
+      <text x="310" y="262" text-anchor="middle" class="sv-label-sm sv-mono">7d~30d</text>
+      <text x="510" y="262" text-anchor="middle" class="sv-label-sm sv-mono">30d~365d</text>
+      <text x="700" y="262" text-anchor="middle" class="sv-label-sm sv-mono">365d~</text>
+
+      <g data-show="5">
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13.5" fill="var(--ok)">✅ min_age는 rollover 시점(write에서 빠진 순간)부터 측정 — 보존 비용은 hot 대비 frozen이 1/10 이하</text>
+      </g>
+
+      <defs>
+        <marker id="arr3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>hot phase</b>: 갓 태어난 인덱스는 NVMe·고RAM 노드에서 색인과 검색을 모두 감당합니다. rollover도 이 단계의 액션입니다.</p>
+    <p>rollover 후 7일이 지나면 <b style="color:var(--warn)">warm 티어로 이동</b>. 더 이상 색인이 없으므로 <code>forcemerge(segment 1개)</code>와 <code>shrink(shard 수 축소)</code>로 검색 효율을 최적화합니다.</p>
+    <p>30일 후 <b style="color:var(--accent)">cold/frozen</b>으로. frozen은 데이터를 S3 같은 object storage에 두고 노드는 캐시만 가지는 <b>searchable snapshot</b> — 검색은 되지만 수 초 단위로 느려질 수 있습니다.</p>
+    <p>365일이 지나면 <b>delete phase</b>가 인덱스를 영구 삭제합니다. 디스크가 가득 차서 새벽에 삭제 작업을 하는 대신, 정책이 알아서 합니다.</p>
+    <p>주의: 각 phase의 <code>min_age</code>는 인덱스 생성이 아니라 <b>rollover 시점부터</b> 측정됩니다. 전체 흐름이 자동화되면 보존 비용은 hot 대비 frozen 기준 1/10 이하로 떨어집니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">PUT</span> _ilm/policy/logs-policy
+{
+  <span class="s">"policy"</span>: {
+    <span class="s">"phases"</span>: {
+      <span class="s">"hot"</span>: {
+        <span class="s">"actions"</span>: {
+          <span class="s">"rollover"</span>: { <span class="s">"max_age"</span>: <span class="s">"1d"</span>, <span class="s">"max_primary_shard_size"</span>: <span class="s">"50gb"</span> },
+          <span class="s">"set_priority"</span>: { <span class="s">"priority"</span>: <span class="n">100</span> }
+        }
+      },
+      <span class="s">"warm"</span>: {
+        <span class="s">"min_age"</span>: <span class="s">"7d"</span>,
+        <span class="s">"actions"</span>: {
+          <span class="s">"forcemerge"</span>: { <span class="s">"max_num_segments"</span>: <span class="n">1</span> },
+          <span class="s">"shrink"</span>:     { <span class="s">"number_of_shards"</span>: <span class="n">1</span> },
+          <span class="s">"allocate"</span>:   { <span class="s">"include"</span>: { <span class="s">"data_tier"</span>: <span class="s">"data_warm"</span> } }
+        }
+      },
+      <span class="s">"cold"</span>:   { <span class="s">"min_age"</span>: <span class="s">"30d"</span>,  <span class="s">"actions"</span>: { <span class="s">"searchable_snapshot"</span>: { <span class="s">"snapshot_repository"</span>: <span class="s">"my_repo"</span> } } },
+      <span class="s">"delete"</span>: { <span class="s">"min_age"</span>: <span class="s">"365d"</span>, <span class="s">"actions"</span>: { <span class="s">"delete"</span>: {} } }
+    }
+  }
+}</code></pre>
+
+<h2 id="s5">9.5 Force merge — 하지 말아야 할 때를 아는 것이 핵심</h2>
+
+<p>Lucene은 background merge로 알아서 segment를 관리합니다. <code>_forcemerge</code>는 read-only가 된 인덱스의 segment를 1개로 합쳐 검색을 최적화하고 삭제 문서의 공간을 회수하는 <strong>마무리 작업</strong>입니다.</p>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">활발히 색인 중인 인덱스에 force merge 금지</div>
+    <p>① 새 segment가 계속 생겨 <strong>merge가 끝나지 않고</strong> ② 병합 중 디스크가 일시적으로 2배 사용되며 ③ 한번 만들어진 거대 단일 segment는 이후 일반 merge 대상에서 사실상 제외되어 삭제 문서가 영원히 회수되지 않을 수 있습니다. ILM warm phase에서 자동화하는 것이 정석입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># 1. rollover로 write가 끝난 인덱스인지 확인 후 read-only 전환</span>
+<span class="k">PUT</span> /logs-2026.07.01/_settings
+{ <span class="s">"index.blocks.write"</span>: <span class="n">true</span> }
+
+<span class="c"># 2. force merge (비동기 실행)</span>
+<span class="k">POST</span> /logs-2026.07.01/_forcemerge?max_num_segments=1&amp;wait_for_completion=false</code></pre>
+
+<h2 id="s6">9.6 베스트 프랙티스 체크리스트</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>항목</th><th>권장</th></tr></thead>
+  <tbody>
+    <tr><td>Bulk 페이로드</td><td>5~15 MiB, <code>errors: true</code> 항목별 처리 + 429 backoff</td></tr>
+    <tr><td>Refresh interval</td><td>운영 워크로드 30s 검토, backfill은 <code>-1</code></td></tr>
+    <tr><td>Replica</td><td>대량 backfill 시 0, 완료 후 복구</td></tr>
+    <tr><td>Translog durability</td><td><code>request</code> 유지 원칙, <code>async</code>는 의식적 선택</td></tr>
+    <tr><td><code>_id</code></td><td>가능하면 ES 자동 생성 (auto-id 최적화 경로 존재)</td></tr>
+    <tr><td>Primary shard 크기</td><td>10~50GB, rollover는 <code>max_primary_shard_size: 50gb</code> 우선</td></tr>
+    <tr><td>Force merge</td><td>read-only 인덱스 한정, ILM warm에서 자동화</td></tr>
+    <tr><td>Update</td><td>append-only가 가능하면 update 회피 (10장 참고)</td></tr>
+    <tr><td>모니터링</td><td><code>indexing_pressure</code>, write thread_pool의 rejected 카운터 (11장)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">색인 직후의 문서가 아직 검색되지 않는 이유와, 그럼에도 노드 장애 시 데이터가 안전한 이유를 올바르게 짝지은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">검색 안 됨: replica 복제 미완료 / 안전: primary shard가 이미 디스크에 fsync했으므로</button>
+    <button type="button" data-correct>검색 안 됨: 아직 refresh 전이라 in-memory buffer에만 있음 / 안전: translog에 기록·fsync된 후 응답했으므로</button>
+    <button type="button">검색 안 됨: merge가 끝나지 않아서 / 안전: OS page cache가 자동으로 보존하므로</button>
+  </div>
+  <div class="quiz-expl">✅ 문서는 refresh(기본 1초)가 새 segment를 만들어야 검색에 노출됩니다(NRT). 한편 내구성은 segment가 아니라 translog가 책임집니다 — 기본 durability: request에서는 translog fsync 후에 응답하므로, 장애가 나도 마지막 commit 이후의 translog를 replay해 복원합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">활발히 색인 중인 인덱스에 <code>_forcemerge?max_num_segments=1</code>을 실행하면 안 되는 이유가 <strong>아닌</strong> 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">병합 중 디스크 사용량이 일시적으로 2배가 된다</button>
+    <button type="button">새 segment가 계속 생겨 병합이 사실상 끝나지 않는다</button>
+    <button type="button">거대 단일 segment는 이후 merge에서 제외되어 삭제 문서가 회수되지 않을 수 있다</button>
+    <button type="button" data-correct>force merge 실행 중에는 해당 인덱스의 검색이 완전히 차단된다</button>
+  </div>
+  <div class="quiz-expl">✅ force merge 중에도 검색 자체는 가능합니다(I/O 경합으로 느려질 뿐 차단되지는 않음). 나머지 셋은 모두 실제 위험이며, 그래서 force merge는 rollover가 끝나 read-only가 된 인덱스에만 — 가급적 ILM warm phase 자동화로 — 수행합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch09_indexing_strategy.md" target="_blank" rel="noopener">chapters/ch09_indexing_strategy.md</a> — index buffer 크기 계산, flush 트리거 상세, data stream 템플릿 전체 예시가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch08.html"><span class="dir">← 이전</span><br><span class="title">8장. Aggregations</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch10.html"><span class="dir">다음 →</span><br><span class="title">10장. 안티패턴 모음</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

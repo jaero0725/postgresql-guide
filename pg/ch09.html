@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9장. WAL과 Checkpoint — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch09">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>9장. WAL과 Checkpoint — 절대 잃어버리지 않는 기술</h1>
+<p class="lead">전원이 갑자기 나가도 커밋된 데이터는 살아남습니다. 그 비밀은 "데이터보다 일기를 먼저 쓴다"는 단순한 규칙 — WAL(Write-Ahead Log)에 있습니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2장 아키텍처</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① WAL-first 원칙 — 커밋이 디스크에 살아남는 원리 ② 크래시 후 WAL 리플레이로 복구되는 과정 ③ Checkpoint가 복구 시작점을 전진시키는 방법 ④ full_page_writes와 pg_wal 폭증 3대 원인</p>
+  </div>
+</div>
+
+<h2 id="s1">9.1 WAL — 하나의 로그가 세 가지 일을 한다</h2>
+
+<p><strong>WAL(Write-Ahead Log)</strong>은 "무슨 변경이 있었는지"를 순서대로 적는 <strong>한 줄짜리 일기장</strong>입니다. 이 단순한 로그 하나가 PostgreSQL의 세 기둥을 동시에 떠받칩니다.</p>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>🛡️ 내구성 (Durability)</h4>
+    <p>COMMIT 응답 전에 변경 내역이 디스크의 WAL에 flush됩니다. 데이터 파일은 아직 안 써도 됩니다 — 일기만 있으면 재현 가능하니까요.</p>
+  </div>
+  <div class="card">
+    <h4>🔁 크래시 복구</h4>
+    <p>비정상 종료 후 재시작하면 마지막 Checkpoint 지점부터 WAL을 다시 읽어 "잊힌 변경"을 재방송합니다.</p>
+  </div>
+  <div class="card">
+    <h4>📡 복제의 기반</h4>
+    <p>Physical 복제는 WAL을 그대로 스트리밍하고, Logical 복제는 WAL을 디코드합니다. WAL이 없으면 복제도 없습니다. (10장)</p>
+  </div>
+</div>
+
+<p>핵심 불변식은 이름 그대로입니다: <strong>데이터 페이지를 디스크에 쓰기 전에, 그 변경을 설명하는 WAL 레코드가 반드시 먼저 flush되어 있어야 한다.</strong> 아래 애니메이션에서 COMMIT 한 번의 여정을 따라가 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="WAL-first — COMMIT 한 번의 여정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 340">
+      <!-- actors -->
+      <rect x="20" y="40" width="120" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="80" y="68" text-anchor="middle" class="sv-label" font-size="13">클라이언트</text>
+
+      <rect x="200" y="40" width="130" height="46" rx="9" class="sv-box"/>
+      <text x="265" y="68" text-anchor="middle" class="sv-label" font-size="13">Backend</text>
+
+      <rect x="200" y="130" width="200" height="60" rx="9" class="sv-box"/>
+      <text x="300" y="153" text-anchor="middle" class="sv-label" font-size="12.5">Shared Buffers (메모리)</text>
+      <rect x="215" y="162" width="80" height="20" rx="4" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)"/>
+      <text x="255" y="176" text-anchor="middle" class="sv-label-sm">dirty page</text>
+
+      <rect x="460" y="130" width="140" height="60" rx="9" class="sv-box"/>
+      <text x="530" y="153" text-anchor="middle" class="sv-label" font-size="12.5">WAL Buffer</text>
+      <text x="530" y="173" text-anchor="middle" class="sv-label-sm">(메모리)</text>
+
+      <rect x="460" y="240" width="140" height="60" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+      <text x="530" y="264" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">pg_wal/ 💾</text>
+      <text x="530" y="284" text-anchor="middle" class="sv-label-sm">(디스크, 영속)</text>
+
+      <rect x="200" y="240" width="140" height="60" rx="9" class="sv-box"/>
+      <text x="270" y="264" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">heap 데이터 파일</text>
+      <text x="270" y="284" text-anchor="middle" class="sv-label-sm">(디스크)</text>
+
+      <!-- step1: commit arrives, dirty page -->
+      <g data-show="1">
+        <path d="M 140 63 L 195 63" class="sv-arrow flow-line"/>
+        <text x="150" y="52" class="sv-label-sm sv-mono" fill="var(--accent)">COMMIT</text>
+        <path d="M 265 86 L 265 126" class="sv-arrow"/>
+        <text x="130" y="112" class="sv-label-sm">① 메모리 페이지만 수정</text>
+      </g>
+
+      <!-- step2: WAL record append -->
+      <g data-show="2">
+        <path d="M 330 86 Q 420 100 500 126" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr9a)"/>
+        <rect x="475" y="146" width="110" height="18" rx="4" fill="color-mix(in srgb, var(--warn) 25%, transparent)" stroke="var(--warn)"/>
+        <text x="530" y="159" text-anchor="middle" class="sv-label-sm sv-mono">WAL 레코드+LSN</text>
+        <text x="615" y="106" class="sv-label-sm">② 변경 내역 append</text>
+      </g>
+
+      <!-- step3: fsync to pg_wal -->
+      <g data-show="3">
+        <path d="M 530 190 L 530 236" stroke="var(--ok)" stroke-width="2.5" class="flow-line" marker-end="url(#arr9b)"/>
+        <text x="545" y="215" class="sv-label-sm" fill="var(--ok)">③ write + fsync ⚡</text>
+      </g>
+
+      <!-- step4: response -->
+      <g data-show="4">
+        <path d="M 195 78 L 140 78" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr9b)"/>
+        <text x="88" y="100" class="sv-label-sm" fill="var(--ok)">④ "커밋 성공!" (durable)</text>
+      </g>
+      <g data-show="4-4">
+        <text x="270" y="222" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">heap은 아직 안 씀! ✋</text>
+      </g>
+
+      <!-- step5: later flush -->
+      <g data-show="5">
+        <path d="M 255 190 L 262 236" stroke="var(--purple)" stroke-width="2" stroke-dasharray="6 5" fill="none" class="flow-line" marker-end="url(#arr9c)"/>
+        <text x="60 " y="220" class="sv-label-sm" fill="var(--purple)">⑤ 나중에 Checkpoint/</text>
+        <text x="70" y="236" class="sv-label-sm" fill="var(--purple)">BGWriter가 천천히</text>
+        <text x="380" y="325" text-anchor="middle" class="sv-label-sm">규칙: heap을 쓰기 전에 해당 WAL이 반드시 먼저 디스크에! (Write-Ahead)</text>
+      </g>
+      <defs>
+        <marker id="arr9a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/></marker>
+        <marker id="arr9b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr9c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 <code>COMMIT</code>을 보냅니다. Backend는 Shared Buffers의 페이지를 수정합니다 — 아직 <b>메모리에서만</b> 바뀐 상태(dirty page)입니다.</p>
+    <p>동시에 "무엇을 바꿨는지" 설명하는 <b>WAL 레코드</b>를 WAL Buffer에 append하고, 위치 번호인 <b>LSN</b>(Log Sequence Number)을 할당받습니다.</p>
+    <p>커밋 시점에 WAL Buffer가 디스크의 <code>pg_wal/</code>로 <b style="color:var(--ok)">write + fsync</b>됩니다. 이 fsync가 커밋 지연의 대부분을 차지하는 진짜 디스크 쓰기입니다.</p>
+    <p>WAL이 디스크에 안착한 순간, 클라이언트에게 <b style="color:var(--ok)">"커밋 성공"</b>이 응답됩니다. heap 데이터 파일은 아직 안 썼지만 괜찮습니다 — 크래시가 나도 WAL로 재현할 수 있으니까요.</p>
+    <p>dirty page는 <b style="color:var(--purple)">나중에</b> Checkpointer나 Background Writer가 천천히 데이터 파일로 내려보냅니다. "일기 먼저, 본문은 나중에" — 이것이 Write-Ahead Logging입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">LSN — WAL 세계의 좌표</div>
+    <p><strong>LSN(Log Sequence Number)</strong>은 WAL 내의 바이트 단위 위치를 가리키는 64비트 값입니다(표기: <code>16/B374D848</code>). 복제 지연, 복구 위치, Checkpoint 기록 등 PostgreSQL의 거의 모든 "위치" 지표가 LSN으로 표현됩니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 현재 WAL 쓰기 위치(LSN) 확인</span>
+<span class="k">SELECT</span> <span class="f">pg_current_wal_lsn</span>();          <span class="c">-- 예: 16/B374D848</span>
+
+<span class="c">-- 두 LSN 사이 거리(바이트)</span>
+<span class="k">SELECT</span> <span class="f">pg_wal_lsn_diff</span>(<span class="s">'16/B3800000'</span>, <span class="s">'16/B0000000'</span>);
+
+<span class="c">-- 이 LSN이 속한 WAL 세그먼트 파일(기본 16MB)</span>
+<span class="k">SELECT</span> <span class="f">pg_walfile_name</span>(<span class="s">'16/B374D848'</span>);  <span class="c">-- 0000000100000016000000B3</span></code></pre>
+
+<h2 id="s2">9.2 크래시 리커버리 — 일기장으로 되살리기</h2>
+
+<p>서버가 갑자기 죽으면 어떻게 될까요? 메모리의 dirty page들은 증발했지만, 커밋된 변경의 일기(WAL)는 디스크에 남아 있습니다. 재시작 시 PostgreSQL은 이 일기를 <strong>처음부터가 아니라, 마지막 Checkpoint의 redo point부터</strong> 다시 읽으며 재생합니다.</p>
+
+<div class="anim" data-steps="4" data-title="크래시 후 리커버리 — WAL 리플레이" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- WAL timeline -->
+      <text x="20" y="30" class="sv-label" font-size="13">WAL (디스크에 살아남음)</text>
+      <rect x="20" y="45" width="720" height="44" rx="8" fill="none" stroke="var(--border)" stroke-width="1.4"/>
+      <rect x="20" y="45" width="240" height="44" rx="8" fill="color-mix(in srgb, var(--text-faint) 12%, transparent)"/>
+      <text x="140" y="72" text-anchor="middle" class="sv-label-sm">이미 데이터 파일에 반영됨</text>
+      <line x1="260" y1="38" x2="260" y2="96" stroke="var(--purple)" stroke-width="2.5"/>
+      <text x="260" y="112" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--purple)">redo point (마지막 Checkpoint)</text>
+      <rect x="262" y="45" width="380" height="44" fill="color-mix(in srgb, var(--warn) 14%, transparent)"/>
+      <text x="450" y="72" text-anchor="middle" class="sv-label-sm">크래시 전 커밋들 (heap엔 아직 없을 수 있음)</text>
+      <line x1="644" y1="38" x2="644" y2="96" stroke="var(--danger)" stroke-width="2.5"/>
+      <text x="672" y="34" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">💥 크래시</text>
+
+      <!-- step1 crash -->
+      <g data-show="1-1">
+        <rect x="250" y="140" width="260" height="56" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="380" y="163" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">⚡ 전원 차단!</text>
+        <text x="380" y="184" text-anchor="middle" class="sv-label-sm">메모리의 dirty page 전부 증발</text>
+      </g>
+
+      <!-- step2 read pg_control -->
+      <g data-show="2">
+        <rect x="40" y="140" width="180" height="60" rx="10" class="sv-box"/>
+        <text x="130" y="164" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">pg_control</text>
+        <text x="130" y="184" text-anchor="middle" class="sv-label-sm">"redo point는 여기야"</text>
+        <path d="M 180 138 Q 230 115 255 100" stroke="var(--purple)" stroke-width="2" fill="none" stroke-dasharray="5 4" class="flow-line"/>
+      </g>
+
+      <!-- step3 replay -->
+      <g data-show="3">
+        <path d="M 270 128 L 620 128" stroke="var(--warn)" stroke-width="3" class="flow-line" marker-end="url(#arr9d)"/>
+        <text x="445" y="120" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">레코드 하나씩 순차 리플레이 ▶▶</text>
+        <rect x="280" y="150" width="200" height="52" rx="9" class="sv-box" data-show="3"/>
+        <text x="380" y="171" text-anchor="middle" class="sv-label-sm">FPI면 → 페이지 통째로 복원</text>
+        <text x="380" y="190" text-anchor="middle" class="sv-label-sm">아니면 → 증분 패치 적용</text>
+      </g>
+
+      <!-- step4 open -->
+      <g data-show="4">
+        <rect x="250" y="230" width="260" height="60" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="380" y="254" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ 커밋된 것은 전부 복원</text>
+        <text x="380" y="276" text-anchor="middle" class="sv-label-sm">end-of-recovery Checkpoint 후 서비스 오픈</text>
+      </g>
+      <defs>
+        <marker id="arr9d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>💥 전원이 갑자기 끊겼습니다. 메모리에 있던 dirty page는 모두 사라졌지만, 커밋 시점에 fsync된 <b>WAL은 디스크에 온전히 살아 있습니다</b>.</p>
+    <p>재시작하면 PostgreSQL은 먼저 <code>pg_control</code> 파일을 읽어 <b style="color:var(--purple)">마지막 Checkpoint의 redo point</b>를 확인합니다. "여기부터 다시 재생하면 된다"는 북마크입니다.</p>
+    <p>redo point부터 WAL 레코드를 <b style="color:var(--warn)">순차적으로 리플레이</b>합니다. Full Page Image(FPI)면 페이지를 통째로 복원하고, 아니면 그 위에 증분 패치를 적용합니다.</p>
+    <p>WAL 끝에 도달하면 커밋된 변경은 전부 복원된 상태! end-of-recovery Checkpoint를 찍고 정상 서비스를 시작합니다. <b style="color:var(--ok)">커밋된 데이터는 단 하나도 잃지 않았습니다.</b></p>
+  </div>
+</div>
+
+<h2 id="s3">9.3 Checkpoint — 복구 시작점을 앞으로 당기기</h2>
+
+<p>WAL만 믿고 영원히 리플레이할 수는 없습니다. WAL이 1TB 쌓였다면 복구에 몇 시간이 걸릴 테니까요. 그래서 주기적으로 <strong>"지금까지의 dirty page를 전부 데이터 파일에 내려쓰고, 복구 시작점(redo point)을 현재로 전진"</strong>시키는 작업이 필요합니다. 이것이 <strong>Checkpoint</strong>입니다.</p>
+
+<div class="anim" data-steps="4" data-title="Checkpoint — dirty page flush와 redo point 전진" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 760 320">
+      <!-- shared buffers -->
+      <rect x="30" y="50" width="300" height="120" rx="10" class="sv-box"/>
+      <text x="180" y="42" text-anchor="middle" class="sv-label" font-size="13">Shared Buffers</text>
+      <rect x="45" y="65" width="80" height="26" rx="5" fill="color-mix(in srgb, var(--warn) 28%, transparent)" stroke="var(--warn)"/>
+      <text x="85" y="83" text-anchor="middle" class="sv-label-sm">dirty</text>
+      <rect x="135" y="65" width="80" height="26" rx="5" fill="color-mix(in srgb, var(--warn) 28%, transparent)" stroke="var(--warn)"/>
+      <text x="175" y="83" text-anchor="middle" class="sv-label-sm">dirty</text>
+      <rect x="225" y="65" width="80" height="26" rx="5" class="sv-box"/>
+      <text x="265" y="83" text-anchor="middle" class="sv-label-sm">clean</text>
+      <rect x="45" y="105" width="80" height="26" rx="5" fill="color-mix(in srgb, var(--warn) 28%, transparent)" stroke="var(--warn)"/>
+      <text x="85" y="123" text-anchor="middle" class="sv-label-sm">dirty</text>
+      <rect x="135" y="105" width="80" height="26" rx="5" class="sv-box"/>
+      <text x="175" y="123" text-anchor="middle" class="sv-label-sm">clean</text>
+      <rect x="225" y="105" width="80" height="26" rx="5" fill="color-mix(in srgb, var(--warn) 28%, transparent)" stroke="var(--warn)"/>
+      <text x="265" y="123" text-anchor="middle" class="sv-label-sm">dirty</text>
+
+      <!-- data files -->
+      <rect x="30" y="230" width="300" height="60" rx="10" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+      <text x="180" y="256" text-anchor="middle" class="sv-label" font-size="12.5">데이터 파일 (heap/index) 💾</text>
+      <text x="180" y="276" text-anchor="middle" class="sv-label-sm">디스크</text>
+
+      <!-- WAL bar -->
+      <text x="420" y="42" class="sv-label" font-size="13">WAL</text>
+      <rect x="420" y="50" width="310" height="36" rx="7" fill="none" stroke="var(--border)" stroke-width="1.4"/>
+      <line x1="470" y1="44" x2="470" y2="92" stroke="var(--purple)" stroke-width="2.5"/>
+      <text x="470" y="108" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">이전 redo</text>
+
+      <!-- step1 trigger -->
+      <g data-show="1">
+        <rect x="420" y="140" width="310" height="62" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="575" y="163" text-anchor="middle" class="sv-label" font-size="12.5">⏰ 트리거: checkpoint_timeout(5min)</text>
+        <text x="575" y="184" text-anchor="middle" class="sv-label-sm">또는 WAL 누적이 max_wal_size(1GB) 도달</text>
+      </g>
+
+      <!-- step2 flush -->
+      <g data-show="2">
+        <path d="M 100 172 L 120 226" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr9e)"/>
+        <path d="M 180 172 L 180 226" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr9e)"/>
+        <path d="M 262 172 L 240 226" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr9e)"/>
+        <text x="352" y="205" class="sv-label-sm" fill="var(--ok)">dirty 전부 write+fsync</text>
+        <text x="352" y="222" class="sv-label-sm">(completion_target 0.9로</text>
+        <text x="352" y="238" class="sv-label-sm">천천히 분산)</text>
+      </g>
+
+      <!-- step3 redo advance -->
+      <g data-show="3">
+        <line x1="650" y1="44" x2="650" y2="92" stroke="var(--purple)" stroke-width="2.5" class="pulse"/>
+        <text x="650" y="108" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">새 redo point!</text>
+        <path d="M 480 70 L 640 70" stroke="var(--purple)" stroke-width="2" stroke-dasharray="6 5" class="flow-line" marker-end="url(#arr9f)"/>
+      </g>
+
+      <!-- step4 recycle old wal -->
+      <g data-show="4">
+        <rect x="420" y="50" width="228" height="36" rx="7" fill="color-mix(in srgb, var(--text-faint) 14%, transparent)"/>
+        <text x="534" y="72" text-anchor="middle" class="sv-label-sm">♻️ 이전 WAL: 재활용/아카이브 가능</text>
+        <text x="575" y="240" text-anchor="middle" class="sv-label-sm">복구는 이제 새 redo point부터 시작 →</text>
+        <text x="575" y="260" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">복구 시간 짧아짐 ✅</text>
+      </g>
+      <defs>
+        <marker id="arr9e" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr9f" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>Checkpoint는 <code>checkpoint_timeout</code>(기본 5분) 경과 또는 WAL 누적이 <code>max_wal_size</code>(기본 1GB)에 도달하면 시작됩니다.</p>
+    <p>그 시점의 <b style="color:var(--warn)">dirty page 전부</b>를 데이터 파일로 write + fsync합니다. I/O 폭탄이 되지 않도록 <code>checkpoint_completion_target</code>(0.9) 비율로 <b>주기 전체에 걸쳐 천천히 분산</b>합니다.</p>
+    <p>flush가 끝나면 <code>pg_control</code>의 <b style="color:var(--purple)">redo point를 현재 LSN으로 전진</b>시킵니다. "이 이전 것들은 이미 데이터 파일에 다 반영됐다"는 선언입니다.</p>
+    <p>이전 redo point 이전의 WAL은 크래시 복구에 더 이상 필요 없으므로 <b>재활용·아카이브 대상</b>이 됩니다. 복구 시작점이 가까워졌으니 크래시 복구도 빨라집니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>파라미터</th><th>기본값</th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td><code>checkpoint_timeout</code></td><td>5min</td><td>시간 기반 Checkpoint 주기</td></tr>
+    <tr><td><code>max_wal_size</code></td><td>1GB</td><td>WAL 누적량 기반 트리거 (soft limit)</td></tr>
+    <tr><td><code>min_wal_size</code></td><td>80MB</td><td>재사용을 위해 유지할 최소 WAL</td></tr>
+    <tr><td><code>checkpoint_completion_target</code></td><td>0.9 (v14+)</td><td>I/O를 주기의 몇 %에 걸쳐 분산할지</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">"checkpoints are occurring too frequently" 로그를 보셨다면</div>
+    <p>WAL이 <code>max_wal_size</code>에 너무 자주 도달한다는 뜻입니다. write-heavy 환경에서는 <code>max_wal_size</code>를 8GB~64GB까지 올리는 것이 일반적입니다. Checkpoint가 잦으면 다음 절의 FPI 때문에 <strong>WAL이 오히려 더 많이 생기는 역설</strong>도 발생합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">9.4 full_page_writes — 반쪽짜리 페이지 사고 방지</h2>
+
+<p>대부분의 디스크는 8KB 쓰기를 원자적으로 보장하지 않습니다. 쓰는 도중 전원이 나가면 "앞 4KB는 새 값, 뒤 4KB는 옛 값"인 <strong>torn page(찢어진 페이지)</strong>가 남을 수 있죠. WAL 레코드는 "이 페이지의 이 위치를 고쳐라"라는 <em>증분 패치</em>라서, 찢어진 페이지 위에 패치를 얹으면 복구가 오히려 망가집니다.</p>
+
+<p>해결책: <strong>Checkpoint 후 페이지가 처음 더럽혀질 때, 페이지 전체 이미지(FPI)를 WAL에 통째로 기록</strong>합니다. 복구 시 FPI로 페이지를 먼저 복원한 뒤 그 위에 증분 패치를 적용하면 안전합니다.</p>
+
+<pre><code><span class="c"># postgresql.conf — 내구성 관련 핵심 설정</span>
+full_page_writes = on          <span class="c"># 기본값, 절대 끄지 말 것</span>
+wal_compression = on           <span class="c"># FPI 압축 → WAL 양 감소 (v15+: pglz/lz4/zstd)</span>
+wal_level = replica            <span class="c"># v10+ 기본. 복제·PITR에 필요</span>
+
+<span class="c"># 쓰기 많은 OLTP 권장 예시</span>
+max_wal_size = <span class="n">16</span>GB
+checkpoint_timeout = <span class="n">15</span>min
+checkpoint_completion_target = <span class="n">0.9</span></code></pre>
+
+<h2 id="s5">9.5 synchronous_commit — 안전과 속도의 다이얼</h2>
+
+<p>커밋 응답을 <em>언제</em> 돌려줄지 선택할 수 있습니다. 안전할수록 느리고, 빠를수록 위험합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>값</th><th>응답 시점</th><th>손실 위험</th></tr></thead>
+  <tbody>
+    <tr><td><code>on</code> (기본)</td><td>로컬 WAL flush 완료 (동기 복제 시 스탠바이까지)</td><td>없음</td></tr>
+    <tr><td><code>remote_apply</code></td><td>스탠바이가 리플레이까지 완료</td><td>없음, 가장 느림</td></tr>
+    <tr><td><code>local</code></td><td>로컬 WAL flush만</td><td>로컬은 안전, 스탠바이 지연 가능</td></tr>
+    <tr><td><code>off</code></td><td>즉시 (WAL flush는 비동기)</td><td><strong>커밋 후 최대 수백 ms 손실 가능</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 손실이 허용되는 로그성 INSERT만 세션 단위로 빠르게</span>
+<span class="k">BEGIN</span>;
+<span class="k">SET LOCAL</span> synchronous_commit = off;
+<span class="k">INSERT INTO</span> event_log <span class="k">SELECT</span> * <span class="k">FROM</span> staging;
+<span class="k">COMMIT</span>;   <span class="c">-- fsync를 기다리지 않고 즉시 응답</span></code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">pg_wal/ 폭증의 3대 원인 — 디스크 풀은 PANIC 셧다운</div>
+    <p>① <strong>미회수 replication slot</strong> — 소비자가 사라진 슬롯이 WAL 삭제를 막음 (최빈 원인, <code>max_slot_wal_keep_size</code>로 방어) ② <strong>archive_command 실패</strong> — 실패한 WAL은 계속 보관·재시도됨 (<code>pg_stat_archiver.failed_count</code> 감시) ③ <strong>wal_keep_size 과다</strong> — 슬롯을 쓴다면 0 유지. 자세한 진단은 10~11장에서 이어집니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">COMMIT이 클라이언트에게 "성공"으로 응답되는 시점(기본 설정)에 대한 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">heap 데이터 파일까지 디스크에 모두 쓰인 후</button>
+    <button type="button" data-correct>WAL 레코드가 디스크(pg_wal/)에 flush된 후 — heap은 아직 메모리에만 있어도 된다</button>
+    <button type="button">Shared Buffers의 dirty page가 생성된 즉시</button>
+    <button type="button">다음 Checkpoint가 완료된 후</button>
+  </div>
+  <div class="quiz-expl">✅ WAL-first 원칙입니다. 커밋의 내구성은 WAL fsync가 보장하며, heap 반영은 나중에 Checkpointer/BGWriter가 천천히 합니다. 크래시가 나도 WAL 리플레이로 재현되므로 안전합니다. heap까지 기다리면 커밋마다 랜덤 I/O가 발생해 성능이 무너집니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">Checkpoint가 하는 일이 <strong>아닌</strong> 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">dirty page를 데이터 파일로 flush한다</button>
+    <button type="button">pg_control의 redo point를 전진시킨다</button>
+    <button type="button">이전 WAL 세그먼트를 재활용/아카이브 가능하게 만든다</button>
+    <button type="button" data-correct>dead tuple을 회수해 테이블 공간을 재사용 가능하게 만든다</button>
+  </div>
+  <div class="quiz-expl">✅ dead tuple 회수는 <strong>VACUUM</strong>(8장)의 일입니다. Checkpoint는 "메모리의 dirty page를 디스크에 내려 복구 시작점을 전진"시키는 작업으로, MVCC 청소와는 전혀 다른 역할입니다. 이름이 비슷한 배경 작업들의 역할 구분이 운영의 기본기입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch09_wal_checkpoint.md" target="_blank" rel="noopener">chapters/ch09_wal_checkpoint.md</a> — WAL 레코드 구조, wal_level 상세, BGWriter 역할 분담, 워크로드별 튜닝 가이드와 진단 쿼리 모음이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch08.html"><span class="dir">← 이전</span><br><span class="title">8장. VACUUM과 Autovacuum</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch10.html"><span class="dir">다음 →</span><br><span class="title">10장. Replication — 복제</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

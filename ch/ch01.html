@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1장. ClickHouse 개요 — 왜 빠른가 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch01">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>1장. ClickHouse 개요 — 왜 빠른가</h1>
+<p class="lead">같은 데이터, 같은 쿼리인데 100배 빠른 이유가 있습니다. 열 저장·벡터화 실행·immutable 파트 — ClickHouse 속도의 3대 비밀을 그림으로 파헤칩니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-basic">기초</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: SQL 기본</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① OLAP과 OLTP의 근본적 트레이드오프 ② 행 저장 vs 열 저장 — 집계 쿼리가 읽는 데이터량의 차이 ③ 벡터화 실행이 CPU를 쥐어짜는 방법 ④ MergeTree 스토리지의 설계 철학 (immutable 파트 + 백그라운드 머지)</p>
+  </div>
+</div>
+
+<h2 id="s1">1.1 OLAP의 극단에 서 있는 데이터베이스</h2>
+
+<p>ClickHouse는 <strong>OLAP(Online Analytical Processing, 온라인 분석 처리)</strong> 워크로드에 특화된 <strong>컬럼 지향(column-oriented) DBMS</strong>입니다. 모든 데이터베이스는 OLTP와 OLAP 사이의 스펙트럼 위 어딘가에 있는데, ClickHouse는 처음부터 "가능한 한 빠른 OLAP 시스템"을 목표로 OLAP 쪽 극단에 자리 잡았습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>OLTP (예: PostgreSQL, MySQL)</th><th>OLAP (예: ClickHouse)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>대표 작업</strong></td><td>주문 1건 저장, 회원 정보 수정</td><td>"지난 1년간 국가별 매출 합계"</td></tr>
+    <tr><td><strong>쿼리 패턴</strong></td><td>소량의 행을 자주 읽고 씀</td><td>드물지만 한 번에 수억 행을 읽음</td></tr>
+    <tr><td><strong>최적화 방향</strong></td><td>행 단위 읽기/쓰기</td><td>컬럼 단위 대량 읽기</td></tr>
+    <tr><td><strong>저장 방식</strong></td><td>행형(row-oriented)</td><td>컬럼형(columnar)</td></tr>
+    <tr><td><strong>트랜잭션</strong></td><td>완전 지원</td><td>미지원 (mutation은 제한적)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>공식 문서는 ClickHouse를 <strong>"true column-oriented DBMS"</strong>라고 부릅니다. 단순히 데이터를 컬럼 단위로 <em>저장</em>하는 것을 넘어, <strong>쿼리 실행 자체가 컬럼(벡터) 단위로 이루어진다</strong>는 뜻입니다. 이 두 가지가 이 장의 핵심 주제입니다.</p>
+
+<h2 id="s2">1.2 행 저장 vs 열 저장 — 집계 쿼리가 읽는 데이터량</h2>
+
+<p>100개 컬럼을 가진 테이블에서 딱 2개 컬럼만 쓰는 분석 쿼리를 떠올려 보세요. 행 저장에서는 한 행의 모든 컬럼이 디스크에 붙어 있으므로 <strong>필요 없는 98개 컬럼도 함께 읽어야</strong> 합니다. 열 저장에서는 컬럼마다 파일이 분리되어 있어 <strong>필요한 파일만</strong> 읽습니다.</p>
+
+<div class="anim" data-steps="5" data-title="같은 집계 쿼리, 행 저장 vs 열 저장이 읽는 데이터량" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <text x="410" y="24" text-anchor="middle" class="sv-label sv-mono" font-size="13">SELECT sum(amount) WHERE country='Korea'</text>
+
+      <!-- 왼쪽: 행 저장 -->
+      <text x="200" y="56" text-anchor="middle" class="sv-label" font-size="15">📄 행 저장 (row-oriented)</text>
+      <rect x="40" y="70" width="320" height="34" rx="6" class="sv-box"/>
+      <text x="200" y="92" text-anchor="middle" class="sv-label-sm sv-mono">1001 · Alice · 25 · Korea · 50000</text>
+      <rect x="40" y="112" width="320" height="34" rx="6" class="sv-box"/>
+      <text x="200" y="134" text-anchor="middle" class="sv-label-sm sv-mono">1002 · Bob · 31 · USA · 12000</text>
+      <rect x="40" y="154" width="320" height="34" rx="6" class="sv-box"/>
+      <text x="200" y="176" text-anchor="middle" class="sv-label-sm sv-mono">1003 · Charlie · 42 · Japan · 78000</text>
+      <rect x="40" y="196" width="320" height="34" rx="6" class="sv-box"/>
+      <text x="200" y="218" text-anchor="middle" class="sv-label-sm sv-mono">1004 · Dave · 29 · Korea · 35000</text>
+
+      <!-- 오른쪽: 열 저장 -->
+      <line x1="410" y1="44" x2="410" y2="250" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="620" y="56" text-anchor="middle" class="sv-label" font-size="15">🗂 열 저장 (ClickHouse)</text>
+      <rect x="460" y="70" width="320" height="26" rx="6" class="sv-box"/>
+      <text x="472" y="88" class="sv-label-sm sv-mono">user_id.bin: 1001·1002·1003·1004</text>
+      <rect x="460" y="102" width="320" height="26" rx="6" class="sv-box"/>
+      <text x="472" y="120" class="sv-label-sm sv-mono">name.bin: Alice·Bob·Charlie·Dave</text>
+      <rect x="460" y="134" width="320" height="26" rx="6" class="sv-box"/>
+      <text x="472" y="152" class="sv-label-sm sv-mono">age.bin: 25·31·42·29</text>
+      <rect x="460" y="166" width="320" height="26" rx="6" class="sv-box"/>
+      <text x="472" y="184" class="sv-label-sm sv-mono">country.bin: Korea·USA·Japan·Korea</text>
+      <rect x="460" y="198" width="320" height="26" rx="6" class="sv-box"/>
+      <text x="472" y="216" class="sv-label-sm sv-mono">amount.bin: 50000·12000·78000·35000</text>
+
+      <!-- step2: 행 저장 전체 읽기 -->
+      <g data-show="2">
+        <rect x="36" y="66" width="328" height="168" rx="8" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="2" class="blink"/>
+        <text x="200" y="252" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">모든 행의 모든 컬럼을 디스크에서 읽음</text>
+      </g>
+
+      <!-- step3: 낭비 표시 -->
+      <g data-show="3">
+        <text x="200" y="274" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">⚠️ 필요한 건 country·amount 뿐 — I/O의 60% 낭비</text>
+      </g>
+
+      <!-- step4: 열 저장 2개 파일만 -->
+      <g data-show="4">
+        <rect x="456" y="162" width="328" height="34" rx="8" fill="none" stroke="var(--ok)" stroke-width="2.2" class="pulse"/>
+        <rect x="456" y="194" width="328" height="34" rx="8" fill="none" stroke="var(--ok)" stroke-width="2.2" class="pulse"/>
+        <text x="620" y="252" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">country.bin과 amount.bin — 이 2개 파일만 읽음 ✅</text>
+      </g>
+
+      <!-- step5: 요약 바 -->
+      <g data-show="5">
+        <text x="60" y="308" class="sv-label-sm">읽은 데이터량 비교</text>
+        <rect x="200" y="296" width="420" height="14" rx="7" fill="color-mix(in srgb, var(--danger) 30%, transparent)"/>
+        <text x="640" y="308" class="sv-label-sm" fill="var(--danger)">행 저장 100%</text>
+        <rect x="200" y="322" width="168" height="14" rx="7" fill="color-mix(in srgb, var(--ok) 45%, transparent)"/>
+        <text x="386" y="334" class="sv-label-sm" fill="var(--ok)">열 저장 40% (+압축하면 수%대)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>같은 테이블을 두 가지 방식으로 저장했습니다. 왼쪽은 <b>한 행의 모든 컬럼이 연속 배치</b>, 오른쪽은 <b>컬럼마다 별도 파일</b>입니다. 쿼리는 country로 필터해 amount를 합산합니다.</p>
+    <p>행 저장에서는 amount 하나를 얻기 위해 <b style="color:var(--danger)">행 전체를 읽어야</b> 합니다. name, age처럼 쿼리에 필요 없는 데이터까지 디스크에서 올라옵니다.</p>
+    <p>이 예시(5컬럼 중 2컬럼)에서도 I/O의 60%가 낭비입니다. 실무의 100컬럼 테이블에서 5컬럼만 쓰는 쿼리라면 <b>95%가 낭비</b>되는 셈이죠.</p>
+    <p>열 저장에서는 <b style="color:var(--ok)">필요한 2개 파일만</b> 읽습니다. name.bin, age.bin은 디스크를 건드리지도 않습니다.</p>
+    <p>읽는 데이터량 자체가 다르니 속도 차이는 필연입니다. 여기에 압축(다음 절)까지 더해지면 격차는 수십 배로 벌어집니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">1.3 보너스: 압축률의 극적인 차이</h2>
+
+<p>열 저장의 이점은 I/O 감소만이 아닙니다. <strong>같은 타입·같은 분포의 값이 물리적으로 연속 배치</strong>되므로 압축 알고리즘이 반복 패턴을 훨씬 잘 찾아냅니다.</p>
+
+<pre><code><span class="c">-- country 컬럼만 놓고 비교해 보면:</span>
+<span class="c">-- 행 저장: Korea, (다른 컬럼들...), USA, (다른 컬럼들...), Japan, ...</span>
+<span class="c">--   → 패턴이 끊겨서 LZ4 압축률 ~50%</span>
+<span class="c">-- 열 저장: Korea, Korea, Korea, USA, USA, Japan, Japan, ...</span>
+<span class="c">--   → 반복 패턴이 명확 → LowCardinality + LZ4로 ~95%까지 압축</span>
+
+<span class="k">CREATE TABLE</span> user_events
+(
+    user_id  UInt64,
+    country  <span class="f">LowCardinality</span>(String),  <span class="c">-- 고유값이 적은 문자열에 특효</span>
+    amount   UInt32
+)
+<span class="k">ENGINE</span> = MergeTree
+<span class="k">ORDER BY</span> (country, user_id);</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">압축 = I/O 감소 = 속도</div>
+    <p>압축은 디스크 절약 이상의 의미가 있습니다. 디스크에서 읽는 바이트 수 자체가 줄어들므로 <strong>쿼리 성능에 직결</strong>됩니다. ClickHouse는 범용 압축(LZ4, ZSTD) 외에도 Delta, Gorilla 같은 타입 특화 코덱을 제공합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">1.4 벡터화 실행 — CPU를 쥐어짜는 방법</h2>
+
+<p>저장만 열 단위인 것이 아니라, <strong>연산도 열(배열) 단위</strong>로 합니다. 행 하나씩 처리(row-at-a-time)하는 대신 수천 개 값의 배열(vector/chunk)에 연산을 한 번에 적용하는 것을 <strong>벡터화 쿼리 실행(vectorized query execution)</strong>이라고 합니다. 이 아이디어는 1957년 APL 언어까지 거슬러 올라가는, 과학 계산 분야에서 수십 년간 검증된 접근입니다.</p>
+
+<div class="anim" data-steps="4" data-title="row-at-a-time vs 벡터화 실행 — sum(amount) 계산" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 300">
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- 왼쪽: row-at-a-time -->
+      <text x="200" y="28" text-anchor="middle" class="sv-label" font-size="15">🐢 일반 DB (row-at-a-time)</text>
+      <g data-show="1">
+        <rect x="80" y="50" width="90" height="30" rx="6" class="sv-box"/>
+        <text x="125" y="70" text-anchor="middle" class="sv-label-sm sv-mono">50000</text>
+        <rect x="80" y="88" width="90" height="30" rx="6" class="sv-box"/>
+        <text x="125" y="108" text-anchor="middle" class="sv-label-sm sv-mono">12000</text>
+        <rect x="80" y="126" width="90" height="30" rx="6" class="sv-box"/>
+        <text x="125" y="146" text-anchor="middle" class="sv-label-sm sv-mono">78000</text>
+        <rect x="80" y="164" width="90" height="30" rx="6" class="sv-box"/>
+        <text x="125" y="184" text-anchor="middle" class="sv-label-sm sv-mono">35000</text>
+      </g>
+      <g data-show="2">
+        <path d="M 172 65 L 240 65" class="sv-arrow" marker-end="url(#arr1)"/>
+        <path d="M 172 103 L 240 103" class="sv-arrow" marker-end="url(#arr1)"/>
+        <path d="M 172 141 L 240 141" class="sv-arrow" marker-end="url(#arr1)"/>
+        <path d="M 172 179 L 240 179" class="sv-arrow" marker-end="url(#arr1)"/>
+        <rect x="248" y="50" width="96" height="144" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)"/>
+        <text x="296" y="115" text-anchor="middle" class="sv-label-sm">sum() 호출</text>
+        <text x="296" y="133" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">행마다 1번</text>
+        <text x="200" y="222" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">N행 = 함수 호출 N번 + 분기 예측 실패</text>
+      </g>
+
+      <!-- 오른쪽: 벡터화 -->
+      <line x1="410" y1="20" x2="410" y2="250" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="620" y="28" text-anchor="middle" class="sv-label" font-size="15">⚡ ClickHouse (vectorized)</text>
+      <g data-show="3">
+        <rect x="460" y="86" width="220" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="570" y="111" text-anchor="middle" class="sv-label-sm sv-mono">[50000, 12000, 78000, 35000, …]</text>
+        <path d="M 684 106 L 720 106" class="sv-arrow flow-line"/>
+        <rect x="722" y="76" width="70" height="60" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="757" y="101" text-anchor="middle" class="sv-label-sm">SIMD</text>
+        <text x="757" y="119" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">호출 1번</text>
+        <text x="620" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">CPU 명령 1개로 4~8개 값 동시 처리</text>
+      </g>
+      <g data-show="4">
+        <rect x="460" y="184" width="332" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="626" y="210" text-anchor="middle" class="sv-label" font-size="13">벡터화가 빠른 3가지 이유</text>
+        <text x="626" y="230" text-anchor="middle" class="sv-label-sm">① 연속 메모리 → L1/L2 캐시 히트율↑</text>
+        <text x="626" y="248" text-anchor="middle" class="sv-label-sm">② SIMD 동시 처리 ③ 함수 호출 오버헤드↓</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>amount 컬럼의 값들이 도착했습니다. 이 값들을 모두 더하는 <code>sum(amount)</code>을 두 방식으로 계산해 봅시다.</p>
+    <p>row-at-a-time 방식은 <b style="color:var(--danger)">행마다 함수를 호출</b>합니다. 100만 행이면 100만 번의 호출 오버헤드와 조건 분기가 발생합니다.</p>
+    <p>벡터화 방식은 값들을 <b>연속된 배열</b>로 두고, <b style="color:var(--ok)">SIMD 명령어</b>로 한 번에 4~8개씩 처리합니다. ClickHouse는 하드웨어가 지원하는 가장 최신 SIMD 명령 세트를 자동 선택합니다.</p>
+    <p>정리하면 ① 캐시 친화적 메모리 배치 ② SIMD 병렬 처리 ③ 함수 호출 횟수 감소 — 이 세 가지가 벡터화 실행의 힘입니다.</p>
+  </div>
+</div>
+
+<p>쿼리 처리 속도를 높이는 또 다른 접근으로 <strong>런타임 코드 생성(runtime code generation)</strong>이 있습니다. 쿼리마다 기계어 코드를 즉석에서 만들어 여러 연산을 하나로 융합(fuse)하는 방식입니다. 공식 문서는 CMU 연구를 인용하며 <strong>두 접근의 결합이 최선</strong>이라고 밝히고, 실제로 ClickHouse는 벡터화를 주축으로 삼되 제한적인 코드 생성을 보조적으로 사용합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>접근</th><th>원리</th><th>장점</th><th>단점</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Vectorized Execution</strong></td><td>데이터를 배열 단위로 처리</td><td>SIMD 활용 용이, 구현 단순</td><td>중간 벡터가 L2 캐시를 넘으면 성능 저하</td></tr>
+    <tr><td><strong>Runtime Code Generation</strong></td><td>실행 시 기계어를 동적 생성</td><td>연산 융합, 간접 호출 제거</td><td>생성 오버헤드, 구현 복잡</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s5">1.5 스토리지의 설계 철학 — MergeTree는 LSM Tree가 아니다</h2>
+
+<p>ClickHouse의 대표 스토리지 엔진 <strong>MergeTree</strong>는 겉보기에 RocksDB류의 LSM Tree와 닮았지만, 결정적 차이가 있습니다. <strong>MEMTABLE(인메모리 쓰기 버퍼)도 WAL(Write-Ahead Log)도 없습니다.</strong> INSERT된 데이터는 프라이머리 키 순서로 정렬되어 <strong>즉시 디스크에 새 파트(part)로 기록</strong>됩니다.</p>
+
+<div class="anim" data-steps="5" data-title="LSM Tree vs MergeTree — INSERT가 디스크에 닿기까지" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <text x="200" y="26" text-anchor="middle" class="sv-label" font-size="15">🪨 LSM Tree (RocksDB 등)</text>
+      <text x="620" y="26" text-anchor="middle" class="sv-label" font-size="15">🌲 MergeTree (ClickHouse)</text>
+      <line x1="410" y1="16" x2="410" y2="340" class="sv-line" stroke-dasharray="4 6"/>
+
+      <!-- step1: INSERT 도착 -->
+      <g data-show="1">
+        <rect x="130" y="40" width="140" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="200" y="62" text-anchor="middle" class="sv-label-sm">INSERT 도착</text>
+        <rect x="550" y="40" width="140" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="620" y="62" text-anchor="middle" class="sv-label-sm">INSERT 도착 (배치)</text>
+      </g>
+
+      <!-- step2: LSM memtable + wal -->
+      <g data-show="2">
+        <path d="M 200 74 L 200 100" class="sv-arrow" marker-end="url(#arr2)"/>
+        <rect x="110" y="104" width="180" height="44" rx="8" fill="color-mix(in srgb, var(--warn) 16%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="200" y="123" text-anchor="middle" class="sv-label-sm">MEMTABLE (메모리 버퍼)</text>
+        <text x="200" y="140" text-anchor="middle" class="sv-label-sm sv-mono">정렬된 맵</text>
+        <path d="M 292 126 L 330 126" stroke="var(--warn)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <rect x="332" y="108" width="60" height="36" rx="8" fill="none" stroke="var(--warn)" stroke-width="1.4"/>
+        <text x="362" y="130" text-anchor="middle" class="sv-label-sm">WAL</text>
+        <text x="200" y="168" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">메모리에 쓰고 + 복구용 로그도 씀</text>
+      </g>
+
+      <!-- step3: LSM flush -->
+      <g data-show="3">
+        <path d="M 200 176 L 200 204" class="sv-arrow flow-line"/>
+        <rect x="110" y="208" width="180" height="38" rx="8" class="sv-box"/>
+        <text x="200" y="232" text-anchor="middle" class="sv-label-sm sv-mono">Level 0 SSTable</text>
+        <rect x="110" y="256" width="180" height="38" rx="8" class="sv-box"/>
+        <text x="200" y="280" text-anchor="middle" class="sv-label-sm sv-mono">Level 1 SSTable (compaction)</text>
+        <text x="200" y="318" text-anchor="middle" class="sv-label-sm">가득 차면 그제야 디스크로 flush</text>
+      </g>
+
+      <!-- step4: MergeTree 즉시 디스크 -->
+      <g data-show="4">
+        <path d="M 620 74 L 620 100" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="530" y="104" width="180" height="44" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="620" y="123" text-anchor="middle" class="sv-label-sm sv-mono">Part all_1_1_0</text>
+        <text x="620" y="140" text-anchor="middle" class="sv-label-sm">즉시 디스크에! 💾</text>
+        <text x="620" y="168" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">MEMTABLE 없음 · WAL 없음</text>
+      </g>
+
+      <!-- step5: MergeTree 백그라운드 머지 + 결론 -->
+      <g data-show="5">
+        <rect x="530" y="188" width="85" height="36" rx="8" class="sv-box"/>
+        <text x="572" y="211" text-anchor="middle" class="sv-label-sm sv-mono">part 2</text>
+        <rect x="625" y="188" width="85" height="36" rx="8" class="sv-box"/>
+        <text x="667" y="211" text-anchor="middle" class="sv-label-sm sv-mono">part 3</text>
+        <path d="M 572 226 Q 590 250 615 258" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 667 226 Q 650 250 625 258" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="540" y="260" width="160" height="36" rx="8" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="620" y="283" text-anchor="middle" class="sv-label-sm">🔧 백그라운드 머지</text>
+        <text x="620" y="322" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">무거운 변환은 전부 머지 시점으로 (merge-time computation)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>양쪽 모두 INSERT가 도착했습니다. LSM은 빈번한 소량 쓰기(OLTP 스타일), MergeTree는 배치 단위 대량 쓰기(OLAP 스타일)를 전제로 설계됐습니다.</p>
+    <p>LSM Tree는 먼저 <b style="color:var(--warn)">메모리의 MEMTABLE</b>에 쓰고, 장애 대비를 위해 <b>WAL에도 중복 기록</b>합니다. 쓰기마다 이중 작업이 발생하죠.</p>
+    <p>MEMTABLE이 가득 차면 SSTable로 flush되고, 레벨 간 compaction이 이어집니다. 읽기는 MEMTABLE + 여러 레벨을 모두 확인해야 합니다.</p>
+    <p>MergeTree는 다릅니다. INSERT는 정렬·압축을 거쳐 <b style="color:var(--ok)">즉시 디스크에 파트로 기록</b>됩니다. MEMTABLE도 WAL도 없어 단순하고, 배치 INSERT가 초고속입니다.</p>
+    <p>쌓인 파트는 <b style="color:var(--purple)">백그라운드 머지</b>가 합칩니다. 중복 제거·사전 집계·TTL 처리 같은 무거운 변환을 INSERT 시점이 아닌 머지 시점으로 미루는 것 — 이것이 INSERT를 가볍게 유지하는 비결입니다.</p>
+  </div>
+</div>
+
+<p>이 구조에서 세 가지 중요한 성질이 나옵니다.</p>
+<ul>
+  <li><strong>INSERT와 SELECT의 완전 격리</strong>: INSERT는 새 파트를 만들 뿐 기존 데이터를 건드리지 않으므로, 동시 실행 중인 SELECT에 영향을 주지 않습니다. SELECT는 쿼리 시작 시점의 파트 스냅샷을 봅니다.</li>
+  <li><strong>동시 INSERT 간 동기화 불필요</strong>: 각자 자기 파트만 만들면 되니까요.</li>
+  <li><strong>Merge-time Computation</strong>: 머지는 어차피 파트를 읽고 다시 쓰는 작업이므로, 그 김에 중복 제거·집계 같은 변환을 얹어도 추가 비용이 미미합니다.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">이 설계의 대가: 배치 INSERT 필수</div>
+    <p>INSERT마다 파트(디렉터리+파일들)가 생성되므로, <strong>초당 수천 번의 소량 INSERT는 파트 폭증</strong>으로 이어집니다("Too many parts" 에러). 배치로 모아 넣거나 async insert를 사용해야 합니다. 4장과 9장에서 자세히 다룹니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">1.6 Data Pruning — 읽지 않는 것이 가장 빠르다</h2>
+
+<p>공식 문서의 명언: <em>"The fastest way to read data is to not read it at all."</em> ClickHouse는 불필요한 데이터를 건너뛰기 위한 세 가지 장치를 제공합니다.</p>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>🔑 Sparse Primary Index</h4>
+    <p>테이블의 정렬 순서를 정의하는 희소 인덱스. WHERE 필터를 풀 스캔 대신 이진 탐색으로 — O(n)이 O(log n)으로. → <a href="ch07.html">7장</a></p>
+  </div>
+  <div class="card">
+    <h4>🪞 Table Projections</h4>
+    <p>같은 데이터를 다른 프라이머리 키로 정렬한 내부 복제본. 자주 쓰는 필터 조건이 여러 개일 때 유용하지만, 데이터가 중복됩니다.</p>
+  </div>
+  <div class="card">
+    <h4>⏭ Skipping Indexes</h4>
+    <p>컬럼에 min/max, 고유값 집합 같은 통계를 내장해 블록을 건너뜁니다. 프라이머리 키와 직교하는 보조 수단입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 잘 설계된 프라이머리 키는 스캔량을 극적으로 줄인다</span>
+<span class="k">EXPLAIN</span> indexes = 1
+<span class="k">SELECT</span> <span class="f">count</span>() <span class="k">FROM</span> user_events <span class="k">WHERE</span> country = <span class="s">'Korea'</span>;
+
+<span class="c">-- PrimaryKey  Parts: 1/4  Granules: 12/3257   ← 3257개 중 12개만 읽음!</span></code></pre>
+
+<h2 id="s7">1.7 확장 모델 — 수직과 수평</h2>
+
+<p><strong>수직 확장</strong>: ClickHouse는 쿼리 플랜을 여러 lane으로 펼쳐 코어당 하나씩 병렬 실행합니다. 각 lane이 테이블의 서로 다른 범위를 처리하므로 코어 수에 비례해 빨라집니다(3장에서 스레드 모델을 다룹니다).</p>
+
+<p><strong>수평 확장</strong>: 단일 노드로 부족하면 테이블을 <strong>샤드(shard)</strong>로 분할해 여러 노드에 분산합니다(8장). 단, 공식 문서가 인정하는 제약이 있습니다 — <strong>클러스터는 elastic하지 않습니다</strong>. 새 샤드를 추가해도 데이터가 자동으로 리밸런싱되지 않으므로, 초기 샤딩 전략이 중요합니다.</p>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">1장에서 바로 도출되는 운영 원칙 4가지</div>
+    <p>① 배치 INSERT 필수 (파트 폭증 방지) ② Mutation(UPDATE/DELETE) 최소화 — immutable 파트 기반이라 파트 전체 재작성 ③ 프라이머리 키 설계가 곧 성능 — 생성 후 ORDER BY 변경 불가 ④ 샤드 자동 리밸런싱 없음을 전제로 설계</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">100개 컬럼 테이블에서 5개 컬럼만 사용하는 집계 쿼리를 실행할 때, 컬럼 지향 저장이 빠른 가장 직접적인 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">데이터가 메모리에 모두 캐시되어 있기 때문</button>
+    <button type="button" data-correct>필요한 5개 컬럼의 파일만 디스크에서 읽기 때문</button>
+    <button type="button">인덱스가 자동으로 100개 컬럼 전체에 생성되기 때문</button>
+    <button type="button">행 단위 락을 사용하지 않기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 컬럼 지향 저장에서는 컬럼마다 파일이 분리되어 있어, 쿼리에 필요한 컬럼 파일만 읽습니다. 행 지향이라면 95개 컬럼 분량의 I/O가 낭비됩니다. 여기에 연속 배치로 인한 높은 압축률이 I/O를 한 번 더 줄여 줍니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">MergeTree가 LSM Tree와 구조적으로 다른 점은?</div>
+  <div class="quiz-opts">
+    <button type="button">MergeTree는 백그라운드 머지(compaction)를 하지 않는다</button>
+    <button type="button">MergeTree는 데이터를 정렬하지 않고 저장한다</button>
+    <button type="button" data-correct>MergeTree에는 MEMTABLE과 WAL이 없어 INSERT가 즉시 디스크 파트로 기록된다</button>
+    <button type="button">MergeTree는 읽기 전용이라 INSERT를 지원하지 않는다</button>
+  </div>
+  <div class="quiz-expl">✅ 공식 문서 원문: "MergeTree is not an LSM tree because it does not contain MEMTABLE and LOG: inserted data is written directly to the filesystem." 그래서 배치 INSERT는 초고속이지만, 소량 빈번 INSERT는 파트 폭증을 부릅니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch01_clickhouse_overview.md" target="_blank" rel="noopener">chapters/ch01_clickhouse_overview.md</a> — 벡터화 실행의 역사(APL 계보), MergeTree vs LSM 상세 비교 다이어그램이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html"><span class="dir">← 이전</span><br><span class="title">학습 홈</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch02.html"><span class="dir">다음 →</span><br><span class="title">2장. 내부 컴포넌트와 쿼리 처리</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

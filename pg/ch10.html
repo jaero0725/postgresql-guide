@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10장. Replication — 복제 — PostgreSQL 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="pg/ch10">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a class="on-pg" href="index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🐘 PostgreSQL 가이드</div>
+  <a class="chap" href="index.html" data-page="pg/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="pg/ch01"><span class="num">01</span> PostgreSQL 개요와 철학</a>
+  <a class="chap" href="ch02.html" data-page="pg/ch02"><span class="num">02</span> 아키텍처 — 프로세스와 메모리</a>
+  <a class="chap" href="ch03.html" data-page="pg/ch03"><span class="num">03</span> MVCC — 동시성의 비밀</a>
+  <a class="chap" href="ch04.html" data-page="pg/ch04"><span class="num">04</span> Storage · Tuple · TOAST</a>
+  <div class="group-title">쿼리와 트랜잭션</div>
+  <a class="chap" href="ch05.html" data-page="pg/ch05"><span class="num">05</span> 인덱스 완전 정복</a>
+  <a class="chap" href="ch06.html" data-page="pg/ch06"><span class="num">06</span> 쿼리 플래너와 EXPLAIN</a>
+  <a class="chap" href="ch07.html" data-page="pg/ch07"><span class="num">07</span> 트랜잭션과 격리 수준</a>
+  <div class="group-title">운영의 핵심</div>
+  <a class="chap" href="ch08.html" data-page="pg/ch08"><span class="num">08</span> VACUUM과 Autovacuum</a>
+  <a class="chap" href="ch09.html" data-page="pg/ch09"><span class="num">09</span> WAL과 Checkpoint</a>
+  <a class="chap" href="ch10.html" data-page="pg/ch10"><span class="num">10</span> Replication — 복제</a>
+  <a class="chap" href="ch11.html" data-page="pg/ch11"><span class="num">11</span> 백업과 PITR 복구</a>
+  <div class="group-title">확장과 관리</div>
+  <a class="chap" href="ch12.html" data-page="pg/ch12"><span class="num">12</span> 파티셔닝</a>
+  <a class="chap" href="ch13.html" data-page="pg/ch13"><span class="num">13</span> Extension 생태계</a>
+  <a class="chap" href="ch14.html" data-page="pg/ch14"><span class="num">14</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>10장. Replication — 한 대가 죽어도 서비스는 계속된다</h1>
+<p class="lead">9장의 WAL은 복구용 일기장이자, 복제의 방송 원본이기도 합니다. WAL 스트리밍이 스탠바이로 흐르는 길, 동기/비동기의 트레이드오프, 그리고 페일오버의 순간까지.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 35분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 9장 WAL</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Physical vs Logical — 두 종류의 복제와 선택 기준 ② WAL 스트리밍이 스탠바이로 흐르고 적용되는 과정(write/flush/replay lag) ③ 동기/비동기 커밋의 차이와 쿼럼 구성 ④ 페일오버 시나리오와 replication slot의 빛과 그림자</p>
+  </div>
+</div>
+
+<h2 id="s1">10.1 두 종류의 복제 — Physical vs Logical</h2>
+
+<p>PostgreSQL의 복제는 크게 두 갈래입니다. <strong>Physical 복제</strong>는 WAL 바이트를 그대로 스트리밍해 "클러스터 전체의 완전한 쌍둥이"를 만들고, <strong>Logical 복제</strong>는 WAL을 해석(디코드)해 "행 단위 변경"만 골라 보냅니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>항목</th><th>Physical Replication</th><th>Logical Replication</th></tr></thead>
+  <tbody>
+    <tr><td>복제 단위</td><td>WAL 바이트 (블록·레코드)</td><td>논리 row 변경 (INSERT/UPDATE/DELETE)</td></tr>
+    <tr><td>스코프</td><td>클러스터 전체 (모든 DB·객체)</td><td>지정한 PUBLICATION (특정 테이블)</td></tr>
+    <tr><td>스탠바이 쓰기</td><td>불가 (read-only)</td><td>가능 (독립 primary)</td></tr>
+    <tr><td>DDL 복제</td><td>자동으로 함께</td><td><strong>안 됨</strong> (v17까지) — 수동 적용</td></tr>
+    <tr><td>메이저 버전</td><td>동일해야 함</td><td>서로 달라도 됨 → 업그레이드에 활용</td></tr>
+    <tr><td>주 용도</td><td>HA, 읽기 분산, DR</td><td>CDC, 마이그레이션, 부분 복제</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>선택 기준은 간단합니다: <strong>"전체를 똑같이, 장애 시 즉시 전환" → Physical</strong>, <strong>"특정 테이블만, 다른 버전/스키마로" → Logical</strong>. 이 장은 HA의 근간인 Physical 스트리밍을 중심으로 봅니다.</p>
+
+<h2 id="s2">10.2 WAL 스트리밍 — 커밋이 스탠바이에 닿기까지</h2>
+
+<p>Primary에서 커밋된 WAL은 <strong>walsender</strong> 프로세스가 네트워크로 흘려보내고, 스탠바이의 <strong>walreceiver</strong>가 받아 저장하고, <strong>startup 프로세스</strong>가 리플레이합니다. 각 단계마다 지연(lag)이 측정됩니다.</p>
+
+<div class="anim" data-steps="5" data-title="WAL 스트리밍 — write_lag → flush_lag → replay_lag" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- primary -->
+      <rect x="20" y="60" width="220" height="150" rx="12" fill="none" stroke="var(--pg-soft)" stroke-width="1.8"/>
+      <text x="130" y="48" text-anchor="middle" class="sv-label" font-size="14">🐘 Primary</text>
+      <rect x="40" y="80" width="180" height="46" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+      <text x="130" y="102" text-anchor="middle" class="sv-label sv-mono" font-size="12">pg_wal/ (commit LSN)</text>
+      <text x="130" y="118" text-anchor="middle" class="sv-label-sm">WAL 기록 완료</text>
+      <rect x="40" y="145" width="180" height="44" rx="8" class="sv-box"/>
+      <text x="130" y="166" text-anchor="middle" class="sv-label sv-mono" font-size="12">walsender</text>
+      <text x="130" y="182" text-anchor="middle" class="sv-label-sm">스트리밍 담당</text>
+
+      <!-- standby -->
+      <rect x="470" y="60" width="310" height="230" rx="12" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="625" y="48" text-anchor="middle" class="sv-label" font-size="14">🛟 Standby (hot_standby=on)</text>
+      <rect x="490" y="80" width="270" height="44" rx="8" class="sv-box"/>
+      <text x="625" y="101" text-anchor="middle" class="sv-label sv-mono" font-size="12">walreceiver — WAL 수신·write</text>
+      <text x="625" y="117" text-anchor="middle" class="sv-label-sm">OS 버퍼에 기록</text>
+      <rect x="490" y="140" width="270" height="44" rx="8" class="sv-box"/>
+      <text x="625" y="161" text-anchor="middle" class="sv-label sv-mono" font-size="12">pg_wal/ fsync — 디스크 영속</text>
+      <rect x="490" y="200" width="270" height="44" rx="8" class="sv-box"/>
+      <text x="625" y="221" text-anchor="middle" class="sv-label sv-mono" font-size="12">startup — WAL 리플레이</text>
+      <text x="625" y="237" text-anchor="middle" class="sv-label-sm">읽기 쿼리에 보이게 됨</text>
+
+      <!-- step1: commit at primary -->
+      <g data-show="1-1">
+        <circle cx="130" cy="103" r="34" fill="none" stroke="var(--ok)" stroke-width="2" class="pulse"/>
+      </g>
+
+      <!-- step2: stream -->
+      <g data-show="2">
+        <path d="M 240 167 Q 350 130 485 102" stroke="var(--accent)" stroke-width="2.5" fill="none" class="flow-line" marker-end="url(#arr10a)"/>
+        <text x="345" y="122" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">네트워크 스트리밍</text>
+      </g>
+      <g data-show="2-2">
+        <rect x="290" y="255" width="180" height="30" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="380" y="275" text-anchor="middle" class="sv-label-sm sv-mono">← 여기까지 write_lag</text>
+      </g>
+
+      <!-- step3: fsync -->
+      <g data-show="3">
+        <path d="M 625 124 L 625 136" stroke="var(--ok)" stroke-width="2.5" class="flow-line" marker-end="url(#arr10b)"/>
+      </g>
+      <g data-show="3-3">
+        <rect x="290" y="255" width="180" height="30" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="380" y="275" text-anchor="middle" class="sv-label-sm sv-mono">← 여기까지 flush_lag</text>
+      </g>
+
+      <!-- step4: replay -->
+      <g data-show="4">
+        <path d="M 625 184 L 625 196" stroke="var(--purple)" stroke-width="2.5" class="flow-line" marker-end="url(#arr10c)"/>
+      </g>
+      <g data-show="4-4">
+        <rect x="290" y="255" width="180" height="30" rx="7" fill="color-mix(in srgb, var(--purple) 14%, transparent)" stroke="var(--purple)"/>
+        <text x="380" y="275" text-anchor="middle" class="sv-label-sm sv-mono">← 여기까지 replay_lag</text>
+      </g>
+
+      <!-- step5: summary -->
+      <g data-show="5">
+        <rect x="20" y="240" width="240" height="80" rx="10" class="sv-box"/>
+        <text x="140" y="264" text-anchor="middle" class="sv-label" font-size="12.5">pg_stat_replication</text>
+        <text x="140" y="285" text-anchor="middle" class="sv-label-sm sv-mono">write_lag ≤ flush_lag</text>
+        <text x="140" y="303" text-anchor="middle" class="sv-label-sm sv-mono">≤ replay_lag</text>
+        <text x="625" y="315" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">읽기 쿼리에 보이는 지연 = replay_lag</text>
+      </g>
+      <defs>
+        <marker id="arr10a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/></marker>
+        <marker id="arr10b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr10c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>Primary에서 트랜잭션이 커밋됩니다. WAL이 로컬 <code>pg_wal/</code>에 fsync된 지점이 <b>commit LSN</b>입니다.</p>
+    <p><b>walsender</b>가 WAL을 네트워크로 스트리밍하고, 스탠바이의 <b>walreceiver</b>가 받아서 OS에 write합니다. 여기까지의 지연이 <b style="color:var(--accent)">write_lag</b> — 주로 네트워크 상태를 반영합니다.</p>
+    <p>스탠바이가 받은 WAL을 자기 디스크에 <b>fsync</b>합니다. 여기까지가 <b style="color:var(--ok)">flush_lag</b> — 이 지점부터는 스탠바이가 크래시해도 WAL이 보존됩니다.</p>
+    <p>startup 프로세스가 WAL을 <b>리플레이</b>해 실제 데이터에 반영합니다. 여기까지가 <b style="color:var(--purple)">replay_lag</b> — 스탠바이의 읽기 쿼리에 데이터가 보이는 시점입니다.</p>
+    <p>세 지연은 항상 <code>write_lag ≤ flush_lag ≤ replay_lag</code> 순입니다. "복제가 느려요"라고 할 땐 <b>어느 단계가 느린지</b>부터 <code>pg_stat_replication</code>으로 분해하세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- Primary에서: 스탠바이별 지연을 단계별로 분해</span>
+<span class="k">SELECT</span> application_name, state, sync_state,
+       <span class="f">pg_wal_lsn_diff</span>(<span class="f">pg_current_wal_lsn</span>(), replay_lsn) <span class="k">AS</span> replay_bytes,
+       write_lag, flush_lag, replay_lag
+<span class="k">FROM</span> pg_stat_replication;</code></pre>
+
+<h2 id="s3">10.3 구축 레시피 — 3줄 요약</h2>
+
+<p>스트리밍 복제 구축은 v12+ 기준으로 매우 단순해졌습니다. Primary에 복제 권한을 열고, <code>pg_basebackup</code> 한 방으로 스탠바이를 만듭니다.</p>
+
+<pre><code><span class="c"># [Primary] postgresql.conf</span>
+wal_level = replica              <span class="c"># v10+ 기본값</span>
+max_wal_senders = <span class="n">10</span>             <span class="c"># 스탠바이 수 + pg_basebackup 여유</span>
+max_slot_wal_keep_size = <span class="n">64</span>GB    <span class="c"># v13+. 슬롯 폭주 방어 (필수급 권장)</span>
+
+<span class="c"># [Primary] pg_hba.conf — 복제 접속 허용</span>
+host  replication  replicator  10.0.0.0/16  scram-sha-256
+
+<span class="c"># [Standby] 데이터 디렉터리를 통째로 복제 + 자동 설정</span>
+pg_basebackup -h primary.example -U replicator \
+    -D $PGDATA -X stream -R -C -S standby1_slot -P
+<span class="c"># -R: standby.signal + primary_conninfo 자동 생성</span>
+<span class="c"># -C -S: replication slot 생성 후 연결</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">Replication Slot — 약속 장치의 양면</div>
+    <p>슬롯은 "스탠바이가 아직 안 받아간 WAL은 지우지 않겠다"는 약속입니다. 일시적 단절에도 재동기화 없이 catch-up할 수 있어 강력하지만, <strong>스탠바이를 폐기하고 슬롯만 남기면 WAL이 무한 축적</strong>되어 디스크가 터집니다. <code>max_slot_wal_keep_size</code>(v13+)로 상한을 꼭 두세요.</p>
+  </div>
+</div>
+
+<h2 id="s4">10.4 동기 vs 비동기 — 커밋은 누구를 기다리는가</h2>
+
+<p>기본 스트리밍은 <strong>비동기</strong>입니다. Primary는 자기 WAL만 flush하면 커밋을 응답하고, 스탠바이 전송은 뒤따라갑니다. 빠르지만, Primary가 그 직후 죽으면 <em>마지막 몇 개의 커밋이 스탠바이에 없을 수 있습니다</em>. <code>synchronous_standby_names</code>를 설정하면 <strong>동기</strong>가 되어 스탠바이의 확인까지 기다립니다.</p>
+
+<div class="anim" data-steps="4" data-title="비동기 vs 동기 커밋 — 무엇을 기다리는가" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <line x1="400" y1="20" x2="400" y2="300" class="sv-line" stroke-dasharray="4 6"/>
+      <!-- async side -->
+      <text x="200" y="30" text-anchor="middle" class="sv-label" font-size="14">⚡ 비동기 (기본)</text>
+      <rect x="60" y="50" width="120" height="44" rx="9" fill="color-mix(in srgb, var(--pg-soft) 18%, transparent)" stroke="var(--pg-soft)" stroke-width="1.5"/>
+      <text x="120" y="77" text-anchor="middle" class="sv-label" font-size="12.5">Primary</text>
+      <rect x="230" y="50" width="120" height="44" rx="9" class="sv-box"/>
+      <text x="290" y="77" text-anchor="middle" class="sv-label" font-size="12.5">Standby</text>
+
+      <g data-show="1">
+        <text x="120" y="130" text-anchor="middle" class="sv-label-sm">로컬 WAL fsync ✓</text>
+        <text x="120" y="155" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">즉시 COMMIT 응답!</text>
+        <path d="M 180 72 L 225 72" stroke="var(--text-faint)" stroke-width="2" stroke-dasharray="5 4" fill="none" class="flow-line" marker-end="url(#arr10d)"/>
+        <text x="200" y="112" text-anchor="middle" class="sv-label-sm">전송은 뒤따라감</text>
+      </g>
+      <g data-show="2-2">
+        <rect x="55" y="180" width="290" height="66" rx="10" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="200" y="205" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">💥 직후 Primary 사망하면?</text>
+        <text x="200" y="228" text-anchor="middle" class="sv-label-sm">마지막 커밋 몇 개가 스탠바이에 없을 수 있음</text>
+      </g>
+
+      <!-- sync side -->
+      <text x="600" y="30" text-anchor="middle" class="sv-label" font-size="14">🔒 동기 (synchronous_standby_names)</text>
+      <rect x="450" y="50" width="120" height="44" rx="9" fill="color-mix(in srgb, var(--pg-soft) 18%, transparent)" stroke="var(--pg-soft)" stroke-width="1.5"/>
+      <text x="510" y="77" text-anchor="middle" class="sv-label" font-size="12.5">Primary</text>
+      <rect x="630" y="50" width="120" height="44" rx="9" class="sv-box"/>
+      <text x="690" y="77" text-anchor="middle" class="sv-label" font-size="12.5">Standby</text>
+
+      <g data-show="3">
+        <path d="M 570 62 L 625 62" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr10e)"/>
+        <text x="598" y="52" text-anchor="middle" class="sv-label-sm">WAL 전송</text>
+        <path d="M 625 84 L 570 84" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr10f)"/>
+        <text x="598" y="102" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">flush 확인 ACK</text>
+        <text x="510" y="135" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--ok)">ACK 받은 후에야 응답</text>
+        <text x="510" y="155" text-anchor="middle" class="sv-label-sm">두 서버에 영속 = 손실 0 (RPO 0)</text>
+      </g>
+      <g data-show="4">
+        <rect x="445" y="180" width="310" height="100" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="600" y="205" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--warn)">⚠️ 대가: 유일한 sync 스탠바이가 죽으면</text>
+        <text x="600" y="228" text-anchor="middle" class="sv-label-sm">Primary의 모든 커밋이 무한 대기!</text>
+        <text x="600" y="256" text-anchor="middle" class="sv-label-sm sv-mono">→ ANY 2 (s1, s2, s3) 쿼럼 권장</text>
+      </g>
+      <defs>
+        <marker id="arr10d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--text-faint)"/></marker>
+        <marker id="arr10e" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/></marker>
+        <marker id="arr10f" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>비동기</b>: Primary는 로컬 WAL fsync만 끝나면 즉시 커밋을 응답합니다. 스탠바이 전송은 백그라운드에서 뒤따라갑니다. 빠르지만…</p>
+    <p>응답 직후 Primary가 죽고 스탠바이로 페일오버하면, <b style="color:var(--danger)">아직 전송되지 않은 마지막 커밋들이 사라질 수 있습니다</b>. "커밋 성공을 본 고객의 주문이 없어지는" 시나리오입니다.</p>
+    <p><b>동기</b>: Primary는 WAL을 보내고 스탠바이의 <b style="color:var(--ok)">flush 확인(ACK)</b>을 받은 후에야 커밋을 응답합니다. 두 서버의 디스크에 영속됐으므로 데이터 손실이 0(RPO 0)입니다.</p>
+    <p>대가도 있습니다. sync 스탠바이가 하나뿐인데 그것이 죽으면 <b style="color:var(--warn)">Primary의 모든 커밋이 멈춥니다</b>. 그래서 <code>ANY 2 (s1, s2, s3)</code> 같은 <b>쿼럼 구성</b>이 실무 권장입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c"># postgresql.conf — 쿼럼 기반 동기 복제</span>
+synchronous_standby_names = <span class="s">'ANY 2 (s1, s2, s3)'</span>  <span class="c"># 3대 중 아무 2대가 ACK하면 커밋</span>
+
+<span class="c">-- 정말 중요한 트랜잭션만 스탠바이 리플레이까지 기다리기</span>
+<span class="k">SET LOCAL</span> synchronous_commit = remote_apply;   <span class="c">-- "쓴 직후 스탠바이에서 읽어도 최신" 보장</span></code></pre>
+
+<h2 id="s5">10.5 페일오버 — 스탠바이가 왕좌에 오르는 순간</h2>
+
+<p>계획된 전환은 <strong>Switchover</strong>, 장애에 의한 전환은 <strong>Failover</strong>라고 부릅니다. 핵심 절차는 같습니다: 스탠바이를 <strong>승격(promote)</strong>시키고, 트래픽을 돌리고, 구 Primary가 복귀할 땐 <strong>pg_rewind</strong>로 새 타임라인에 맞춥니다.</p>
+
+<div class="anim" data-steps="5" data-title="페일오버 시나리오 — 승격, 타임라인, 그리고 복귀" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- app -->
+      <rect x="330" y="20" width="140" height="42" rx="9" class="sv-box"/>
+      <text x="400" y="46" text-anchor="middle" class="sv-label" font-size="12.5">Application</text>
+
+      <!-- primary -->
+      <rect x="80" y="120" width="200" height="70" rx="11" fill="color-mix(in srgb, var(--pg-soft) 16%, transparent)" stroke="var(--pg-soft)" stroke-width="1.8"/>
+      <text x="180" y="148" text-anchor="middle" class="sv-label" font-size="13">🐘 Primary</text>
+      <text x="180" y="170" text-anchor="middle" class="sv-label-sm sv-mono">Timeline 1</text>
+
+      <!-- standby -->
+      <rect x="520" y="120" width="200" height="70" rx="11" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="620" y="148" text-anchor="middle" class="sv-label" font-size="13">🛟 Standby</text>
+      <text x="620" y="170" text-anchor="middle" class="sv-label-sm sv-mono">WAL 리플레이 중</text>
+
+      <g data-show="1-1">
+        <path d="M 370 62 Q 280 90 220 116" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr10g)"/>
+        <text x="268" y="86" class="sv-label-sm" fill="var(--ok)">쓰기</text>
+        <path d="M 285 160 L 515 160" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr10h)"/>
+        <text x="400" y="150" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">WAL 스트리밍</text>
+      </g>
+
+      <!-- step2: primary dies -->
+      <g data-show="2">
+        <line x1="100" y1="128" x2="262" y2="184" stroke="var(--danger)" stroke-width="3.5"/>
+        <line x1="262" y1="128" x2="100" y2="184" stroke="var(--danger)" stroke-width="3.5"/>
+        <text x="180" y="220" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">💥 장애!</text>
+      </g>
+      <g data-show="2-2">
+        <text x="400" y="200" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">스트리밍 끊김</text>
+      </g>
+
+      <!-- step3: promote -->
+      <g data-show="3">
+        <rect x="520" y="120" width="200" height="70" rx="11" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="2.2"/>
+        <text x="620" y="148" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">👑 New Primary</text>
+        <text x="620" y="170" text-anchor="middle" class="sv-label-sm sv-mono">pg_ctl promote</text>
+        <text x="620" y="220" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">쓰기 가능 상태로 전환!</text>
+      </g>
+
+      <!-- step4: new timeline + traffic -->
+      <g data-show="4">
+        <path d="M 430 62 Q 520 90 580 116" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr10g)"/>
+        <text x="530" y="84" class="sv-label-sm" fill="var(--ok)">쓰기 트래픽 전환 (DNS/VIP)</text>
+        <rect x="520" y="240" width="200" height="40" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="620" y="265" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--purple)">Timeline 2 시작 🔀</text>
+      </g>
+
+      <!-- step5: pg_rewind -->
+      <g data-show="5">
+        <rect x="80" y="120" width="200" height="70" rx="11" fill="none" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="6 5"/>
+        <text x="180" y="148" text-anchor="middle" class="sv-label" font-size="13">구 Primary 부활</text>
+        <text x="180" y="170" text-anchor="middle" class="sv-label-sm sv-mono">pg_rewind 후 Standby로</text>
+        <path d="M 515 250 Q 350 290 200 194" stroke="var(--purple)" stroke-width="2" fill="none" stroke-dasharray="6 5" class="flow-line" marker-end="url(#arr10i)"/>
+        <text x="360" y="300" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">Timeline 2에 맞춰 되감기 → 역방향 복제</text>
+        <text x="180" y="235" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">⚠️ 그냥 켜면 Split-brain!</text>
+      </g>
+      <defs>
+        <marker id="arr10g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/></marker>
+        <marker id="arr10h" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/></marker>
+        <marker id="arr10i" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/></marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>평상시: 앱은 Primary에 쓰고, Primary는 WAL을 스탠바이로 스트리밍합니다. 스탠바이는 읽기 쿼리를 받으며 대기 중입니다.</p>
+    <p>💥 Primary에 장애가 발생했습니다. 스트리밍이 끊기고, 앱의 쓰기가 실패하기 시작합니다.</p>
+    <p>스탠바이에서 <code>pg_ctl promote</code>(또는 <code>SELECT pg_promote()</code>)를 실행하면 리커버리를 끝내고 <b style="color:var(--ok)">쓰기 가능한 새 Primary</b>로 승격됩니다.</p>
+    <p>DNS/VIP를 전환해 트래픽을 새 Primary로 돌립니다. 이때 WAL 역사는 <b style="color:var(--purple)">새 타임라인(Timeline 2)</b>으로 갈라집니다 — 페일오버 이후의 역사를 이전과 구분하는 장치입니다.</p>
+    <p>구 Primary가 살아나도 <b style="color:var(--danger)">그냥 켜면 안 됩니다</b>(두 개의 Primary = Split-brain). <code>pg_rewind</code>로 Timeline 2에 맞게 되감은 뒤 스탠바이로 재합류시킵니다. 실무에선 이 전 과정을 <b>Patroni</b> 같은 도구로 자동화합니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">수동 페일오버는 새벽 2시의 실수를 부른다</div>
+    <p>운영에서는 <strong>Patroni</strong>(etcd 기반 리더 선출, 가장 널리 사용), repmgr, pg_auto_failover 같은 자동화 도구를 씁니다. 공통 요구사항은 Split-brain 방지, 타임라인 관리, DNS/VIP 전환입니다. 관리형 서비스(RDS 등)는 플랫폼이 대신해 줍니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">10.6 Hot Standby의 딜레마 — 읽기 쿼리 vs 리플레이</h2>
+
+<p>스탠바이에서 읽기 쿼리를 받다 보면 충돌이 생깁니다. Primary에서 VACUUM으로 지워진 행을, 스탠바이의 장기 쿼리가 아직 보고 있다면? WAL 리플레이를 기다리게 하거나, 쿼리를 취소하거나 — 둘 중 하나입니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>설정</th><th>효과</th><th>부작용</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_standby_streaming_delay = 30s</code></td><td>리플레이를 늦춰 쿼리에 양보</td><td>복제 지연 누적</td></tr>
+    <tr><td><code>hot_standby_feedback = on</code></td><td>스탠바이의 oldest xmin을 Primary에 전달 → 필요한 튜플의 vacuum 보류</td><td>Primary에 Bloat 누적 (8장)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>정답은 워크로드에 따라 다릅니다: <strong>분석 쿼리용 스탠바이</strong>는 feedback on + 긴 delay, <strong>실시간 HA용 스탠바이</strong>는 그 반대로 설정합니다.</p>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">비동기 복제 환경에서 Primary가 갑자기 죽어 스탠바이를 승격했습니다. 어떤 위험이 있나요?</div>
+  <div class="quiz-opts">
+    <button type="button">스탠바이의 데이터가 Primary보다 미래 상태가 된다</button>
+    <button type="button" data-correct>Primary에서 커밋 응답까지 나갔지만 아직 전송되지 않은 마지막 트랜잭션들이 유실될 수 있다</button>
+    <button type="button">아무 위험이 없다 — WAL이 모든 것을 보장한다</button>
+    <button type="button">스탠바이의 모든 인덱스가 깨져서 REINDEX가 필요하다</button>
+  </div>
+  <div class="quiz-expl">✅ 비동기 복제는 로컬 WAL flush만으로 커밋을 응답하므로, 전송 전에 Primary가 죽으면 그 커밋들은 스탠바이에 없습니다. 이 손실을 0으로 만들려면 동기 복제(<code>synchronous_standby_names</code>)가 필요하고, 대신 커밋 지연과 "sync 스탠바이 장애 시 커밋 정지" 리스크를 감수해야 합니다. 쿼럼(<code>ANY N</code>)이 균형점입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">스탠바이를 폐기했는데 Primary에 replication slot을 지우지 않고 남겨두면 어떻게 되나요?</div>
+  <div class="quiz-opts">
+    <button type="button">슬롯이 1시간 후 자동으로 삭제된다</button>
+    <button type="button">아무 일도 없다 — 슬롯은 메타데이터일 뿐이다</button>
+    <button type="button" data-correct>슬롯이 WAL 삭제를 계속 막아 pg_wal/이 무한 축적되고, 방치하면 디스크 풀로 서버가 정지한다</button>
+  </div>
+  <div class="quiz-expl">✅ 슬롯은 "소비자가 확인한 지점까지만 WAL 삭제 허용"이라는 약속이므로, 소비자가 사라지면 WAL이 영원히 쌓입니다. pg_wal 폭증의 최빈 원인입니다. 안 쓰는 슬롯은 <code>pg_drop_replication_slot()</code>으로 즉시 제거하고, v13+에서는 <code>max_slot_wal_keep_size</code>로 상한을 걸어 Primary를 보호하세요.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/postgresql-guide/blob/main/chapters/ch10_replication.md" target="_blank" rel="noopener">chapters/ch10_replication.md</a> — Logical Replication(PUBLICATION/SUBSCRIPTION) 상세, Cascading 복제, 읽기 분산 패턴, 진단·운영 레시피가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch09.html"><span class="dir">← 이전</span><br><span class="title">9장. WAL과 Checkpoint</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch11.html"><span class="dir">다음 →</span><br><span class="title">11장. 백업과 PITR 복구</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

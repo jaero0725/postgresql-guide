@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7장. Query DSL — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch07">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>7장. Query DSL — 검색을 말하는 언어</h1>
+<p class="lead">SQL이 "어떤 행이 조건에 맞는가"를 묻는다면, Query DSL은 "어떤 문서가 <em>얼마나 잘</em> 맞는가"까지 묻습니다. 점수, 컨텍스트, bool 조합 — 검색 특유의 정신 모델을 그림으로 익힙니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 6장 Analyzer</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Query context vs Filter context — 점수와 캐시의 갈림길 ② term vs match, 그리고 match 쿼리가 매칭되는 실제 과정 ③ bool 쿼리의 must/filter/should/must_not 조합 ④ BM25 점수와 깊은 페이지네이션(PIT + search_after)</p>
+  </div>
+</div>
+
+<h2 id="s1">7.1 Query Context vs Filter Context — 가장 근본적인 구분</h2>
+
+<p>같은 조건이라도 <strong>어느 컨텍스트</strong>에 넣느냐에 따라 동작이 완전히 달라집니다. 이 구분 하나가 ES 쿼리 운영의 80%를 좌우합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Query Context</th><th>Filter Context</th></tr></thead>
+  <tbody>
+    <tr><td><strong>점수 계산</strong></td><td>O — <code>_score</code> 산출 (BM25)</td><td>X — 매칭 여부만 (예/아니오)</td></tr>
+    <tr><td><strong>캐시</strong></td><td>캐시 안 됨 (매번 계산)</td><td><strong>node-level filter cache</strong> 적용</td></tr>
+    <tr><td><strong>사용 위치</strong></td><td><code>query</code>, <code>bool.must</code>, <code>bool.should</code></td><td><code>bool.filter</code>, <code>bool.must_not</code>, <code>constant_score.filter</code></td></tr>
+    <tr><td><strong>용도</strong></td><td>"얼마나 잘 맞는가"</td><td>"조건에 맞는가"</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">운영 원칙 한 줄</div>
+    <p><strong>점수에 영향을 주지 않아야 하는 모든 조건은 filter에 넣어라.</strong> <code>must</code>에 <code>term</code> 조건을 쌓으면 점수도 왜곡되고 캐시 혜택도 못 받습니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">7.2 term vs match — 그리고 match가 매칭되는 실제 과정</h2>
+
+<p>초보자가 가장 많이 헤매는 지점입니다. <code>term</code>은 <strong>분석하지 않고</strong> 입력 그대로 역색인을 찾습니다. text 필드의 역색인에는 이미 토큰화·소문자화된 값이 들어 있으므로, text 필드에 <code>term</code>을 쓰면 거의 항상 매칭에 실패합니다.</p>
+
+<pre><code><span class="c">// ❌ name이 text 필드면 거의 매칭 안 됨 (역색인엔 "quick","brown","fox"가 있음)</span>
+{ <span class="s">"term"</span>: { <span class="s">"name"</span>: <span class="s">"Quick Brown Fox"</span> } }
+
+<span class="c">// ✅ 정확 일치가 목적이면 keyword 서브필드로</span>
+{ <span class="s">"term"</span>: { <span class="s">"name.keyword"</span>: <span class="s">"Quick Brown Fox"</span> } }
+
+<span class="c">// ✅ 전문 검색이 목적이면 match로 (검색어도 분석됨)</span>
+{ <span class="s">"match"</span>: { <span class="s">"name"</span>: <span class="s">"Quick Brown Fox"</span> } }</code></pre>
+
+<p>그렇다면 <code>match</code> 쿼리는 내부에서 정확히 무슨 일을 할까요? 6장의 analyzer가 여기서 다시 등장합니다.</p>
+
+<div class="anim" data-steps="5" data-title="match 쿼리의 일생 — 분석 → 역색인 조회 → 스코어링" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <!-- 쿼리 입력 -->
+      <rect x="20" y="20" width="230" height="44" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="135" y="39" text-anchor="middle" class="sv-label sv-mono" font-size="12">match: "Quick Foxes"</text>
+      <text x="135" y="56" text-anchor="middle" class="sv-label-sm">사용자 질의</text>
+
+      <!-- step2: 분석 -->
+      <g data-show="2">
+        <path d="M 250 42 L 300 42" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="308" y="20" width="130" height="44" rx="9" class="sv-box"/>
+        <text x="373" y="39" text-anchor="middle" class="sv-label" font-size="12">analyzer</text>
+        <text x="373" y="56" text-anchor="middle" class="sv-label-sm">색인과 같은 분석기</text>
+        <path d="M 438 42 L 488 42" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="496" y="24" width="76" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+        <text x="534" y="47" text-anchor="middle" class="sv-label sv-mono" font-size="12">quick</text>
+        <rect x="580" y="24" width="76" height="36" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+        <text x="618" y="47" text-anchor="middle" class="sv-label sv-mono" font-size="12">foxes</text>
+      </g>
+
+      <!-- 역색인 -->
+      <rect x="20" y="110" width="330" height="110" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="36" y="134" class="sv-label" font-size="13">📖 역색인</text>
+      <text x="36" y="160" class="sv-label-sm sv-mono">brown → [doc1, doc3]</text>
+      <g data-active="3-5">
+        <text x="36" y="182" class="sv-label-sm sv-mono" fill="var(--es)">quick → [doc1, doc3]</text>
+        <text x="36" y="204" class="sv-label-sm sv-mono" fill="var(--es)">foxes → [doc1, doc2]</text>
+      </g>
+
+      <!-- step3: lookup -->
+      <g data-show="3">
+        <path d="M 534 64 C 500 90 420 110 355 150" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 618 64 C 600 110 480 140 355 190" stroke="var(--es)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="470" y="120" class="sv-label-sm" fill="var(--es)">토큰별 posting list 조회</text>
+      </g>
+
+      <!-- step4: 후보 + 스코어링 -->
+      <g data-show="4">
+        <rect x="420" y="130" width="350" height="120" rx="10" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="595" y="154" text-anchor="middle" class="sv-label">🧮 BM25 스코어링</text>
+        <text x="440" y="180" class="sv-label-sm sv-mono">doc1: quick+foxes 둘 다 → _score 3.9</text>
+        <text x="440" y="202" class="sv-label-sm sv-mono">doc3: quick만            → _score 1.7</text>
+        <text x="440" y="224" class="sv-label-sm sv-mono">doc2: foxes만            → _score 1.4</text>
+      </g>
+
+      <!-- step5: 결과 -->
+      <g data-show="5">
+        <path d="M 595 250 L 595 278" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="420" y="284" width="350" height="56" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="595" y="307" text-anchor="middle" class="sv-label">결과: doc1 → doc3 → doc2</text>
+        <text x="595" y="327" text-anchor="middle" class="sv-label-sm">_score 내림차순 정렬 (기본 OR — 토큰 1개만 맞아도 후보)</text>
+      </g>
+
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>사용자가 <code>match: "Quick Foxes"</code> 쿼리를 보냅니다. 이 문자열은 아직 "사람의 언어"입니다.</p>
+    <p>검색어가 <b>색인 때와 같은 analyzer</b>를 통과해 <code>[quick, foxes]</code> 토큰이 됩니다. 색인과 검색이 같은 언어로 변환되는 순간 — 6장이 여기서 힘을 발휘합니다.</p>
+    <p>각 토큰으로 <b>역색인의 posting list를 조회</b>합니다. <code>quick → [doc1, doc3]</code>, <code>foxes → [doc1, doc2]</code>.</p>
+    <p>후보 문서마다 <b style="color:var(--purple)">BM25 점수</b>를 계산합니다. 두 토큰을 모두 가진 doc1이 가장 높은 점수를 받습니다. match의 기본 연산자는 OR이라 한 토큰만 맞아도 후보에 포함됩니다.</p>
+    <p><code>_score</code> 내림차순으로 정렬된 결과가 반환됩니다. "모든 토큰 필수"로 바꾸려면 <code>"operator": "AND"</code>를 지정하세요.</p>
+  </div>
+</div>
+
+<p>자주 쓰는 leaf 쿼리를 정리하면:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>분류</th><th>쿼리</th><th>특징</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="3">Term-level<br>(분석 X)</td><td><code>term</code> / <code>terms</code></td><td>정확 일치 / OR 목록. keyword·숫자·bool 필드용</td></tr>
+    <tr><td><code>range</code></td><td>범위 (<code>gte</code>, <code>lte</code>)</td></tr>
+    <tr><td><code>exists</code>, <code>prefix</code>, <code>wildcard</code></td><td>존재/접두사/와일드카드 — wildcard·regexp는 느림</td></tr>
+    <tr><td rowspan="3">Full-text<br>(분석 O)</td><td><code>match</code></td><td>기본 OR. <code>operator: AND</code> 가능</td></tr>
+    <tr><td><code>match_phrase</code></td><td>구문 매칭 (토큰 순서·인접성 요구)</td></tr>
+    <tr><td><code>multi_match</code></td><td>여러 필드 동시 검색. <code>fields: ["title^3", "body"]</code>로 boost</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s3">7.3 bool 쿼리 — 조건을 조합하는 4개의 방</h2>
+
+<p>실전 쿼리의 대부분은 <code>bool</code>로 조립됩니다. 4개의 절이 각각 다른 역할을 합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>절</th><th>점수</th><th>매칭 요건</th><th>용도</th></tr></thead>
+  <tbody>
+    <tr><td><code>must</code></td><td>O</td><td>모두 매칭</td><td>필수 조건 + 점수 계산</td></tr>
+    <tr><td><code>should</code></td><td>O</td><td>기본 0개 이상 (<code>minimum_should_match</code>로 강제)</td><td>선택 조건, 점수 가산</td></tr>
+    <tr><td><code>filter</code></td><td>X</td><td>모두 매칭</td><td>필터 (점수 X, <strong>캐시 O</strong>)</td></tr>
+    <tr><td><code>must_not</code></td><td>X</td><td>하나도 매칭 안 됨</td><td>제외</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="anim" data-steps="5" data-title="bool 쿼리 — 문서들이 4개의 관문을 통과하는 과정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <!-- 문서 후보들 -->
+      <text x="20" y="26" class="sv-label" font-size="14">후보 문서 (노트북 검색)</text>
+      <g>
+        <rect x="20" y="40" width="110" height="34" rx="8" class="sv-box"/>
+        <text x="75" y="62" text-anchor="middle" class="sv-label-sm sv-mono">doc1 재고O</text>
+        <rect x="140" y="40" width="110" height="34" rx="8" class="sv-box"/>
+        <text x="195" y="62" text-anchor="middle" class="sv-label-sm sv-mono">doc2 재고X</text>
+        <rect x="260" y="40" width="110" height="34" rx="8" class="sv-box"/>
+        <text x="315" y="62" text-anchor="middle" class="sv-label-sm sv-mono">doc3 재고O</text>
+        <rect x="380" y="40" width="120" height="34" rx="8" class="sv-box"/>
+        <text x="440" y="62" text-anchor="middle" class="sv-label-sm sv-mono">doc4 단종품</text>
+        <rect x="510" y="40" width="120" height="34" rx="8" class="sv-box"/>
+        <text x="570" y="62" text-anchor="middle" class="sv-label-sm sv-mono">doc5 재고O 삼성</text>
+      </g>
+
+      <!-- filter 관문 -->
+      <g data-active="2-2">
+        <rect x="20" y="110" width="360" height="46" rx="9" fill="color-mix(in srgb, var(--accent) 8%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="200" y="130" text-anchor="middle" class="sv-label" font-size="12.5">filter: in_stock=true · price≤200만</text>
+        <text x="200" y="147" text-anchor="middle" class="sv-label-sm">점수 X · 비트셋 캐시 O</text>
+      </g>
+      <!-- must_not 관문 -->
+      <g data-active="2-2">
+        <rect x="420" y="110" width="360" height="46" rx="9" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="600" y="130" text-anchor="middle" class="sv-label" font-size="12.5">must_not: discontinued=true</text>
+        <text x="600" y="147" text-anchor="middle" class="sv-label-sm">매칭되면 제외 · 점수 X</text>
+      </g>
+
+      <g data-show="2">
+        <text x="180" y="180" class="sv-label-sm" fill="var(--danger)">doc2(재고X) 탈락</text>
+        <text x="430" y="180" class="sv-label-sm" fill="var(--danger)">doc4(단종) 탈락</text>
+      </g>
+
+      <!-- must 관문 -->
+      <g data-active="3-3">
+        <rect x="20" y="200" width="360" height="46" rx="9" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="200" y="220" text-anchor="middle" class="sv-label" font-size="12.5">must: match(name, "무선 노트북")</text>
+        <text x="200" y="237" text-anchor="middle" class="sv-label-sm">필수 매칭 + BM25 점수</text>
+      </g>
+      <g data-show="3">
+        <text x="420" y="228" class="sv-label-sm sv-mono">doc1 _score 2.1 · doc3 _score 1.6 · doc5 _score 1.9</text>
+      </g>
+
+      <!-- should 관문 -->
+      <g data-active="4-4">
+        <rect x="20" y="270" width="360" height="46" rx="9" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)" stroke-width="1.5"/>
+        <text x="200" y="290" text-anchor="middle" class="sv-label" font-size="12.5">should: brand=삼성 · tags=프리미엄</text>
+        <text x="200" y="307" text-anchor="middle" class="sv-label-sm">맞으면 점수 가산 (없어도 통과)</text>
+      </g>
+      <g data-show="4">
+        <text x="420" y="290" class="sv-label-sm sv-mono" fill="var(--es)">doc5: 삼성 매칭 → _score 1.9 + 0.8 = 2.7 ⤴</text>
+      </g>
+
+      <!-- 결과 -->
+      <g data-show="5">
+        <rect x="470" y="320" width="310" height="34" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="625" y="342" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">최종: doc5(2.7) → doc1(2.1) → doc3(1.6)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>5개의 후보 문서가 bool 쿼리에 들어옵니다. 각 절이 순서대로 "관문" 역할을 한다고 상상해 보세요.</p>
+    <p><b>filter</b>와 <b>must_not</b>이 먼저 예/아니오 판정을 합니다. 재고 없는 doc2, 단종된 doc4가 탈락 — <b>점수 계산 없이 비트셋으로 처리되고 캐시</b>되므로 매우 쌉니다.</p>
+    <p><b>must</b>는 필수 매칭 + 점수 계산. 이름에 "무선 노트북"이 매칭된 문서들이 BM25 점수를 받습니다.</p>
+    <p><b>should</b>는 보너스 점수. 삼성 브랜드인 doc5가 <b style="color:var(--es)">가산점을 받아 역전</b>합니다. should는 매칭 안 돼도 탈락시키지 않습니다(<code>minimum_should_match</code>로 강제하지 않는 한).</p>
+    <p>최종 순위는 점수 순: doc5 → doc1 → doc3. "필수는 must, 예/아니오는 filter, 가산점은 should, 제외는 must_not" — 이 배치가 bool 설계의 전부입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">GET</span> /products/_search
+{
+  <span class="s">"query"</span>: {
+    <span class="s">"bool"</span>: {
+      <span class="s">"must"</span>:     [ { <span class="s">"match"</span>: { <span class="s">"name"</span>: <span class="s">"무선 노트북"</span> } } ],
+      <span class="s">"should"</span>:   [ { <span class="s">"match"</span>: { <span class="s">"tags"</span>:  <span class="s">"프리미엄"</span> } },
+                    { <span class="s">"match"</span>: { <span class="s">"brand"</span>: <span class="s">"삼성"</span> } } ],
+      <span class="s">"filter"</span>:   [ { <span class="s">"term"</span>:  { <span class="s">"category"</span>: <span class="s">"laptop"</span> } },
+                    { <span class="s">"range"</span>: { <span class="s">"price"</span>: { <span class="s">"lte"</span>: <span class="n">2000000</span> } } },
+                    { <span class="s">"term"</span>:  { <span class="s">"in_stock"</span>: <span class="n">true</span> } } ],
+      <span class="s">"must_not"</span>: [ { <span class="s">"term"</span>: { <span class="s">"discontinued"</span>: <span class="n">true</span> } } ],
+      <span class="s">"minimum_should_match"</span>: <span class="n">1</span>
+    }
+  }
+}</code></pre>
+
+<p>그 밖의 컴파운드 쿼리: <code>dis_max</code>(여러 쿼리 중 최고 점수 채택), <code>function_score</code>(인기도 가산·최신성 감쇠 등 점수 커스터마이징), <code>boosting</code>(제외 대신 점수 감점), <code>constant_score</code>(filter를 점수 1.0으로 고정).</p>
+
+<h2 id="s4">7.4 점수의 정체 — BM25</h2>
+
+<p>ES 5.x부터 기본 점수 알고리즘은 <strong>BM25(Okapi BM25)</strong>입니다. 직관만 잡으면 충분합니다.</p>
+
+<ul>
+  <li><strong>TF (term frequency)</strong> — 문서 안에 토큰이 많이 나올수록 점수↑. 단, 무한히 오르지 않고 <strong>포화</strong>됩니다 (<code>k1</code>, 기본 1.2가 포화 정도 조절)</li>
+  <li><strong>IDF (inverse document frequency)</strong> — 전체 문서에서 <strong>희귀한 토큰일수록</strong> 점수↑. "the"보다 "elasticsearch"가 강력</li>
+  <li><strong>문서 길이 보정</strong> — 평균보다 긴 문서는 점수를 깎아 공평하게 (<code>b</code>, 기본 0.75가 강도 조절)</li>
+</ul>
+
+<pre><code><span class="c">// 점수가 이상할 때 첫 번째 디버깅 도구: 점수 계산 내역을 트리로 출력</span>
+<span class="k">GET</span> /products/_search
+{
+  <span class="s">"explain"</span>: <span class="n">true</span>,
+  <span class="s">"query"</span>: { <span class="s">"match"</span>: { <span class="s">"name"</span>: <span class="s">"노트북"</span> } }
+}</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">흔한 점수 함정</div>
+    <p>① 상위 결과가 짧은 스팸성 문서 — 길이 정규화가 짧은 문서를 선호하기 때문. function_score로 보정. ② 오타·고유명사가 IDF로 과대평가. ③ "filter에 넣었는데 점수가 변해요" — filter는 점수 0이 맞고, 함께 쓴 should가 점수에 들어간 경우가 대부분입니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">7.5 페이지네이션 — from/size의 한계와 search_after</h2>
+
+<p><code>{ "from": 20, "size": 10 }</code> 방식은 얕은 페이지에서는 문제없지만, <code>from + size</code>가 <code>index.max_result_window</code>(기본 <strong>10,000</strong>)를 넘으면 거부됩니다. 왜 이런 안전장치가 있을까요?</p>
+
+<div class="anim" data-steps="4" data-title="깊은 페이지네이션 — from/size의 비용 vs search_after" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- 요청 -->
+      <rect x="20" y="20" width="250" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="145" y="45" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">from=10000, size=10</text>
+
+      <!-- 샤드들 -->
+      <g>
+        <rect x="40" y="100" width="180" height="56" class="sv-box"/>
+        <text x="130" y="124" text-anchor="middle" class="sv-label">shard A</text>
+        <rect x="300" y="100" width="180" height="56" class="sv-box"/>
+        <text x="390" y="124" text-anchor="middle" class="sv-label">shard B</text>
+        <rect x="560" y="100" width="180" height="56" class="sv-box"/>
+        <text x="650" y="124" text-anchor="middle" class="sv-label">shard C</text>
+      </g>
+
+      <g data-show="2-3">
+        <text x="130" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">상위 10,010개 정렬</text>
+        <text x="390" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">상위 10,010개 정렬</text>
+        <text x="650" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">상위 10,010개 정렬</text>
+        <path d="M 130 156 C 150 190 300 215 380 228" stroke="var(--warn)" stroke-width="2.4" fill="none" class="flow-line"/>
+        <path d="M 390 156 L 390 226" stroke="var(--warn)" stroke-width="2.4" fill="none" class="flow-line"/>
+        <path d="M 650 156 C 630 190 480 215 400 228" stroke="var(--warn)" stroke-width="2.4" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- coordinating -->
+      <rect x="270" y="232" width="240" height="52" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="390" y="254" text-anchor="middle" class="sv-label">coordinating node</text>
+      <text x="390" y="272" text-anchor="middle" class="sv-label-sm">병합 + 재정렬</text>
+
+      <g data-show="3-3">
+        <text x="390" y="312" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13.5">30,030개 로드 → 10개만 반환, 30,020개는 버려짐 💸</text>
+      </g>
+
+      <g data-show="4">
+        <text x="130" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">정렬키 이후 10개만</text>
+        <text x="390" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">정렬키 이후 10개만</text>
+        <text x="650" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">정렬키 이후 10개만</text>
+        <text x="390" y="312" text-anchor="middle" class="sv-label" fill="var(--ok)" font-size="13.5">✅ search_after: 샤드당 10개, 총 30개만 이동 — 깊이와 무관한 비용</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>1,001번째 페이지 요청 <code>from=10000, size=10</code>이 coordinating node에 도착해 3개 샤드로 흩어집니다.</p>
+    <p>각 샤드는 자기 몫의 상위 문서만으로는 전역 순위를 알 수 없으므로 <b style="color:var(--warn)">상위 10,010개 전부</b>를 정렬해 coordinating node로 보냅니다.</p>
+    <p>coordinating node는 <b style="color:var(--danger)">30,030개를 메모리에 올려 재정렬</b>한 뒤 겨우 10개를 반환합니다. 깊이가 깊어질수록 메모리가 폭발 — 그래서 10,000 한계가 기본으로 걸려 있습니다.</p>
+    <p><b>search_after</b>는 "직전 페이지 마지막 정렬키 이후부터 10개"만 요청하므로 각 샤드가 10개씩, 총 30개만 이동합니다. <b style="color:var(--ok)">페이지 깊이와 무관하게 비용이 일정</b>합니다.</p>
+  </div>
+</div>
+
+<p>8.x 표준 패턴은 <strong>PIT(point-in-time) + search_after</strong>입니다. PIT는 검색 시작 시점의 인덱스 스냅샷을 고정해, 페이지를 넘기는 동안 문서가 추가·삭제되어도 결과가 일관되게 유지되도록 합니다. (<code>scroll</code> API는 deprecated 추세 — 새 코드에서는 쓰지 마세요.)</p>
+
+<pre><code><span class="c">// 1) PIT 열기</span>
+<span class="k">POST</span> /products/_pit?keep_alive=1m
+
+<span class="c">// 2) 첫 페이지 — tiebreaker로 _shard_doc 권장(8.x)</span>
+<span class="k">POST</span> /_search
+{
+  <span class="s">"size"</span>: <span class="n">100</span>,
+  <span class="s">"pit"</span>:  { <span class="s">"id"</span>: <span class="s">"46To..."</span>, <span class="s">"keep_alive"</span>: <span class="s">"1m"</span> },
+  <span class="s">"sort"</span>: [ { <span class="s">"created_at"</span>: <span class="s">"desc"</span> }, { <span class="s">"_shard_doc"</span>: <span class="s">"asc"</span> } ]
+}
+<span class="c">// 응답 마지막 hit의 sort 값: [1714512345000, 42]</span>
+
+<span class="c">// 3) 다음 페이지</span>
+<span class="k">POST</span> /_search
+{
+  <span class="s">"size"</span>: <span class="n">100</span>,
+  <span class="s">"pit"</span>:  { <span class="s">"id"</span>: <span class="s">"46To..."</span>, <span class="s">"keep_alive"</span>: <span class="s">"1m"</span> },
+  <span class="s">"sort"</span>: [ { <span class="s">"created_at"</span>: <span class="s">"desc"</span> }, { <span class="s">"_shard_doc"</span>: <span class="s">"asc"</span> } ],
+  <span class="s">"search_after"</span>: [<span class="n">1714512345000</span>, <span class="n">42</span>]
+}
+
+<span class="c">// 4) 끝나면 PIT 닫기</span>
+<span class="k">DELETE</span> /_pit
+{ <span class="s">"id"</span>: <span class="s">"46To..."</span> }</code></pre>
+
+<h2 id="s6">7.6 운영 팁 모음</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🚦 track_total_hits</h4>
+    <p>ES는 기본적으로 총 일치 수를 10,000까지만 셉니다. 총 개수 표시가 필요 없으면 <code>track_total_hits: false</code>로 더 빠르게, 정확한 수가 꼭 필요할 때만 <code>true</code>로.</p>
+  </div>
+  <div class="card">
+    <h4>🛡️ 검색창엔 simple_query_string</h4>
+    <p><code>query_string</code>은 Lucene 문법 오류 시 쿼리 전체가 실패합니다. 사용자 입력에는 잘못된 문법을 조용히 무시하는 <code>simple_query_string</code>을 쓰세요.</p>
+  </div>
+  <div class="card">
+    <h4>🐢 wildcard·regexp는 비싸다</h4>
+    <p>특히 leading wildcard(<code>*foo</code>)는 사실상 풀스캔. 자동완성이 목적이면 6장의 edge_ngram이나 completion suggester로.</p>
+  </div>
+  <div class="card">
+    <h4>🔬 profile API</h4>
+    <p><code>"profile": true</code>를 붙이면 샤드별 Lucene 단계별 소요 시간이 응답에 포함됩니다. "왜 느리지?"의 첫 답.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">🧪</span>
+  <div>
+    <div class="callout-title">더 나아가기: Hybrid Search (8.x/9.x)</div>
+    <p>8.16 GA된 <strong>retriever</strong> 프레임워크로 BM25와 kNN(벡터 검색)을 <strong>RRF(Reciprocal Rank Fusion)</strong>로 결합하는 것이 hybrid search 표준입니다. 9.x의 <code>semantic_text</code> 필드는 임베딩 생성·검색까지 추상화해 줍니다. 원문 7.8절 참고.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">bool 쿼리에서 "카테고리가 laptop이고 재고가 있는" 조건처럼 점수에 영향을 줄 필요가 없는 조건은 어디에 넣는 것이 가장 좋은가?</div>
+  <div class="quiz-opts">
+    <button type="button"><code>must</code> — 필수 조건이니까</button>
+    <button type="button" data-correct><code>filter</code> — 점수 계산을 생략하고 캐시 혜택을 받는다</button>
+    <button type="button"><code>should</code> — 유연하게 매칭되도록</button>
+    <button type="button">어디에 넣어도 결과와 성능이 동일하다</button>
+  </div>
+  <div class="quiz-expl">✅ filter context는 점수를 계산하지 않고(관련도 왜곡 없음) 결과 비트셋이 node-level 캐시에 저장되어 반복 쿼리가 매우 빨라집니다. must에 넣으면 매번 점수를 계산하고 캐시도 받지 못합니다. "점수에 무관한 조건은 filter로"가 운영 제1원칙입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">text 필드 <code>name</code>에 <code>{ "term": { "name": "Quick Brown Fox" } }</code> 쿼리가 매칭되지 않는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">term 쿼리는 text 필드에 문법적으로 허용되지 않아서 에러가 난다</button>
+    <button type="button" data-correct>역색인에는 분석된 토큰(quick, brown, fox)이 저장되어 있는데, term은 검색어를 분석하지 않고 원문 그대로 찾기 때문</button>
+    <button type="button">대소문자를 구분하는 옵션이 기본으로 꺼져 있어서</button>
+  </div>
+  <div class="quiz-expl">✅ term 쿼리는 분석을 거치지 않으므로 "Quick Brown Fox"라는 통짜 문자열을 역색인에서 찾습니다. 하지만 색인 시점에 analyzer가 이미 [quick, brown, fox]로 쪼개 두었기 때문에 매칭될 키가 없습니다. 정확 일치는 name.keyword에 term, 전문 검색은 match를 쓰세요.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch07_query_dsl.md" target="_blank" rel="noopener">chapters/ch07_query_dsl.md</a> — function_score 상세, multi_match type 옵션, highlight/suggester, retriever·RRF·semantic_text까지 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06.html"><span class="dir">← 이전</span><br><span class="title">6장. Text Analysis</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch08.html"><span class="dir">다음 →</span><br><span class="title">8장. Aggregations</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

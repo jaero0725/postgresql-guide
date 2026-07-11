@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4장. 인덱스와 샤드 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch04">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>4장. 인덱스와 샤드 — 데이터는 어디에 놓이는가</h1>
+<p class="lead">Elasticsearch 운영 사고의 최다 원인은 쿼리가 아니라 <strong>샤드 설계 실수</strong>입니다. 라우팅, 사이징, 장애 대응까지 — 후회 없는 샤드 설계의 전부를 다룹니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 28분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2장 클러스터, 3장 Lucene</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 인덱스=논리, 샤드=물리 — primary/replica가 노드에 분배되는 규칙 ② 문서가 샤드를 찾아가는 라우팅 공식 ③ 노드 장애 시 replica 승격과 클러스터 색상(GREEN/YELLOW/RED) ④ 샤드 사이징 가이드와 oversharding의 파국</p>
+  </div>
+</div>
+
+<h2 id="s1">4.1 인덱스는 논리, 샤드는 물리</h2>
+
+<p>이 구분이 모든 것의 출발점입니다. <strong>인덱스(index)</strong>는 사용자가 보는 논리적 이름(<code>products</code>, <code>logs-2026.07.11</code>)이고, 실제 데이터는 인덱스를 쪼갠 <strong>샤드(shard)</strong>에 저장됩니다. 각 샤드는 3장에서 본 <strong>하나의 완전한 Lucene 인덱스</strong>이며, 클러스터의 어느 노드에든 배치될 수 있습니다.</p>
+
+<pre><code><span class="c"># 인덱스 생성 — 샤드 수는 이 순간 결정된다</span>
+<span class="k">PUT</span> /logs-2026.07.11
+{
+  <span class="s">"settings"</span>: {
+    <span class="s">"number_of_shards"</span>: <span class="n">3</span>,     <span class="c"># primary 수 — 생성 후 변경 불가!</span>
+    <span class="s">"number_of_replicas"</span>: <span class="n">1</span>    <span class="c"># replica 수 — 언제든 동적 변경 가능</span>
+  },
+  <span class="s">"mappings"</span>: {
+    <span class="s">"properties"</span>: {
+      <span class="s">"@timestamp"</span>: { <span class="s">"type"</span>: <span class="s">"date"</span> },
+      <span class="s">"message"</span>:    { <span class="s">"type"</span>: <span class="s">"text"</span> },
+      <span class="s">"level"</span>:      { <span class="s">"type"</span>: <span class="s">"keyword"</span> }
+    }
+  }
+}</code></pre>
+
+<p>3 primary + replica 1이면 총 6개의 샤드가 생깁니다. 이들이 노드에 어떻게 놓이고, 문서가 어떻게 자기 샤드를 찾아가는지 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="인덱스 생성 — primary/replica 샤드가 노드에 분배되는 과정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 360">
+      <defs>
+        <marker id="d1arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--es)"/>
+        </marker>
+      </defs>
+
+      <!-- 인덱스 (논리) -->
+      <g data-show="1">
+        <rect x="280" y="20" width="300" height="52" rx="10" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)" stroke-width="2"/>
+        <text x="430" y="42" text-anchor="middle" class="sv-label" font-size="13">📄 Index "logs-2026.07.11" (논리)</text>
+        <text x="430" y="62" text-anchor="middle" class="sv-label-sm sv-mono">shards=3, replicas=1</text>
+      </g>
+
+      <!-- 노드 3개 -->
+      <g>
+        <rect x="40" y="130" width="240" height="150" rx="10" class="sv-box"/>
+        <text x="160" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Node A</text>
+        <rect x="310" y="130" width="240" height="150" rx="10" class="sv-box"/>
+        <text x="430" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Node B</text>
+        <rect x="580" y="130" width="240" height="150" rx="10" class="sv-box"/>
+        <text x="700" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Node C</text>
+      </g>
+
+      <!-- primary 분배 -->
+      <g data-show="2">
+        <path d="M 340 74 Q 200 100 140 126" class="sv-arrow flow-line" marker-end="url(#d1arr)"/>
+        <path d="M 430 74 L 430 126" class="sv-arrow flow-line" marker-end="url(#d1arr)"/>
+        <path d="M 520 74 Q 660 100 700 126" class="sv-arrow flow-line" marker-end="url(#d1arr)"/>
+        <rect x="60" y="168" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="105" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P0</text>
+        <rect x="330" y="168" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="375" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P1</text>
+        <rect x="600" y="168" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="645" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P2</text>
+      </g>
+
+      <!-- replica 분배 -->
+      <g data-show="3">
+        <rect x="170" y="168" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+        <text x="215" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R2</text>
+        <rect x="440" y="168" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+        <text x="485" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R0</text>
+        <rect x="710" y="168" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+        <text x="755" y="193" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R1</text>
+        <text x="430" y="308" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">규칙: primary와 그 replica는 절대 같은 노드에 놓이지 않는다 (P0↔R0 분리)</text>
+      </g>
+
+      <!-- 문서 라우팅 -->
+      <g data-show="4">
+        <rect x="40" y="20" width="200" height="52" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="140" y="42" text-anchor="middle" class="sv-label" font-size="12">✉️ 문서 _id="abc123"</text>
+        <text x="140" y="61" text-anchor="middle" class="sv-label-sm sv-mono">hash("abc123") % 3 = 1</text>
+        <path d="M 175 76 Q 300 130 370 164" stroke="var(--warn)" stroke-width="2.4" fill="none" class="flow-line"/>
+        <text x="255" y="120" class="sv-label-sm" fill="var(--warn)">→ P1으로 색인</text>
+      </g>
+      <g data-show="5">
+        <path d="M 420 200 Q 450 230 480 210" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="430" y="245" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">P1 → R0(Node B)? 아니, R1(Node C)로 동기 복제</text>
+        <path d="M 420 188 Q 560 150 706 185" stroke="var(--ok)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#d1arr)"/>
+        <text x="430" y="336" text-anchor="middle" class="sv-label" font-size="13">✅ 색인 응답 시점 = primary와 모든 in-sync replica에 도달 완료</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>number_of_shards=3, replicas=1</code>로 인덱스를 생성했습니다. 인덱스는 이름일 뿐 — 실제 데이터가 살 곳은 지금부터 정해집니다.</p>
+    <p>마스터가 3개의 <b>primary 샤드(P0, P1, P2)</b>를 세 노드에 고르게 분배합니다. 각각이 독립적인 Lucene 인덱스입니다.</p>
+    <p>이어서 <b>replica(R0, R1, R2)</b>가 배치됩니다. 핵심 규칙: <b>primary와 그 복제본은 절대 같은 노드에 두지 않습니다.</b> 같이 있으면 노드 장애 때 둘 다 잃으니까요.</p>
+    <p>문서가 들어오면 <code>hash(_id) % primary 수</code> 공식으로 목적지가 정해집니다. "abc123"은 <b>P1(Node B)</b>로 갑니다. 어느 노드가 받았든 결과는 같습니다.</p>
+    <p>P1이 색인을 마치면 자신의 replica <b>R1(Node C)</b>로 동기 복제합니다. 모든 in-sync 사본의 ack를 받아야 클라이언트에 응답 — 색인 성공 = 모든 활성 사본에 도달입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">primary 샤드 수는 되돌릴 수 없다</div>
+    <p>라우팅 공식이 <code>% num_primary_shards</code>에 묶여 있어서, primary 수를 바꾸면 기존 문서의 위치 계산이 전부 틀어집니다. 그래서 <strong>생성 후 변경 불가</strong>이며, 바꾸려면 reindex 또는 split/shrink(4.6)가 필요합니다. 반면 replica 수는 라우팅과 무관하므로 언제든 동적 변경 가능합니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">4.2 Primary vs Replica — 두 개의 얼굴</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Primary</th><th>Replica</th></tr></thead>
+  <tbody>
+    <tr><td>색인(쓰기)</td><td>모든 색인은 primary 먼저</td><td>primary로부터 동기 복제 수신</td></tr>
+    <tr><td>검색(읽기)</td><td>가능</td><td>가능 — 부하 분산 대상</td></tr>
+    <tr><td>장애 시</td><td>죽으면 replica가 승격</td><td>primary 장애 시 승격 후보</td></tr>
+    <tr><td>수 변경</td><td>생성 후 변경 불가</td><td>동적 변경 가능</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>replica는 <strong>고가용성</strong>과 <strong>읽기 처리량</strong>이라는 두 역할을 동시에 수행합니다. replica를 늘리면 검색 QPS는 선형으로 늘지만, 모든 사본에 복제해야 하므로 색인 처리량은 떨어집니다. 이 트레이드오프를 활용한 대표 패턴이 있습니다.</p>
+
+<pre><code><span class="c"># 대량 초기 적재 패턴: replica 0으로 색인 → 끝나면 복원</span>
+<span class="k">PUT</span> /logs-init/_settings
+{ <span class="s">"index"</span>: { <span class="s">"number_of_replicas"</span>: <span class="n">0</span> } }
+
+<span class="c"># ... bulk 색인 (복제 비용 없이 최대 처리량) ...</span>
+
+<span class="k">PUT</span> /logs-init/_settings
+{ <span class="s">"index"</span>: { <span class="s">"number_of_replicas"</span>: <span class="n">1</span> } }   <span class="c"># 완료된 세그먼트를 통째로 복사</span></code></pre>
+
+<h2 id="s3">4.3 라우팅 공식 — 문서의 주소 계산</h2>
+
+<p>정확한 공식은 split을 대비해 한 단계가 더 있습니다.</p>
+
+<pre><code><span class="c"># 공식 문서에 명시된 라우팅 공식</span>
+routing_factor = num_routing_shards / num_primary_shards
+shard_num      = (<span class="f">hash</span>(_routing) % num_routing_shards) / routing_factor
+
+<span class="c"># _routing 기본값 = 문서의 _id</span>
+<span class="c"># num_routing_shards는 미래의 split을 위한 여유분 (예: 4 primary에 128)</span>
+<span class="c"># → 4 → 8 → 16 ... 128까지 split해도 hash 결과가 유지됨</span></code></pre>
+
+<p>같은 사용자의 문서를 한 샤드에 모으고 싶다면 <code>?routing=user_42</code>처럼 <strong>custom routing</strong>을 쓸 수 있습니다. 검색이 전체 샤드 broadcast 대신 1개 샤드만 조회해 빨라지지만, 특정 키에 데이터가 몰리는 <strong>skew(쏠림)</strong> 위험을 항상 평가해야 합니다.</p>
+
+<h2 id="s4">4.4 노드 장애 — replica 승격의 순간</h2>
+
+<p>replica가 있는 이유를 가장 극적으로 보여주는 시나리오입니다. 노드 하나가 갑자기 사라지면 무슨 일이 벌어질까요?</p>
+
+<div class="anim" data-steps="5" data-title="노드 장애와 replica 승격 — YELLOW에서 GREEN으로" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 340">
+      <!-- 상태 배지 -->
+      <g data-show="1" data-active="1-1">
+        <rect x="330" y="16" width="200" height="34" rx="17" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="430" y="38" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">● GREEN — 모든 샤드 정상</text>
+      </g>
+      <g data-show="2-3">
+        <rect x="330" y="16" width="200" height="34" rx="17" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="430" y="38" text-anchor="middle" class="sv-label" font-size="13" fill="var(--warn)">● YELLOW — replica 미할당</text>
+      </g>
+      <g data-show="5">
+        <rect x="330" y="16" width="200" height="34" rx="17" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="430" y="38" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">● GREEN 복귀 ✨</text>
+      </g>
+
+      <!-- 노드들 -->
+      <rect x="40" y="80" width="240" height="150" rx="10" class="sv-box"/>
+      <text x="160" y="104" text-anchor="middle" class="sv-label" font-size="12.5">Node A</text>
+      <rect x="310" y="80" width="240" height="150" rx="10" class="sv-box"/>
+      <text x="430" y="104" text-anchor="middle" class="sv-label" font-size="12.5">Node B</text>
+      <rect x="580" y="80" width="240" height="150" rx="10" class="sv-box"/>
+      <text x="700" y="104" text-anchor="middle" class="sv-label" font-size="12.5">Node C</text>
+
+      <!-- Node A 샤드 -->
+      <rect x="60" y="120" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="105" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P0</text>
+      <rect x="170" y="120" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+      <text x="215" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R1</text>
+
+      <!-- Node B 샤드 (장애 대상) -->
+      <g data-show="1-1">
+        <rect x="330" y="120" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="375" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P1</text>
+        <rect x="440" y="120" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+        <text x="485" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R0</text>
+      </g>
+
+      <!-- Node C 샤드 -->
+      <rect x="600" y="120" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4"/>
+      <g data-show="1-3">
+        <text x="645" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R1'</text>
+      </g>
+
+      <!-- 장애 표시 -->
+      <g data-show="2">
+        <line x1="320" y1="90" x2="540" y2="220" stroke="var(--danger)" stroke-width="3"/>
+        <line x1="540" y1="90" x2="320" y2="220" stroke="var(--danger)" stroke-width="3"/>
+        <text x="430" y="260" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13">💥 Node B 다운 — P1과 R0 상실!</text>
+      </g>
+
+      <!-- 승격 -->
+      <g data-show="3">
+        <rect x="600" y="120" width="90" height="40" rx="8" fill="color-mix(in srgb, var(--ok) 18%, transparent)" stroke="var(--ok)" stroke-width="2.4" class="pulse"/>
+        <text x="645" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R1→P1</text>
+        <text x="700" y="185" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">마스터가 replica를</text>
+        <text x="700" y="203" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">primary로 승격!</text>
+      </g>
+
+      <!-- 재복제 -->
+      <g data-show="4">
+        <rect x="600" y="120" width="90" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="645" y="145" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">P1</text>
+        <path d="M 105 160 Q 105 200 160 205" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="170" y="185" width="90" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="5 4" class="blink"/>
+        <text x="215" y="210" text-anchor="middle" class="sv-label sv-mono" font-size="11.5" fill="var(--ok)">R0'</text>
+        <path d="M 645 165 Q 500 260 265 205" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="430" y="290" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">살아있는 primary들이 새 replica를 다른 노드에 재복제</text>
+      </g>
+
+      <g data-show="5">
+        <text x="430" y="322" text-anchor="middle" class="sv-label" font-size="13">✅ 데이터 유실 0 — 이것이 replica가 존재하는 이유</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>3노드 클러스터, 2 primary + replica 1 구성입니다. 모든 샤드가 할당되어 <b style="color:var(--ok)">GREEN</b> 상태입니다.</p>
+    <p><b>Node B가 다운</b>됩니다. P1(primary)과 R0(replica)이 함께 사라졌습니다. P1의 데이터는 이제 Node C의 R1 사본에만 있습니다. 클러스터는 <b style="color:var(--warn)">YELLOW</b>로 전환됩니다.</p>
+    <p>마스터가 즉시 Node C의 <b>R1을 P1으로 승격(promote)</b>합니다. 색인과 검색이 중단 없이 계속됩니다 — primary와 replica를 같은 노드에 두지 않은 규칙이 빛나는 순간입니다.</p>
+    <p>이어서 부족해진 replica들을 살아있는 노드에 <b>재복제</b>합니다. 세그먼트 파일을 통째로 복사하므로 데이터량에 비례한 시간과 네트워크 비용이 듭니다.</p>
+    <p>모든 샤드가 다시 할당되면 <b style="color:var(--ok)">GREEN 복귀</b>. 데이터 유실은 없었습니다. 만약 replicas=0이었다면? P1의 데이터는 그대로 소멸했을 것입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">클러스터 색상 읽는 법</div>
+    <p><strong>GREEN</strong> = 모든 primary·replica 할당됨. <strong>YELLOW</strong> = primary는 다 있지만 일부 replica 미할당(읽기·쓰기는 정상, 여유가 사라진 상태). <strong>RED</strong> = 일부 primary가 미할당 — 해당 데이터에 접근 불가, 즉시 대응 필요.</p>
+  </div>
+</div>
+
+<h2 id="s5">4.5 샤드 사이징 — 10~50GB의 과학</h2>
+
+<p>공식 문서의 가이드는 명확합니다: <strong>"샤드 크기는 10GB~50GB, 샤드당 문서 2억 개 이하"</strong>. 그리고 노드 관점에서는 <strong>"JVM heap 1GB당 샤드 20개 이하"</strong>. 이 범위를 벗어나면 양쪽 어디로든 사고가 납니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>지표</th><th>위험 임계</th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td>노드당 샤드 수</td><td>heap GB × 20 초과</td><td>메타데이터만으로 heap 압박</td></tr>
+    <tr><td>클러스터 총 샤드</td><td>50,000 초과</td><td>cluster state 비대화</td></tr>
+    <tr><td>평균 샤드 크기</td><td>1GB 미만</td><td>oversharding — 오버헤드가 데이터보다 큼</td></tr>
+    <tr><td>평균 샤드 크기</td><td>100GB 초과</td><td>undersharding — recovery·검색 느려짐</td></tr>
+    <tr><td>cluster state publish</td><td>수 초 이상</td><td>변경마다 클러스터 일시정지</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>샤드가 너무 많으면 어떤 파국이 오는지, 2장의 cluster state 지식과 연결해서 봅시다.</p>
+
+<div class="anim" data-steps="4" data-title="Oversharding — 작은 샤드 수만 개가 클러스터를 죽이는 과정" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <!-- 정상 -->
+      <g data-show="1" data-active="1-1">
+        <text x="200" y="34" text-anchor="middle" class="sv-label" font-size="14">😀 적정: 600 샤드 / 3노드</text>
+        <rect x="80" y="50" width="240 " height="90" rx="10" class="sv-box"/>
+        <rect x="100" y="70" width="60" height="50" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="170" y="70" width="60" height="50" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="240" y="70" width="60" height="50" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="200" y="164" text-anchor="middle" class="sv-label-sm">샤드당 30GB · state ~30MB · publish &lt;100ms</text>
+      </g>
+
+      <!-- oversharded -->
+      <g data-show="2" data-active="2-4">
+        <text x="600" y="34" text-anchor="middle" class="sv-label" font-size="14">🤯 60,000 샤드 / 3노드</text>
+        <rect x="480" y="50" width="240" height="90" rx="10" class="sv-box"/>
+        <g fill="color-mix(in srgb, var(--danger) 25%, transparent)" stroke="var(--danger)" stroke-width=".8">
+          <rect x="492" y="60" width="20" height="14" rx="2"/><rect x="516" y="60" width="20" height="14" rx="2"/><rect x="540" y="60" width="20" height="14" rx="2"/><rect x="564" y="60" width="20" height="14" rx="2"/><rect x="588" y="60" width="20" height="14" rx="2"/><rect x="612" y="60" width="20" height="14" rx="2"/><rect x="636" y="60" width="20" height="14" rx="2"/><rect x="660" y="60" width="20" height="14" rx="2"/><rect x="684" y="60" width="20" height="14" rx="2"/>
+          <rect x="492" y="78" width="20" height="14" rx="2"/><rect x="516" y="78" width="20" height="14" rx="2"/><rect x="540" y="78" width="20" height="14" rx="2"/><rect x="564" y="78" width="20" height="14" rx="2"/><rect x="588" y="78" width="20" height="14" rx="2"/><rect x="612" y="78" width="20" height="14" rx="2"/><rect x="636" y="78" width="20" height="14" rx="2"/><rect x="660" y="78" width="20" height="14" rx="2"/><rect x="684" y="78" width="20" height="14" rx="2"/>
+          <rect x="492" y="96" width="20" height="14" rx="2"/><rect x="516" y="96" width="20" height="14" rx="2"/><rect x="540" y="96" width="20" height="14" rx="2"/><rect x="564" y="96" width="20" height="14" rx="2"/><rect x="588" y="96" width="20" height="14" rx="2"/><rect x="612" y="96" width="20" height="14" rx="2"/><rect x="636" y="96" width="20" height="14" rx="2"/><rect x="660" y="96" width="20" height="14" rx="2"/><rect x="684" y="96" width="20" height="14" rx="2"/>
+          <rect x="492" y="114" width="20" height="14" rx="2"/><rect x="516" y="114" width="20" height="14" rx="2"/><rect x="540" y="114" width="20" height="14" rx="2"/><rect x="564" y="114" width="20" height="14" rx="2"/><rect x="588" y="114" width="20" height="14" rx="2"/><rect x="612" y="114" width="20" height="14" rx="2"/><rect x="636" y="114" width="20" height="14" rx="2"/><rect x="660" y="114" width="20" height="14" rx="2"/><rect x="684" y="114" width="20" height="14" rx="2"/>
+        </g>
+        <text x="600" y="164" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">샤드당 수십 MB — 오버헤드가 데이터를 압도</text>
+      </g>
+
+      <g data-show="3">
+        <rect x="120" y="190" width="560" height="52" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="400" y="212" text-anchor="middle" class="sv-label" font-size="12.5">cluster state ~3GB로 비대 → 변경마다 전 노드 publish 30초+</text>
+        <text x="400" y="232" text-anchor="middle" class="sv-label-sm">인덱스 하나 만들 때마다 클러스터 전체가 30초씩 멈칫</text>
+      </g>
+
+      <g data-show="4">
+        <rect x="120" y="256" width="560" height="52" rx="9" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8"/>
+        <text x="400" y="278" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">GC pause 빈발 → 마스터 타임아웃 → 재선출 반복 → GREEN 회복 불가 💀</text>
+        <text x="400" y="298" text-anchor="middle" class="sv-label-sm">해법: shrink·reindex로 샤드 통합 + rollover를 크기 기준(50GB)으로</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>heap 30GB 노드 3대에 600개 샤드 — 노드당 200개, 샤드당 ~30GB. cluster state는 ~30MB, publish는 100ms 미만. 건강한 상태입니다.</p>
+    <p>같은 3대에 <b>샤드 60,000개</b>가 있다면? "일별 인덱스 × 서비스별 인덱스 × 기본 샤드 수"가 방치되면 실제로 일어나는 일입니다. 샤드당 데이터는 수십 MB뿐인데, 샤드 하나마다 Lucene 인덱스 전체의 오버헤드가 붙습니다.</p>
+    <p>cluster state가 기가바이트 단위로 비대해집니다. 인덱스 생성 같은 <b>모든 변경이 전 노드 publish 수십 초</b>를 유발 — 클러스터가 변경 때마다 멈칫거립니다.</p>
+    <p>메타데이터가 heap을 압박해 GC pause가 잦아지고, 마스터가 타임아웃으로 재선출을 반복하다 결국 회복 불능이 됩니다. 대응은 <b>shrink/reindex로 샤드 통합</b>, 그리고 미래 인덱스는 <b>크기 기반 rollover</b>로 예방하는 것입니다.</p>
+  </div>
+</div>
+
+<p>시계열 데이터라면 매일 새 인덱스 대신 <strong>rollover</strong>가 정석입니다. 크기 조건으로 전환하면 샤드가 늘 적정 크기를 유지합니다.</p>
+
+<pre><code><span class="c"># ILM 정책 — 샤드가 50GB에 도달하면 새 인덱스로 자동 전환</span>
+<span class="k">PUT</span> /_ilm/policy/logs-policy
+{
+  <span class="s">"policy"</span>: {
+    <span class="s">"phases"</span>: {
+      <span class="s">"hot"</span>: {
+        <span class="s">"actions"</span>: {
+          <span class="s">"rollover"</span>: {
+            <span class="s">"max_primary_shard_size"</span>: <span class="s">"50gb"</span>,   <span class="c"># 공식 권장 패턴</span>
+            <span class="s">"max_age"</span>: <span class="s">"1d"</span>
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<h2 id="s6">4.6 사후 도구함 — Shrink · Split · Clone · 그리고 watermark</h2>
+
+<p>이미 만들어진 인덱스의 샤드 수를 조정해야 한다면:</p>
+
+<ul>
+  <li><strong>Shrink</strong> (샤드 ↓): read-only 전환 + 모든 샤드 사본을 한 노드에 모은 뒤, <strong>hard link로 복사 없이</strong> 새 인덱스 생성. 새 primary 수는 기존의 약수(8→4, 2, 1).</li>
+  <li><strong>Split</strong> (샤드 ↑): <code>num_routing_shards</code> 여유분 안에서 배수로 증가(1→2→4→8...).</li>
+  <li><strong>Clone</strong>: 같은 설정의 사본. 백업·실험용.</li>
+  <li><strong>Reindex</strong>: 매핑·설정까지 바꿀 수 있는 만능 도구지만 모든 데이터를 다시 색인하므로 가장 느립니다.</li>
+</ul>
+
+<pre><code><span class="c"># shrink 예: 8 shards → 1 shard</span>
+<span class="k">PUT</span> /my-index/_settings
+{
+  <span class="s">"settings"</span>: {
+    <span class="s">"index.routing.allocation.require._name"</span>: <span class="s">"node-1"</span>,  <span class="c"># 한 노드로 모으기</span>
+    <span class="s">"index.blocks.write"</span>: <span class="k">true</span>                             <span class="c"># read-only</span>
+  }
+}
+<span class="k">POST</span> /my-index/_shrink/my-index-shrunk
+{ <span class="s">"settings"</span>: { <span class="s">"index.number_of_shards"</span>: <span class="n">1</span> } }</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">디스크 watermark — "색인이 갑자기 안 돼요"의 정체</div>
+    <p>디스크 사용률 85%(low)부터 새 샤드 할당 거부, 90%(high)면 샤드를 다른 노드로 이동, <strong>95%(flood_stage)에 도달하면 인덱스가 자동으로 read-only</strong>가 됩니다. 디스크를 확보한 뒤 <code>PUT /_all/_settings {"index.blocks.read_only_allow_delete": null}</code>로 해제해야 합니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">primary 샤드 수는 인덱스 생성 후 변경할 수 없습니다. 근본적인 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">Lucene 세그먼트가 immutable이기 때문</button>
+    <button type="button" data-correct>문서의 위치가 hash(_routing) % 샤드 수 공식으로 정해지므로, 샤드 수가 바뀌면 기존 문서의 위치 계산이 전부 어긋나기 때문</button>
+    <button type="button">replica와의 동기 복제가 깨지기 때문</button>
+    <button type="button">cluster state의 크기가 고정되어 있기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 라우팅 공식이 primary 샤드 수에 묶여 있어서입니다. 샤드 수를 바꾸면 "이 _id는 어느 샤드에 있는가"의 답이 달라져 기존 문서를 찾을 수 없게 됩니다. 그래서 변경하려면 reindex나 split/shrink 같은 재배치 작업이 필요합니다. replica 수는 라우팅과 무관해 동적 변경이 가능합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">클러스터가 YELLOW 상태입니다. 올바른 해석은?</div>
+  <div class="quiz-opts">
+    <button type="button">일부 primary가 유실되어 데이터 일부에 접근할 수 없다</button>
+    <button type="button">클러스터가 곧 다운된다는 예고 신호다</button>
+    <button type="button" data-correct>모든 primary는 정상이지만 일부 replica가 미할당 상태 — 서비스는 되지만 장애 여유가 사라졌다</button>
+  </div>
+  <div class="quiz-expl">✅ YELLOW = replica 미할당. 읽기·쓰기는 정상 동작하지만, 지금 노드가 하나 더 죽으면 데이터 유실(RED)로 이어질 수 있는 "여유 없음" 상태입니다. primary가 미할당인 RED는 즉시 대응 대상입니다. 노드 수가 replica 배치 제약(같은 노드 금지)을 만족 못 해도 YELLOW가 됩니다 — 단일 노드에 replicas=1 인덱스가 대표적입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch04_index_and_shards.md" target="_blank" rel="noopener">chapters/ch04_index_and_shards.md</a> — 샤드 수 산정 공식, allocation awareness(랙/AZ 분산), oversharding 진단 체크리스트가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch03.html"><span class="dir">← 이전</span><br><span class="title">3장. Lucene 내부 구조</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch05.html"><span class="dir">다음 →</span><br><span class="title">5장. 매핑과 필드 타입</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

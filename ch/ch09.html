@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9장. INSERT 전략 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch09">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>9장. INSERT 전략 선택</h1>
+<p class="lead">"한 번에 얼마나, 얼마나 자주 넣을 것인가" — 이 단순한 질문의 답이 "Too many parts" 장애와 안정적인 수집 파이프라인을 가릅니다. 배칭, async insert, 포맷·압축까지 INSERT의 모든 선택지를 정리합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Parts, 6장 Merges</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 소량 잦은 INSERT가 파트 폭발을 일으키는 이유와 배칭의 힘 ② 배칭이 불가능할 때의 대안 — async_insert의 서버 측 버퍼링 ③ 재시도해도 안전한 이유 — INSERT 멱등성(dedup) ④ 포맷(Native/RowBinary/JSON)·압축(LZ4/ZSTD)·인터페이스(Native/HTTP) 선택 기준</p>
+  </div>
+</div>
+
+<h2 id="s1">9.1 INSERT 한 번에 일어나는 일 — 고정 오버헤드의 존재</h2>
+
+<p>ClickHouse의 INSERT는 기본적으로 <strong>동기(synchronous)</strong>입니다. 쿼리 하나가 곧바로 디스크에 <strong>파트 하나</strong>를 만듭니다. 그런데 파트 하나를 만드는 데는 행이 10개든 10만 개든 거의 <strong>일정한 고정 비용</strong>이 듭니다.</p>
+
+<pre><code><span class="c">-- 서버 측 INSERT 처리 파이프라인</span>
+클라이언트: ① 배칭 → ② 사전 정렬(선택) → ③ 포맷 → ④ 압축(선택) → ⑤ 전송
+서버:      ⑥ 수신 → ⑦ 압축 해제 → ⑧ 파싱 → ⑨ in-memory Block 구성
+           → ⑩ 프라이머리 키 정렬 → ⑪ sparse index 생성
+           → ⑫ 컬럼별 압축 → ⑬ 디스크에 새 파트 기록</code></pre>
+
+<p>⑩~⑬은 행 수와 무관하게 항상 수행됩니다. 그래서 <strong>배치가 클수록 행당 비용이 급감</strong>합니다. 공식 권장 수치는 명확합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">공식 권장 — 배치 크기와 빈도</div>
+    <p>"최소 <strong>1,000행</strong>, 이상적으로는 <strong>10,000~100,000행</strong> 단위로 INSERT하라." 그리고 빈도는 "<strong>초당 약 1회</strong>의 INSERT 쿼리를 유지하라." INSERT마다 파트가 생기고, 백그라운드 머지가 그것을 따라잡아야 하기 때문입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">9.2 파트 폭발 — 안티패턴과 배칭의 극적인 차이</h2>
+
+<p>초당 수백 번의 소량 INSERT가 왜 장애로 이어지는지, 그리고 같은 데이터를 배치로 넣으면 어떻게 달라지는지 비교해 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="소량 잦은 INSERT (파트 폭발) vs 배치 INSERT" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <line x1="400" y1="16" x2="400" y2="330" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="200" y="30" text-anchor="middle" class="sv-label" font-size="14">😰 행 10개씩 · 초당 500회</text>
+      <text x="600" y="30" text-anchor="middle" class="sv-label" font-size="14">😎 10,000행 배치 · 초당 1회</text>
+
+      <!-- left: tiny inserts raining -->
+      <g data-show="1">
+        <text x="60" y="60" class="sv-label-sm sv-mono">INSERT×500/s ↓↓↓</text>
+        <g class="pulse">
+          <rect x="40" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="76" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="112" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="148" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="184" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="220" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <rect x="256" y="72" width="26" height="16" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        </g>
+      </g>
+
+      <!-- step2: part explosion -->
+      <g data-show="2">
+        <rect x="36" y="100" width="330" height="110" rx="9" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="200" y="122" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">파트 수천 개 (전부 level 0)</text>
+        <g fill="color-mix(in srgb, var(--danger) 25%, transparent)" stroke="var(--danger)">
+          <rect x="52" y="134" width="20" height="14" rx="3"/><rect x="80" y="134" width="20" height="14" rx="3"/><rect x="108" y="134" width="20" height="14" rx="3"/><rect x="136" y="134" width="20" height="14" rx="3"/><rect x="164" y="134" width="20" height="14" rx="3"/><rect x="192" y="134" width="20" height="14" rx="3"/><rect x="220" y="134" width="20" height="14" rx="3"/><rect x="248" y="134" width="20" height="14" rx="3"/><rect x="276" y="134" width="20" height="14" rx="3"/><rect x="304" y="134" width="20" height="14" rx="3"/><rect x="332" y="134" width="20" height="14" rx="3"/>
+          <rect x="52" y="156" width="20" height="14" rx="3"/><rect x="80" y="156" width="20" height="14" rx="3"/><rect x="108" y="156" width="20" height="14" rx="3"/><rect x="136" y="156" width="20" height="14" rx="3"/><rect x="164" y="156" width="20" height="14" rx="3"/><rect x="192" y="156" width="20" height="14" rx="3"/><rect x="220" y="156" width="20" height="14" rx="3"/><rect x="248" y="156" width="20" height="14" rx="3"/><rect x="276" y="156" width="20" height="14" rx="3"/><rect x="304" y="156" width="20" height="14" rx="3"/><rect x="332" y="156" width="20" height="14" rx="3"/>
+        </g>
+        <text x="200" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">머지가 도저히 못 따라감 ⚙️🔥</text>
+      </g>
+
+      <!-- step3: too many parts error -->
+      <g data-show="3">
+        <rect x="60" y="226" width="280" height="52" rx="9" fill="color-mix(in srgb, var(--danger) 16%, transparent)" stroke="var(--danger)" stroke-width="2" class="blink"/>
+        <text x="200" y="248" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">DB::Exception: Too many parts (3000)</text>
+        <text x="200" y="268" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">parts_to_throw_insert 초과 → INSERT 거부!</text>
+      </g>
+
+      <!-- step4: right side batch -->
+      <g data-show="4">
+        <rect x="480" y="60" width="240" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="600" y="82" text-anchor="middle" class="sv-label-sm sv-mono">INSERT 10,000행 × 1회/초</text>
+        <path d="M 600 94 L 600 126" class="sv-arrow flow-line"/>
+        <rect x="480" y="130" width="240" height="80" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="600" y="152" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">초당 파트 1개씩만 생성</text>
+        <rect x="520" y="164" width="70" height="30" rx="6" fill="color-mix(in srgb, var(--ok) 20%, transparent)" stroke="var(--ok)"/>
+        <rect x="610" y="164" width="70" height="30" rx="6" fill="color-mix(in srgb, var(--ok) 20%, transparent)" stroke="var(--ok)"/>
+      </g>
+
+      <!-- step5: conclusion -->
+      <g data-show="5">
+        <text x="600" y="248" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--ok)">머지가 여유롭게 수렴 ✅</text>
+        <text x="600" y="268" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">쿼리도 빠르고 INSERT도 안정적</text>
+      </g>
+      <g data-show="5" class="rise">
+        <rect x="90" y="300" width="620" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="400" y="325" text-anchor="middle" class="sv-label" font-size="13">같은 5,000행/초 — 파트 500개/초 vs 1개/초. 배칭이 전부다 ⚡</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>행 10개짜리 INSERT가 초당 500번 쏟아집니다. <b>INSERT 1회 = 파트 1개</b>이므로 초당 파트 500개가 생성됩니다.</p>
+    <p>level 0 파트가 수천 개로 불어나고, 백그라운드 머지는 파트 생성 속도를 <b style="color:var(--danger)">도저히 따라잡지 못합니다</b>. 파트마다 고정 오버헤드(인덱스·메타데이터·디렉터리)도 반복 지불됩니다.</p>
+    <p>활성 파트가 <code>parts_to_throw_insert</code>(기본 3000)를 넘는 순간 — <b style="color:var(--danger)">"Too many parts" 에러와 함께 INSERT가 거부</b>됩니다. 가장 흔한 ClickHouse 운영 사고입니다.</p>
+    <p>같은 데이터를 <b>10,000행 배치로 초당 1회</b> 넣으면? 파트가 초당 1개만 생기고, 고정 오버헤드도 1/500로 줄어듭니다.</p>
+    <p>머지는 여유롭게 계층을 수렴시키고, SELECT는 적은 파트만 읽어 빠릅니다. <b>배칭은 ClickHouse 수집 최적화의 알파이자 오메가</b>입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">사전 정렬은 "선택적" 최적화</div>
+    <p>클라이언트에서 프라이머리 키 순서로 정렬해 보내면 서버가 정렬 단계를 건너뛰어 CPU가 절약됩니다. 하지만 ClickHouse의 서버 측 병렬 정렬이 매우 효율적이므로, 데이터가 이미 거의 정렬돼 있거나 클라이언트 자원이 남을 때만 유의미합니다. observability 같은 고속 스트리밍에서는 보통 생략합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">9.3 재시도해도 안전하다 — INSERT 멱등성</h2>
+
+<p>네트워크는 언제든 끊길 수 있습니다. "INSERT가 성공했는지 모르겠는데 다시 보내면 중복되지 않을까?" — MergeTree는 이 문제를 <strong>INSERT 중복 제거(deduplication)</strong>로 해결합니다.</p>
+
+<div class="anim" data-steps="4" data-title="멱등한 재시도 — 같은 배치는 두 번 저장되지 않는다" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 300">
+      <defs>
+        <marker id="arr9a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <rect x="40" y="90" width="170" height="60" rx="10" class="sv-box"/>
+      <text x="125" y="115" text-anchor="middle" class="sv-label" font-size="12.5">🧑‍💻 클라이언트</text>
+      <text x="125" y="135" text-anchor="middle" class="sv-label-sm sv-mono">배치 #42 (10,000행)</text>
+      <rect x="540" y="90" width="200" height="60" rx="10" class="sv-box"/>
+      <text x="640" y="115" text-anchor="middle" class="sv-label" font-size="12.5">ClickHouse 서버</text>
+      <text x="640" y="135" text-anchor="middle" class="sv-label-sm">배치 해시 기록 유지</text>
+
+      <!-- step1: insert ok -->
+      <g data-show="1">
+        <path d="M 210 108 L 530 108" class="sv-arrow flow-line" marker-end="url(#arr9a)"/>
+        <text x="370" y="98" text-anchor="middle" class="sv-label-sm">① INSERT 배치 #42</text>
+        <rect x="580" y="164" width="120" height="30" rx="7" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)"/>
+        <text x="640" y="184" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">파트 생성 ✓</text>
+      </g>
+
+      <!-- step2: ack lost -->
+      <g data-show="2">
+        <path d="M 530 132 Q 440 145 370 138" stroke="var(--danger)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="420" y="164" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">② 응답(ACK)이 네트워크 중단으로 유실 ⚡✂️</text>
+        <text x="125" y="172" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">"실패했나...?" 😨</text>
+      </g>
+
+      <!-- step3: retry -->
+      <g data-show="3">
+        <path d="M 210 122 Q 370 200 530 128" class="sv-arrow flow-line" marker-end="url(#arr9a)" stroke="var(--warn)"/>
+        <text x="370" y="200" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">③ 동일한 배치 #42 재전송 (내용·순서 동일)</text>
+        <text x="640" y="215" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">해시 비교 → "이미 받은 배치!"</text>
+      </g>
+
+      <!-- step4: dedup -->
+      <g data-show="4" class="rise">
+        <rect x="90" y="238" width="600" height="48" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="390" y="258" text-anchor="middle" class="sv-label" font-size="13">④ 중복 파트를 만들지 않고 성공 응답 → 재시도가 안전(멱등) ✅</text>
+        <text x="390" y="278" text-anchor="middle" class="sv-label-sm">조건: 재시도 시 배치의 내용과 순서가 완전히 동일해야 한다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 배치 #42를 INSERT하고, 서버는 파트를 성공적으로 생성합니다.</p>
+    <p>그런데 성공 응답이 클라이언트에 도달하기 전에 <b style="color:var(--danger)">네트워크가 끊깁니다</b>. 클라이언트 입장에서는 성공인지 실패인지 알 수 없습니다. (서버 측 실패 후 타임아웃도 같은 상황)</p>
+    <p>클라이언트가 <b style="color:var(--warn)">동일한 배치를 재전송</b>합니다. 서버는 배치의 해시를 기존 기록과 비교해 "이미 처리한 INSERT"임을 감지합니다.</p>
+    <p>중복 파트는 만들어지지 않고 성공으로 처리됩니다. 단, <b>배치 내용과 순서가 완전히 동일할 때만</b> 동작하므로, 재시도 로직에서 배치를 재구성하지 않도록 주의하세요.</p>
+  </div>
+</div>
+
+<h2 id="s4">9.4 배칭이 불가능하다면 — Async Insert</h2>
+
+<p>수백~수천 개의 에이전트가 실시간으로 소량 데이터를 계속 쏘는 observability 환경에서는 클라이언트 측 배칭이 어렵습니다. 이럴 때 <strong>배칭을 서버에게 맡기는</strong> 것이 <code>async_insert</code>입니다.</p>
+
+<div class="anim" data-steps="5" data-title="async_insert — 서버 메모리 버퍼가 대신 배칭한다" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <defs>
+        <marker id="arr9b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- agents -->
+      <g data-show="1">
+        <rect x="30" y="40" width="120" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="62" text-anchor="middle" class="sv-label-sm">에이전트 A</text>
+        <rect x="30" y="86" width="120" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="108" text-anchor="middle" class="sv-label-sm">에이전트 B</text>
+        <rect x="30" y="132" width="120" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="90" y="154" text-anchor="middle" class="sv-label-sm">에이전트 C … ×1000</text>
+        <text x="90" y="190" text-anchor="middle" class="sv-label-sm sv-mono">소량 행 실시간 전송</text>
+      </g>
+
+      <!-- step2: buffer -->
+      <g data-show="2">
+        <path d="M 150 57 Q 220 70 275 100" class="sv-arrow flow-line" marker-end="url(#arr9b)"/>
+        <path d="M 150 103 L 275 118" class="sv-arrow flow-line" marker-end="url(#arr9b)"/>
+        <path d="M 150 149 Q 220 145 275 133" class="sv-arrow flow-line" marker-end="url(#arr9b)"/>
+        <rect x="280" y="80" width="220" height="90" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="390" y="106" text-anchor="middle" class="sv-label" font-size="12.5">🧠 서버 메모리 버퍼</text>
+        <text x="390" y="128" text-anchor="middle" class="sv-label-sm">행들이 계속 누적...</text>
+        <text x="390" y="150" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">(flush 전엔 쿼리 불가!)</text>
+      </g>
+
+      <!-- step3: flush conditions -->
+      <g data-show="3">
+        <rect x="540" y="46" width="230" height="112" rx="10" class="sv-box"/>
+        <text x="655" y="70" text-anchor="middle" class="sv-label" font-size="12.5">Flush 조건 (하나라도 충족)</text>
+        <text x="556" y="94" class="sv-label-sm sv-mono">① 버퍼 크기 초과 (max_data_size)</text>
+        <text x="556" y="116" class="sv-label-sm sv-mono">② 타임아웃 (busy_timeout_ms)</text>
+        <text x="556" y="138" class="sv-label-sm sv-mono">③ 누적 쿼리 수 (max_query_number)</text>
+        <path d="M 540 120 Q 520 130 502 135" class="sv-arrow" stroke="var(--warn)"/>
+      </g>
+
+      <!-- step4: flush to part -->
+      <g data-show="4">
+        <path d="M 390 170 L 390 214" class="sv-arrow flow-line" marker-end="url(#arr9b)" stroke="var(--ok)"/>
+        <rect x="290" y="218" width="200" height="52" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="390" y="240" text-anchor="middle" class="sv-label" font-size="12.5">💾 하나의 파트로 flush</text>
+        <text x="390" y="260" text-anchor="middle" class="sv-label-sm">수천 개의 소량 INSERT → 파트 1개</text>
+      </g>
+
+      <!-- step5: wait_for_async_insert -->
+      <g data-show="5" class="rise">
+        <rect x="60" y="288" width="680" height="42" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="400" y="306" text-anchor="middle" class="sv-label" font-size="12.5">wait_for_async_insert = 1 (기본): flush 완료 후 응답 → 에러가 클라이언트에 전달됨 ✅ 프로덕션 권장</text>
+        <text x="400" y="324" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">= 0 (fire-and-forget): 버퍼링 즉시 응답 — 에러 미인지 + 과부하 위험. 유실 허용 시에만</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>수백~수천 개의 에이전트가 각자 소량의 행을 실시간으로 보냅니다. 클라이언트 측 배칭이 불가능한 전형적 상황입니다.</p>
+    <p>서버가 INSERT를 즉시 파트로 만드는 대신 <b style="color:var(--warn)">메모리 버퍼에 누적</b>합니다. 클라이언트에게는 투명하게 동작하지만, <b style="color:var(--danger)">flush 전까지 그 데이터는 쿼리할 수 없습니다</b>.</p>
+    <p>세 가지 flush 조건 중 하나가 충족되면: ① 버퍼 크기(<code>async_insert_max_data_size</code>) ② 타임아웃(<code>async_insert_busy_timeout_ms</code>) ③ 누적 쿼리 수(<code>async_insert_max_query_number</code>).</p>
+    <p>버퍼 전체가 <b style="color:var(--ok)">하나의 파트</b>로 기록됩니다. 수천 개의 소량 INSERT가 파트 1개로 — 파트 폭발이 원천 차단됩니다.</p>
+    <p>응답 모드가 중요합니다. <code>wait_for_async_insert=1</code>(기본)은 flush 완료 후 응답해 에러를 알 수 있습니다. <b style="color:var(--danger)">=0은 매우 위험</b> — 공식 문서도 "클라이언트가 에러를 알 수 없고 과부하를 유발할 수 있다"고 강하게 경고합니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 사용자 레벨로 활성화</span>
+<span class="k">ALTER USER</span> default <span class="k">SETTINGS</span> async_insert = <span class="n">1</span>;
+
+<span class="c">-- 또는 쿼리 레벨</span>
+<span class="k">INSERT INTO</span> mytable <span class="k">SETTINGS</span> async_insert = <span class="n">1</span> <span class="k">VALUES</span> (...);</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">async insert의 중복 제거는 기본 꺼짐</div>
+    <p>동기 INSERT와 달리 비동기 INSERT에서는 dedup이 기본 <strong>비활성화</strong>입니다. 활성화할 수는 있지만, 의존하는 Materialized View가 있으면 문제가 생길 수 있으니 주의하세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">9.5 포맷·압축·인터페이스 — 전송 경로의 선택</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>포맷</th><th>특징</th><th>권장 용도</th></tr></thead>
+  <tbody>
+    <tr><td><code>Native</code></td><td>가장 효율적. 컬럼 지향이라 서버 측 파싱 최소. Go/Python 클라이언트 기본값</td><td>고처리량 수집</td></tr>
+    <tr><td><code>RowBinary</code></td><td>효율적인 행 기반 포맷. Java 클라이언트 기본값</td><td>클라이언트에서 컬럼 변환이 어려울 때</td></tr>
+    <tr><td><code>JSONEachRow</code></td><td>사용은 편리하나 파싱 비용 높음</td><td>저볼륨, 빠른 통합</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>압축</strong>은 LZ4(기본)가 대부분 최적입니다 — 빠르고 가벼우며 50% 이상 크기를 줄입니다. 리전 간 전송이나 클라우드 egress 비용처럼 <strong>네트워크 비용이 높을 때만 ZSTD</strong>(높은 압축률, CPU 부하 증가)를 고려하세요. <strong>Native 포맷 + LZ4</strong> 조합이 최고 수집 성능을 냅니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Native 인터페이스</th><th>HTTP 인터페이스</th></tr></thead>
+  <tbody>
+    <tr><td><strong>포맷</strong></td><td>항상 Native (최효율)</td><td>70+ 포맷 지원</td></tr>
+    <tr><td><strong>압축</strong></td><td>블록 단위 LZ4/ZSTD</td><td>전체 페이로드 단위</td></tr>
+    <tr><td><strong>로드밸런싱</strong></td><td>어려움</td><td>용이</td></tr>
+    <tr><td><strong>성능</strong></td><td>약간 더 빠름</td><td>약간 느림 (차이는 "small")</td></tr>
+    <tr><td><strong>권장</strong></td><td>최대 처리량이 필요할 때</td><td><strong>대부분의 프로덕션 환경</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">분산 환경에서 INSERT 대상 선택</div>
+    <p>8장에서 배운 대로, Distributed 테이블 INSERT는 Initiator를 거치는 오버헤드와 장애 시 임시 데이터 유실 위험이 있습니다. 가능하면 <strong>로컬 테이블(ReplicatedMergeTree)에 직접 INSERT</strong>하고, 클라이언트나 로드밸런서가 shard별 라우팅을 담당하게 하세요.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">ClickHouse 공식 문서가 권장하는 INSERT 배치 크기와 빈도는?</div>
+  <div class="quiz-opts">
+    <button type="button">행 1개씩, 최대한 자주 (실시간성 우선)</button>
+    <button type="button">100행 단위, 초당 100회</button>
+    <button type="button" data-correct>최소 1,000행 — 이상적으로 10,000~100,000행, 초당 약 1회</button>
+    <button type="button">1억 행 단위, 하루 1회</button>
+  </div>
+  <div class="quiz-expl">✅ INSERT마다 고정 오버헤드를 가진 파트가 하나씩 생기므로, 배치를 키우고 빈도를 초당 약 1회로 유지해야 백그라운드 머지가 따라잡을 수 있습니다. 소량 잦은 INSERT는 파트 폭발 → "Too many parts"(기본 3000 초과 시 INSERT 거부)로 이어집니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q"><code>wait_for_async_insert = 0</code>이 위험한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">flush가 영원히 일어나지 않기 때문</button>
+    <button type="button" data-correct>버퍼링 직후 성공으로 응답하므로, 이후 flush 단계의 에러를 클라이언트가 알 수 없고 서버 과부하도 유발할 수 있기 때문</button>
+    <button type="button">중복 제거가 강제로 활성화되어 성능이 떨어지기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ =0은 fire-and-forget 모드입니다. 서버가 버퍼에 넣자마자 성공을 반환하므로, 실제 파트 기록에서 에러가 나도 클라이언트는 모른 채 데이터가 유실됩니다. 공식 문서는 "very risky"라고 표현하며, 프로덕션에서는 기본값인 <code>wait_for_async_insert=1</code>을 유지하라고 권고합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch09_insert_strategy.md" target="_blank" rel="noopener">chapters/ch09_insert_strategy.md</a> — 서버 측 처리 13단계, 사전 정렬 트레이드오프, 비동기 INSERT 중복 제거 상세가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch08.html"><span class="dir">← 이전</span><br><span class="title">8장. Shards &amp; Replicas</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch10.html"><span class="dir">다음 →</span><br><span class="title">10장. 안티패턴 모음</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

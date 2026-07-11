@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8장. Aggregations — 집계 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch08">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>8장. Aggregations — 검색 엔진 위의 분석 엔진</h1>
+<p class="lead">검색이 "어느 문서가 맞는가"를 묻는다면, 집계는 "이 문서들의 분포와 추세는 어떠한가"를 답합니다. Kibana 대시보드의 거의 모든 차트가 이 위에 서 있습니다 — 그리고 그 숫자, 가끔은 근사치입니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 28분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 7장 Query DSL</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Metric / Bucket / Pipeline — 집계의 세 종류와 트리 구조 ② terms 집계가 샤드별 부분 집계를 합치는 과정과 <strong>근사치 오차</strong>의 원인 ③ 시계열의 핵심 date_histogram과 pipeline 집계 ④ 대량 버킷을 안전하게 순회하는 composite</p>
+  </div>
+</div>
+
+<h2 id="s1">8.1 집계의 세 종류와 트리 구조</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>종류</th><th>산출물</th><th>예</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Metric</strong></td><td>숫자 (또는 통계 객체)</td><td><code>avg</code>, <code>sum</code>, <code>cardinality</code>, <code>percentiles</code>, <code>top_hits</code></td></tr>
+    <tr><td><strong>Bucket</strong></td><td>문서들의 그룹(버킷)</td><td><code>terms</code>, <code>range</code>, <code>date_histogram</code>, <code>filters</code></td></tr>
+    <tr><td><strong>Pipeline</strong></td><td>다른 집계의 출력을 입력으로</td><td><code>derivative</code>, <code>cumulative_sum</code>, <code>moving_fn</code>, <code>bucket_script</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>핵심은 <strong>bucket 안에 자식 집계를 중첩해 트리를 만들 수 있다</strong>는 점입니다. SQL의 <code>GROUP BY</code> + 집계 함수 + 윈도우 함수가 하나의 JSON 트리로 표현된다고 생각하면 됩니다.</p>
+
+<div class="anim" data-steps="4" data-title="집계 트리가 조립되는 과정 — 카테고리별 → 월별 → 이동평균" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- 요청 -->
+      <rect x="20" y="20" width="180" height="42" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="110" y="38" text-anchor="middle" class="sv-label" font-size="12.5">Search 요청</text>
+      <text x="110" y="55" text-anchor="middle" class="sv-label-sm sv-mono">"size": 0, "aggs": …</text>
+
+      <!-- step1: bucket -->
+      <g data-active="1-1">
+        <rect x="20" y="100" width="220" height="52" rx="9" class="sv-box"/>
+        <text x="130" y="122" text-anchor="middle" class="sv-label" font-size="12.5">🪣 by_category (terms)</text>
+        <text x="130" y="140" text-anchor="middle" class="sv-label-sm sv-mono">laptop · phone · tablet</text>
+      </g>
+      <path d="M 110 62 L 110 98" class="sv-arrow" marker-end="url(#arr1)"/>
+
+      <!-- step2: metric children -->
+      <g data-show="2" data-active="2-2">
+        <path d="M 240 126 L 288 126" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="296" y="82" width="190" height="40" rx="8" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)"/>
+        <text x="391" y="107" text-anchor="middle" class="sv-label-sm sv-mono">📏 avg_price (avg)</text>
+        <rect x="296" y="130" width="190" height="40" rx="8" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)"/>
+        <text x="391" y="155" text-anchor="middle" class="sv-label-sm sv-mono">📏 revenue (sum)</text>
+      </g>
+
+      <!-- step3: nested bucket -->
+      <g data-show="3" data-active="3-3">
+        <path d="M 130 152 L 130 196" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="20" y="200" width="240" height="52" rx="9" class="sv-box"/>
+        <text x="140" y="222" text-anchor="middle" class="sv-label" font-size="12.5">🪣 by_month (date_histogram)</text>
+        <text x="140" y="240" text-anchor="middle" class="sv-label-sm sv-mono">calendar_interval: 1M</text>
+        <path d="M 260 226 L 308 226" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="316" y="206" width="200" height="40" rx="8" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)"/>
+        <text x="416" y="231" text-anchor="middle" class="sv-label-sm sv-mono">📏 monthly_rev (sum)</text>
+      </g>
+
+      <!-- step4: pipeline -->
+      <g data-show="4">
+        <path d="M 516 226 L 564 226" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <rect x="572" y="200" width="208" height="52" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="676" y="222" text-anchor="middle" class="sv-label" font-size="12.5">🔁 3m_moving_avg</text>
+        <text x="676" y="240" text-anchor="middle" class="sv-label-sm sv-mono">moving_fn(window: 3)</text>
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13.5">결과: 카테고리별 → [평균가, 매출, 월별 매출 + 3개월 이동평균] 트리 그대로 반환</text>
+      </g>
+
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>집계 전용 요청은 <code>"size": 0</code>으로 시작합니다 — "검색 결과(hits)는 필요 없고 집계만 달라"는 뜻. 먼저 <b>terms bucket</b>이 문서를 카테고리별 버킷으로 나눕니다.</p>
+    <p>각 버킷 안에 <b>metric 자식</b>을 넣습니다. laptop 버킷의 평균가, phone 버킷의 매출… 버킷마다 독립적으로 계산됩니다.</p>
+    <p>버킷 안에 <b>또 다른 bucket</b>(date_histogram)을 중첩할 수도 있습니다. "카테고리별 → 월별 매출"의 2단 트리가 완성됩니다.</p>
+    <p>마지막으로 <b style="color:var(--purple)">pipeline 집계</b>가 다른 집계의 출력(월별 매출)을 입력으로 받아 3개월 이동평균을 계산합니다. 요청의 트리 구조가 곧 응답의 구조입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">8.2 Metric — 숫자를 뽑는 집계</h2>
+
+<pre><code><span class="k">GET</span> /sales/_search
+{
+  <span class="s">"size"</span>: <span class="n">0</span>,
+  <span class="s">"aggs"</span>: {
+    <span class="s">"avg_price"</span>:     { <span class="s">"avg"</span>: { <span class="s">"field"</span>: <span class="s">"price"</span> } },
+    <span class="s">"total_revenue"</span>: { <span class="s">"sum"</span>: { <span class="s">"field"</span>: <span class="s">"price"</span> } },
+    <span class="s">"price_stats"</span>:   { <span class="s">"stats"</span>: { <span class="s">"field"</span>: <span class="s">"price"</span> } },   <span class="c">// count·min·max·avg·sum 한 번에</span>
+    <span class="s">"unique_users"</span>:  { <span class="s">"cardinality"</span>: { <span class="s">"field"</span>: <span class="s">"user_id"</span> } }
+  }
+}</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">cardinality는 정확한 수가 아니다</div>
+    <p><code>cardinality</code>는 <strong>HyperLogLog++</strong> 기반 근사값입니다. <code>precision_threshold</code>(기본 3000, 최대 40000) 이하에서는 정확하고, 그 이상은 약 1~2% 오차가 납니다. 값을 키우면 정확도↑ 메모리↑ (대략 threshold × 8바이트). 정확한 distinct count가 반드시 필요하다면 ES는 적합한 도구가 아닙니다.</p>
+  </div>
+</div>
+
+<p><code>percentiles</code>(TDigest 기반 근사)로 p50/p95/p99 지연시간을, <code>top_hits</code>로 각 버킷의 대표 문서를 뽑을 수 있습니다. <code>top_hits</code>는 SQL의 <code>ROW_NUMBER() OVER (PARTITION BY …)</code>에 가장 가까운 도구입니다.</p>
+
+<h2 id="s3">8.3 Bucket — 문서를 그룹으로 나누는 집계</h2>
+
+<p>가장 자주 쓰는 둘만 확실히 잡으면 됩니다: 그룹핑의 <code>terms</code>, 시계열의 <code>date_histogram</code>.</p>
+
+<pre><code><span class="c">// 브랜드별 Top 10 — 매출순 정렬은 자식 metric으로</span>
+<span class="s">"by_brand"</span>: {
+  <span class="s">"terms"</span>: {
+    <span class="s">"field"</span>: <span class="s">"brand"</span>,
+    <span class="s">"size"</span>:  <span class="n">10</span>,
+    <span class="s">"order"</span>: { <span class="s">"total_revenue"</span>: <span class="s">"desc"</span> }
+  },
+  <span class="s">"aggs"</span>: {
+    <span class="s">"total_revenue"</span>: { <span class="s">"sum"</span>: { <span class="s">"field"</span>: <span class="s">"price"</span> } }
+  }
+}</code></pre>
+
+<pre><code><span class="c">// 일별 매출 그래프 — 시계열의 표준 형태</span>
+<span class="s">"sales_over_time"</span>: {
+  <span class="s">"date_histogram"</span>: {
+    <span class="s">"field"</span>: <span class="s">"ordered_at"</span>,
+    <span class="s">"calendar_interval"</span>: <span class="s">"1d"</span>,
+    <span class="s">"time_zone"</span>: <span class="s">"Asia/Seoul"</span>,       <span class="c">// 기본 UTC! 반드시 명시</span>
+    <span class="s">"min_doc_count"</span>: <span class="n">0</span>,               <span class="c">// 데이터 없는 날도 0으로</span>
+    <span class="s">"extended_bounds"</span>: { <span class="s">"min"</span>: <span class="s">"2026-01-01"</span>, <span class="s">"max"</span>: <span class="s">"2026-06-30"</span> }
+  }
+}</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🕐</span>
+  <div>
+    <div class="callout-title">time_zone 누락 — 한국 대시보드의 단골 버그</div>
+    <p>date_histogram의 기본은 <strong>UTC</strong>입니다. KST 자정 직전 주문이 "어제" 버킷으로 밀려 보이는 버그의 원인. 한국 기준 일별 차트라면 <strong>항상 <code>time_zone: "Asia/Seoul"</code>을 명시</strong>하세요.</p>
+  </div>
+</div>
+
+<p>그 밖에: <code>range</code>(사용자 정의 구간), <code>histogram</code>(숫자 균등 구간), <code>filters</code>(이름 붙은 필터 버킷), <code>nested</code>(nested 필드 진입용) 등이 있습니다.</p>
+
+<h2 id="s4">8.4 terms 집계는 왜 부정확할 수 있는가 — 분산의 대가</h2>
+
+<p>공식 문서가 직접 경고합니다: <em>"the doc_count values for a terms aggregation may be approximate."</em> ES에서 가장 자주 오해되는 부분입니다. 원인은 데이터가 <strong>여러 샤드에 분산</strong>되어 있다는 사실 그 자체입니다.</p>
+
+<ol>
+  <li>각 샤드는 자기 데이터에서 상위 <code>shard_size</code>개 버킷만 추려 coordinating node로 보냅니다</li>
+  <li>coordinating node가 부분 결과를 합산해 최종 상위 <code>size</code>개를 결정합니다</li>
+</ol>
+
+<p>문제는 <strong>어떤 term이 샤드마다 순위가 다를 때</strong> 발생합니다. 애니메이션으로 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="terms 집계의 분산 처리 — 근사치 오차가 생기는 순간" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 370">
+      <!-- 요청 -->
+      <rect x="270" y="14" width="260" height="38" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="400" y="38" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">terms(brand, size=5) · shard_size=10</text>
+
+      <!-- 샤드 A -->
+      <rect x="30" y="80" width="330" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="46" y="104" class="sv-label" font-size="13">Shard A — 로컬 카운트</text>
+      <text x="46" y="130" class="sv-label-sm sv-mono">1위 a:100 · 2위 b:90 · … · 10위 j:15</text>
+      <g data-active="2-4">
+        <rect x="42" y="144" width="200" height="30" rx="7" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)"/>
+        <text x="142" y="164" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">11위 X:14 — 잘림!</text>
+      </g>
+      <text x="46" y="198" class="sv-label-sm">상위 10개(shard_size)만 전송</text>
+
+      <!-- 샤드 B -->
+      <rect x="440" y="80" width="330" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="456" y="104" class="sv-label" font-size="13">Shard B — 로컬 카운트</text>
+      <text x="456" y="130" class="sv-label-sm sv-mono">1위 k:200 · 2위 l:150 · 3위 m:120</text>
+      <g data-active="3-4">
+        <rect x="452" y="144" width="200" height="30" rx="7" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+        <text x="552" y="164" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--es)">5위 X:90 — 포함 ✓</text>
+      </g>
+      <text x="456" y="198" class="sv-label-sm">상위 10개 안에 X가 있음</text>
+
+      <!-- 전송 화살표 -->
+      <g data-show="2">
+        <path d="M 195 210 C 230 250 320 275 372 288" stroke="var(--warn)" stroke-width="2.2" fill="none" class="flow-line"/>
+      </g>
+      <g data-show="3">
+        <path d="M 605 210 C 570 250 480 275 428 288" stroke="var(--warn)" stroke-width="2.2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- coordinating -->
+      <rect x="280" y="286" width="240" height="52" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="400" y="308" text-anchor="middle" class="sv-label">coordinating node</text>
+      <text x="400" y="326" text-anchor="middle" class="sv-label-sm">부분 집계 합산 → 최종 Top 5</text>
+
+      <!-- step4: 오차 -->
+      <g data-show="4-4">
+        <text x="400" y="362" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13.5">X의 최종 카운트 = 90 … 실제는 90 + 14 = 104. 샤드 A 몫이 증발! ❌</text>
+      </g>
+
+      <!-- step5: 해결 -->
+      <g data-show="5">
+        <text x="400" y="362" text-anchor="middle" class="sv-label" fill="var(--ok)" font-size="13.5">✅ shard_size를 키우면 X가 샤드 A에서도 전송됨 → 104로 정확해짐</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>브랜드 Top 5를 요청합니다. 각 샤드는 최종 순위를 모르므로 여유분을 포함해 상위 <code>shard_size</code>(=10)개씩만 보냅니다.</p>
+    <p><b>Shard A</b>에서 term <code>X</code>는 카운트 14로 <b style="color:var(--danger)">11위 — 전송 목록에서 잘립니다</b>. X가 A에 14건 있다는 사실은 coordinating node에 전달되지 않습니다.</p>
+    <p><b>Shard B</b>에서는 X가 카운트 90으로 5위 — 이쪽 목록에는 <b style="color:var(--es)">포함되어 전송</b>됩니다.</p>
+    <p>coordinating node가 합산한 X의 최종 카운트는 90. 실제로는 104(90+14)인데 <b style="color:var(--danger)">샤드 A의 몫이 누락</b>됐습니다. 이것이 terms 집계 근사치 오차의 정체입니다.</p>
+    <p>대응은 <code>shard_size</code>를 키워 각 샤드가 더 많은 후보를 보내게 하는 것. <code>show_term_doc_count_error: true</code>로 오차 상한(<code>doc_count_error_upper_bound</code>)을 응답에서 확인할 수 있습니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="s">"by_brand"</span>: {
+  <span class="s">"terms"</span>: {
+    <span class="s">"field"</span>:      <span class="s">"brand"</span>,
+    <span class="s">"size"</span>:       <span class="n">10</span>,
+    <span class="s">"shard_size"</span>: <span class="n">100</span>,                 <span class="c">// 기본 size*1.5+10 → 키우면 정확도↑</span>
+    <span class="s">"show_term_doc_count_error"</span>: <span class="n">true</span>   <span class="c">// 버킷별 오차 상한 포함</span>
+  }
+}
+<span class="c">// 응답: "doc_count_error_upper_bound": 14  ← 0이면 신뢰 가능</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">얼마나 심각하게 받아들여야 하나</div>
+    <p>대시보드의 "Top 10 보여주기"는 기본값으로 충분합니다. 반면 <strong>보고서·정산처럼 숫자가 정확해야 하는 곳</strong>은 오차 상한을 확인하고, 필요하면 composite로 모든 버킷을 순회하세요. 고유값이 수만 개 이상인 필드일수록 오차 위험이 커집니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">8.5 composite — 버킷의 페이지네이션</h2>
+
+<p><code>terms</code>는 모든 버킷을 한 번에 계산해 반환하므로, 고유값이 수십만 개인 필드(예: user_id)에 쓰면 메모리가 폭발합니다. 이때의 답이 <strong><code>composite</code></strong> — 정렬된 버킷을 <code>after_key</code> 커서로 페이지 단위로 순회합니다.</p>
+
+<div class="anim" data-steps="4" data-title="composite 집계 — after_key로 버킷을 결정적으로 순회" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 300">
+      <!-- 전체 버킷 공간 -->
+      <rect x="30" y="50" width="300" height="200" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="180" y="36" text-anchor="middle" class="sv-label" font-size="13">전체 버킷 (수십만 개, 키 순 정렬)</text>
+      <g data-active="2-2">
+        <rect x="46" y="66" width="268" height="50" rx="8" fill="color-mix(in srgb, var(--es) 12%, transparent)" stroke="var(--es)"/>
+        <text x="180" y="96" text-anchor="middle" class="sv-label-sm sv-mono">buckets 1 ~ 1000</text>
+      </g>
+      <g data-active="3-3">
+        <rect x="46" y="126" width="268" height="50" rx="8" class="sv-box"/>
+        <text x="180" y="156" text-anchor="middle" class="sv-label-sm sv-mono">buckets 1001 ~ 2000</text>
+      </g>
+      <rect x="46" y="186" width="268" height="50" rx="8" class="sv-box"/>
+      <text x="180" y="216" text-anchor="middle" class="sv-label-sm sv-mono">buckets 2001 ~ …</text>
+
+      <!-- step1: terms의 문제 -->
+      <g data-show="1-1">
+        <rect x="420" y="70" width="330" height="70" rx="10" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+        <text x="585" y="98" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">terms로 한 번에? 전 버킷을 메모리에!</text>
+        <text x="585" y="120" text-anchor="middle" class="sv-label-sm">고카디널리티 필드 → OOM 위험 ❌</text>
+      </g>
+
+      <!-- step2: page1 -->
+      <g data-show="2">
+        <path d="M 314 91 L 412 91" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
+        <rect x="420" y="66" width="330" height="50" rx="9" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)"/>
+        <text x="585" y="87" text-anchor="middle" class="sv-label-sm sv-mono">composite(size=1000) → page 1</text>
+        <text x="585" y="106" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--es)">after_key: {"category":"laptop"}</text>
+      </g>
+
+      <!-- step3: page2 -->
+      <g data-show="3">
+        <path d="M 314 151 L 412 151" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
+        <rect x="420" y="126" width="330" height="50" rx="9" fill="color-mix(in srgb, var(--es) 10%, transparent)" stroke="var(--es)"/>
+        <text x="585" y="147" text-anchor="middle" class="sv-label-sm sv-mono">"after": {"category":"laptop"} → page 2</text>
+        <text x="585" y="166" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--es)">after_key: {"category":"wear"}</text>
+      </g>
+
+      <!-- step4 -->
+      <g data-show="4">
+        <path d="M 314 211 L 412 211" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
+        <text x="585" y="205" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ after_key가 없어질 때까지 반복</text>
+        <text x="585" y="228" text-anchor="middle" class="sv-label-sm">모든 버킷을 누락·중복 없이 순회 — ETL·전체 덤프에 적합</text>
+      </g>
+
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--es)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>고유값이 수십만 개인 필드를 <code>terms</code>로 집계하면 <b style="color:var(--danger)">모든 버킷을 한 번에 메모리에 올려야</b> 합니다. OOM의 지름길이죠.</p>
+    <p><code>composite</code>는 키 순으로 정렬된 버킷을 <b>1000개씩 페이지로</b> 반환합니다. 응답 끝의 <code>after_key</code>가 "여기까지 읽었다"는 책갈피입니다.</p>
+    <p>다음 요청에 <code>"after": {이전 after_key}</code>를 넣으면 이어서 다음 페이지를 받습니다. 7장의 search_after와 같은 커서 패턴입니다.</p>
+    <p><code>after_key</code>가 더 이상 없을 때까지 반복하면 <b style="color:var(--ok)">모든 버킷을 결정적으로(누락·중복 없이) 순회</b>합니다. 정확한 전체 집계·ETL·덤프 용도의 정석입니다.</p>
+  </div>
+</div>
+
+<p>제약도 있습니다: composite 안에서는 자식 metric 기준 <code>order</code>를 쓸 수 없고(키 순서 고정), 한 요청에 composite 하나만 넣을 수 있습니다.</p>
+
+<h2 id="s6">8.6 Pipeline — 시계열 분석의 마무리</h2>
+
+<p>pipeline 집계는 <strong>다른 집계의 결과</strong>를 입력으로 받습니다. 시계열 대시보드의 "전일 대비 증감", "7일 이동평균"이 전부 이것입니다. 실전 예제로 마무리합니다.</p>
+
+<pre><code><span class="k">GET</span> /sales/_search
+{
+  <span class="s">"size"</span>: <span class="n">0</span>,
+  <span class="s">"track_total_hits"</span>: <span class="n">false</span>,
+  <span class="s">"query"</span>: {
+    <span class="s">"bool"</span>: {
+      <span class="s">"filter"</span>: [                              <span class="c">// 7장: 점수 불필요 → filter (캐시)</span>
+        { <span class="s">"term"</span>:  { <span class="s">"status"</span>: <span class="s">"completed"</span> } },
+        { <span class="s">"range"</span>: { <span class="s">"ordered_at"</span>: { <span class="s">"gte"</span>: <span class="s">"now-90d/d"</span> } } }
+      ]
+    }
+  },
+  <span class="s">"aggs"</span>: {
+    <span class="s">"daily_sales"</span>: {
+      <span class="s">"date_histogram"</span>: {
+        <span class="s">"field"</span>: <span class="s">"ordered_at"</span>,
+        <span class="s">"calendar_interval"</span>: <span class="s">"1d"</span>,
+        <span class="s">"time_zone"</span>: <span class="s">"Asia/Seoul"</span>,
+        <span class="s">"min_doc_count"</span>: <span class="n">0</span>
+      },
+      <span class="s">"aggs"</span>: {
+        <span class="s">"revenue"</span>: { <span class="s">"sum"</span>: { <span class="s">"field"</span>: <span class="s">"price"</span> } },
+        <span class="s">"7d_moving_avg"</span>: {
+          <span class="s">"moving_fn"</span>: {                       <span class="c">// moving_avg는 deprecated</span>
+            <span class="s">"buckets_path"</span>: <span class="s">"revenue"</span>,
+            <span class="s">"window"</span>: <span class="n">7</span>,
+            <span class="s">"script"</span>: <span class="s">"MovingFunctions.unweightedAvg(values)"</span>
+          }
+        },
+        <span class="s">"revenue_diff"</span>: {
+          <span class="s">"derivative"</span>: { <span class="s">"buckets_path"</span>: <span class="s">"revenue"</span> }   <span class="c">// 전일 대비 증감</span>
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">집계 전용 쿼리의 표준 헤더</div>
+    <p><code>"size": 0</code>(hits 생략) + <code>"track_total_hits": false</code>(정확한 총 개수 계산 생략). 응답이 빨라지고 작아집니다. 집계만 필요한 쿼리라면 거의 항상 이 둘을 붙이세요.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">운영 주의 3가지</div>
+    <p>① <code>terms { "field": "user_id" }</code>처럼 수백만 고유값 필드에 terms 직접 사용 금지 — composite로. ② runtime field 집계는 매칭 문서마다 스크립트 실행 — 자주 쓰면 정식 필드로 승격. ③ 느린 집계는 <code>"profile": true</code>로 단계별 시간부터 확인.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">terms 집계의 doc_count가 실제보다 작게 나올 수 있는 근본 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">HyperLogLog 알고리즘의 해시 충돌 때문</button>
+    <button type="button" data-correct>각 샤드가 상위 shard_size개만 전송하므로, 특정 샤드에서 순위가 밀린 term의 카운트가 합산에서 누락되기 때문</button>
+    <button type="button">refresh가 아직 안 된 문서는 집계에서 제외되기 때문</button>
+    <button type="button">coordinating node가 메모리 절약을 위해 카운트를 반올림하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 분산 환경에서 각 샤드는 로컬 상위 shard_size개 버킷만 보냅니다. 어떤 term이 샤드 A에서는 잘리고(11위) 샤드 B에서는 포함(5위)되면, A의 카운트가 누락된 채 합산됩니다. shard_size를 키우거나 composite로 전체 순회하면 완화됩니다. (참고: HLL은 cardinality 집계 이야기입니다.)</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">user_id처럼 고유값이 수십만 개인 필드의 <strong>모든</strong> 버킷별 합계를 정확히 뽑아야 한다. 올바른 접근은?</div>
+  <div class="quiz-opts">
+    <button type="button"><code>terms</code>의 size를 1000000으로 키운다</button>
+    <button type="button"><code>cardinality</code>의 precision_threshold를 40000으로 올린다</button>
+    <button type="button" data-correct><code>composite</code> 집계로 after_key를 따라가며 페이지 단위로 전체 버킷을 순회한다</button>
+  </div>
+  <div class="quiz-expl">✅ terms의 size를 키우면 모든 샤드가 거대한 부분 결과를 전송해 coordinating node 메모리가 폭발합니다. composite는 정렬된 버킷을 페이지 단위로 결정적으로 순회하므로 메모리가 일정하고 결과도 정확합니다. cardinality는 "고유값 개수"만 셀 뿐 버킷별 합계와는 무관합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch08_aggregations.md" target="_blank" rel="noopener">chapters/ch08_aggregations.md</a> — percentiles의 TDigest/HDR, bucket_script로 증감률 계산, Top-N 상품 리포트 실전 쿼리가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch07.html"><span class="dir">← 이전</span><br><span class="title">7장. Query DSL</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch09.html"><span class="dir">다음 →</span><br><span class="title">9장. 인덱싱 전략</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11장. 모니터링과 트러블슈팅 — Elasticsearch 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="es/ch11">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a class="on-es" href="index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔍 Elasticsearch 가이드</div>
+  <a class="chap" href="index.html" data-page="es/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="es/ch01"><span class="num">01</span> Elasticsearch 개요</a>
+  <a class="chap" href="ch02.html" data-page="es/ch02"><span class="num">02</span> 클러스터 아키텍처</a>
+  <a class="chap" href="ch03.html" data-page="es/ch03"><span class="num">03</span> Lucene 내부 구조</a>
+  <a class="chap" href="ch04.html" data-page="es/ch04"><span class="num">04</span> 인덱스와 샤드</a>
+  <div class="group-title">검색의 핵심</div>
+  <a class="chap" href="ch05.html" data-page="es/ch05"><span class="num">05</span> 매핑과 필드 타입</a>
+  <a class="chap" href="ch06.html" data-page="es/ch06"><span class="num">06</span> Text Analysis — Analyzer</a>
+  <a class="chap" href="ch07.html" data-page="es/ch07"><span class="num">07</span> Query DSL</a>
+  <a class="chap" href="ch08.html" data-page="es/ch08"><span class="num">08</span> Aggregations — 집계</a>
+  <div class="group-title">운영</div>
+  <a class="chap" href="ch09.html" data-page="es/ch09"><span class="num">09</span> 인덱싱 전략</a>
+  <a class="chap" href="ch10.html" data-page="es/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="es/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>11장. 모니터링과 트러블슈팅 — 살아있는 클러스터 다루기</h1>
+<p class="lead">운영 중인 클러스터는 살아있는 시스템입니다. 한 노드의 heap 압박이 다른 노드의 증상으로 전파되죠. green이 yellow가 되는 순간 무슨 일이 벌어지는지, 어떤 명령을 어떤 순서로 쳐야 하는지를 시나리오로 익힙니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2장 아키텍처 · 4장 샤드</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① green / yellow / red의 정확한 의미와 노드 장애 → 복구의 전 과정 ② _cat · _nodes/stats · hot_threads — 진단 도구 3종 세트 ③ thread pool 429와 디스크 watermark의 동작 ④ 증상별("검색이 느려요", "색인이 안 돼요") 진단 플로우</p>
+  </div>
+</div>
+
+<h2 id="s1">11.1 Cluster health — green, yellow, red의 진짜 의미</h2>
+
+<pre><code><span class="k">GET</span> /_cluster/health
+{
+  <span class="s">"status"</span>: <span class="s">"yellow"</span>,
+  <span class="s">"number_of_nodes"</span>: <span class="n">6</span>,
+  <span class="s">"active_primary_shards"</span>: <span class="n">120</span>,
+  <span class="s">"unassigned_shards"</span>: <span class="n">5</span>,      <span class="c">← 미할당 shard 수</span>
+  <span class="s">"number_of_pending_tasks"</span>: <span class="n">0</span>
+}</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>상태</th><th>의미</th><th>즉시 행동</th></tr></thead>
+  <tbody>
+    <tr><td><strong style="color:var(--ok)">green</strong></td><td>모든 primary + replica 할당 완료</td><td>없음</td></tr>
+    <tr><td><strong style="color:var(--warn)">yellow</strong></td><td>모든 primary 할당, 일부 replica 미할당</td><td>5분 내 자동복구 안 되면 진단</td></tr>
+    <tr><td><strong style="color:var(--danger)">red</strong></td><td><strong>일부 primary 미할당</strong></td><td>즉시 대응 — 해당 데이터 색인·검색 불가</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>노드 하나가 죽었을 때 클러스터가 어떻게 반응하는지, 상태 전이 전체를 따라가 봅시다.</p>
+
+<div class="anim" data-steps="6" data-title="노드 장애 시나리오 — green → yellow → (복구) → green, 그리고 red의 조건" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 380">
+      <!-- 상태 배지 -->
+      <g data-show="1-1">
+        <rect x="320" y="14" width="160" height="34" rx="17" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="37" text-anchor="middle" class="sv-label" fill="var(--ok)">status: green</text>
+      </g>
+      <g data-show="2-4">
+        <rect x="320" y="14" width="160" height="34" rx="17" fill="color-mix(in srgb, var(--warn) 15%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="400" y="37" text-anchor="middle" class="sv-label" fill="var(--warn)">status: yellow</text>
+      </g>
+      <g data-show="5-5">
+        <rect x="320" y="14" width="160" height="34" rx="17" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="37" text-anchor="middle" class="sv-label" fill="var(--ok)">status: green ✓</text>
+      </g>
+      <g data-show="6-6">
+        <rect x="320" y="14" width="160" height="34" rx="17" fill="color-mix(in srgb, var(--danger) 15%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="400" y="37" text-anchor="middle" class="sv-label" fill="var(--danger)">status: red</text>
+      </g>
+
+      <!-- 노드 1 -->
+      <rect x="30" y="80" width="220" height="150" rx="10" class="sv-box"/>
+      <text x="140" y="104" text-anchor="middle" class="sv-label">node-1</text>
+      <rect x="50" y="120" width="80" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="90" y="143" text-anchor="middle" class="sv-label-sm sv-mono">P1</text>
+      <!-- R3: step1-2 replica, step3부터 P3 승격 -->
+      <g data-show="1-2">
+        <rect x="150" y="120" width="80" height="36" rx="7" fill="none" stroke="var(--accent)" stroke-dasharray="5 4"/>
+        <text x="190" y="143" text-anchor="middle" class="sv-label-sm sv-mono">R3</text>
+      </g>
+      <g data-show="3-5">
+        <rect x="150" y="120" width="80" height="36" rx="7" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="190" y="143" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">P3 ⬆</text>
+      </g>
+
+      <!-- 노드 2 -->
+      <rect x="290" y="80" width="220" height="150" rx="10" class="sv-box"/>
+      <text x="400" y="104" text-anchor="middle" class="sv-label">node-2</text>
+      <rect x="310" y="120" width="80" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="350" y="143" text-anchor="middle" class="sv-label-sm sv-mono">P2</text>
+      <rect x="410" y="120" width="80" height="36" rx="7" fill="none" stroke="var(--accent)" stroke-dasharray="5 4"/>
+      <text x="450" y="143" text-anchor="middle" class="sv-label-sm sv-mono">R2'</text>
+      <!-- step4: 새 replica 생성 중 -->
+      <g data-show="4-4">
+        <rect x="310" y="170" width="180" height="36" rx="7" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" class="pulse"/>
+        <text x="400" y="193" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--warn)">R3' INITIALIZING…</text>
+      </g>
+      <g data-show="5-5">
+        <rect x="310" y="170" width="180" height="36" rx="7" fill="none" stroke="var(--ok)" stroke-dasharray="5 4"/>
+        <text x="400" y="193" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">R3' STARTED ✓</text>
+      </g>
+
+      <!-- 노드 3 -->
+      <g data-active="2-6">
+        <rect x="550" y="80" width="220" height="150" rx="10" class="sv-box"/>
+        <text x="660" y="104" text-anchor="middle" class="sv-label">node-3</text>
+        <g data-show="1-1">
+          <rect x="570" y="120" width="80" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+          <text x="610" y="143" text-anchor="middle" class="sv-label-sm sv-mono">P3</text>
+          <rect x="670" y="120" width="80" height="36" rx="7" fill="none" stroke="var(--accent)" stroke-dasharray="5 4"/>
+          <text x="710" y="143" text-anchor="middle" class="sv-label-sm sv-mono">R1</text>
+        </g>
+      </g>
+      <g data-show="2">
+        <line x1="560" y1="90" x2="760" y2="220" stroke="var(--danger)" stroke-width="3"/>
+        <line x1="760" y1="90" x2="560" y2="220" stroke="var(--danger)" stroke-width="3"/>
+        <text x="660" y="252" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13">💥 노드 다운 — P3, R1 소실</text>
+      </g>
+
+      <!-- 하단 설명줄 -->
+      <g data-show="3-3">
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">node-1의 replica R3가 primary로 승격 → 모든 primary 생존 = yellow (red 아님!)</text>
+      </g>
+      <g data-show="4-4">
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13" fill="var(--warn)">delayed_timeout(기본 1m) 경과 → 남은 노드에 새 replica 복제 시작</text>
+      </g>
+      <g data-show="5-5">
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ 복제 완료 — 사람의 개입 없이 green 복귀</text>
+      </g>
+      <g data-show="6-6">
+        <rect x="150" y="120" width="80" height="36" rx="7" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="190" y="143" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">R3 없음</text>
+        <text x="400" y="300" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">만약 replica가 0이었다면? P3의 대체가 없어 red — 그 shard의 데이터만 색인·검색 불가</text>
+        <text x="400" y="326" text-anchor="middle" class="sv-label-sm">red ≠ 클러스터 전체 다운. 다른 인덱스는 정상 동작</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>평화로운 <b style="color:var(--ok)">green</b> 상태. primary(P1~P3)와 replica(점선)가 세 노드에 분산 배치되어 있습니다.</p>
+    <p><b style="color:var(--danger)">node-3 다운!</b> 거기 있던 primary P3와 replica R1이 사라졌습니다. 클러스터가 어떻게 반응할까요?</p>
+    <p>node-1에 있던 <b>replica R3가 즉시 primary로 승격</b>됩니다. 모든 primary가 살아 있으므로 상태는 <b style="color:var(--warn)">yellow</b> — red가 아닙니다. 서비스는 계속됩니다.</p>
+    <p><code>index.unassigned.node_left.delayed_timeout</code>(기본 1분)을 기다려도 노드가 안 돌아오면, 남은 노드에 <b>새 replica 복제(INITIALIZING)</b>를 시작합니다. 데이터 크기에 따라 분~시간 단위.</p>
+    <p>복제가 끝나면 <b style="color:var(--ok)">green 복귀</b>. 여기까지 사람이 한 일은 없습니다 — 잘 설계된 클러스터는 스스로 치유합니다.</p>
+    <p>반전 시나리오: replica를 0으로 운영했다면 P3를 대체할 사본이 없어 <b style="color:var(--danger)">red</b> — 해당 shard의 데이터만 색인·검색 불가입니다. red는 "클러스터 다운"이 아니라 "일부 primary 미할당"이라는 정확한 의미로 읽어야 대응이 빨라집니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">11.2 진단 도구 3종 세트 — _cat, _nodes/stats, hot_threads</h2>
+
+<p><code>_cat</code> API는 사람이 읽기 좋은 표를 반환합니다. 운영자가 가장 자주 치는 명령부터.</p>
+
+<pre><code><span class="c"># 노드별 핵심 지표 한 줄씩</span>
+<span class="k">GET</span> /_cat/nodes?v&amp;h=name,node.role,heap.percent,cpu,load_1m,disk.used_percent
+
+name     node.role  heap.percent  cpu  load_1m  disk.used_percent
+es-01    cdfhirstw  <span class="n">68</span>            <span class="n">45</span>   <span class="n">2.10</span>     <span class="n">67.3</span>
+es-03    cdfhirstw  <span class="n">85</span>            <span class="n">62</span>   <span class="n">3.01</span>     <span class="n">71.8</span>   <span class="c">← heap 임계!</span>
+
+<span class="c"># shard 상태 (STARTED / RELOCATING / INITIALIZING / UNASSIGNED)</span>
+<span class="k">GET</span> /_cat/shards?v&amp;h=index,shard,prirep,state,docs,store,node</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>도구</th><th>언제</th><th>보는 것</th></tr></thead>
+  <tbody>
+    <tr><td><code>_cat/nodes · indices · shards · allocation</code></td><td>빠른 훑어보기</td><td>heap/CPU/disk, 인덱스 크기, shard 상태·분포</td></tr>
+    <tr><td><code>_nodes/stats</code></td><td>깊은 메트릭</td><td>JVM heap·GC, indexing_pressure, thread_pool, breaker</td></tr>
+    <tr><td><code>_nodes/hot_threads</code></td><td>"CPU 90%" 알람 직후</td><td>바쁜 thread의 stack — merge 폭주? 비싼 쿼리? GC?</td></tr>
+    <tr><td><code>_cluster/pending_tasks</code></td><td>클러스터가 굼뜰 때</td><td>master의 state 변경 큐 (평소엔 비어 있어야 정상)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">hot_threads로 읽는 흔한 패턴</div>
+    <p><code>Lucene Merge Thread</code>가 상위 → 작은 segment 폭증 또는 활성 인덱스 force_merge 의심. <code>[search]</code> thread가 aggregation에 머무름 → 비싼 쿼리. <code>[write]</code> thread가 mapping update에 머무름 → dynamic mapping 폭주(10장). GC thread → heap 압박.</p>
+  </div>
+</div>
+
+<h2 id="s3">11.3 색인이 거부될 때 — thread pool과 429</h2>
+
+<p>"클라이언트에서 429 에러가 폭주해요"는 ES가 고장 난 것이 아니라 <strong>스스로를 보호하는 중</strong>이라는 신호입니다. 각 노드의 write thread pool에는 큐가 있고, 큐가 가득 차면 요청을 거부합니다.</p>
+
+<div class="anim" data-steps="4" data-title="write thread pool — 큐가 차오르고 429가 터지기까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <!-- 클라이언트 -->
+      <rect x="20" y="60" width="140" height="60" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="90" y="86" text-anchor="middle" class="sv-label" font-size="12.5">클라이언트</text>
+      <text x="90" y="105" text-anchor="middle" class="sv-label-sm">bulk 요청 유입</text>
+
+      <!-- 큐 -->
+      <rect x="240" y="50" width="300" height="80" rx="10" class="sv-box"/>
+      <text x="390" y="42" text-anchor="middle" class="sv-label-sm">write queue</text>
+      <!-- 큐 채움 게이지 -->
+      <rect x="256" y="72" width="268" height="36" rx="8" fill="none" stroke="var(--border)"/>
+      <g data-show="1-1"><rect x="256" y="72" width="54" height="36" rx="8" fill="var(--ok)"/></g>
+      <g data-show="2-2"><rect x="256" y="72" width="188" height="36" rx="8" fill="var(--warn)"/></g>
+      <g data-show="3-3"><rect x="256" y="72" width="268" height="36" rx="8" fill="var(--danger)" class="blink"/></g>
+      <g data-show="4"><rect x="256" y="72" width="94" height="36" rx="8" fill="var(--ok)"/></g>
+
+      <!-- 워커 -->
+      <rect x="620" y="50" width="160" height="80" rx="10" class="sv-box"/>
+      <text x="700" y="80" text-anchor="middle" class="sv-label" font-size="12.5">write threads</text>
+      <text x="700" y="102" text-anchor="middle" class="sv-label-sm sv-mono">active 8/8</text>
+
+      <path d="M 160 90 L 232 90" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+      <path d="M 540 90 L 612 90" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+
+      <!-- 단계별 텍스트 -->
+      <g data-show="1-1">
+        <text x="400" y="180" text-anchor="middle" class="sv-label" font-size="13">유입 ≈ 처리 — queue 여유, rejected 0</text>
+      </g>
+      <g data-show="2-2">
+        <text x="400" y="180" text-anchor="middle" class="sv-label" font-size="13" fill="var(--warn)">유입 &gt; 처리 — queue가 차오른다 (heap·CPU·merge 병목 확인 신호)</text>
+      </g>
+      <g data-show="3-3">
+        <path d="M 240 110 C 200 150 150 150 110 130" stroke="var(--danger)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="400" y="180" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">queue 가득! → 429 es_rejected_execution_exception 반환</text>
+        <text x="400" y="204" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">_cat/thread_pool/write?v → rejected: 1234</text>
+      </g>
+      <g data-show="4">
+        <text x="400" y="180" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ 클라이언트가 exponential backoff로 재시도 + 유입 속도 조절 → queue 해소</text>
+        <text x="400" y="204" text-anchor="middle" class="sv-label-sm">근본 원인은 따로 진단: bulk 크기, refresh_interval, merge 폭주, 노드 부족</text>
+      </g>
+
+      <!-- 하단 -->
+      <text x="400" y="256" text-anchor="middle" class="sv-label-sm">429는 장애가 아니라 backpressure — "천천히 보내라"는 신호</text>
+
+      <defs>
+        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>정상 상태: bulk 요청이 write queue를 거쳐 워커 thread(코어 수만큼)로 흘러갑니다. 유입과 처리가 균형이면 queue는 거의 비어 있습니다.</p>
+    <p>색인 폭주 또는 처리 둔화(merge 폭주, heap 압박)로 <b style="color:var(--warn)">유입이 처리를 앞지르면 queue가 차오릅니다</b>. <code>_cat/thread_pool/write?v</code>의 queue 칼럼이 경고등입니다.</p>
+    <p>queue가 가득 차면 ES는 요청을 <b style="color:var(--danger)">429(es_rejected_execution_exception)로 거부</b>합니다. OOM으로 쓰러지는 대신 밀어내는 자기 보호 — bulk 응답 안의 항목별 429를 놓치면 데이터 유실입니다(9장).</p>
+    <p>올바른 대응: 클라이언트 <b style="color:var(--ok)">exponential backoff 재시도 + 유입 조절</b>. 그리고 근본 원인(bulk 크기, refresh_interval, merge, 노드 수)을 <code>indexing_pressure</code>·hot_threads로 진단합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">11.4 JVM heap과 circuit breaker</h2>
+
+<p>heap 진단의 위험 신호: <code>heap_used_percent &gt; 75%</code> 지속, old GC가 분당 수 회 이상, <code>breaker</code>의 <code>tripped</code> 카운터 증가. circuit breaker는 <strong>OOM 직전에 ES가 요청을 스스로 거부</strong>한 흔적입니다.</p>
+
+<pre><code><span class="k">GET</span> /_nodes/stats/breaker
+<span class="s">"breakers"</span>: {
+  <span class="s">"fielddata"</span>: { <span class="s">"tripped"</span>: <span class="n">12</span> },   <span class="c">← text 필드 fielddata 사용 의심 (10장)</span>
+  <span class="s">"parent"</span>:    { <span class="s">"tripped"</span>: <span class="n">3</span> }
+}</code></pre>
+
+<p>heap을 늘리기 전에 순서대로 점검하세요: ① 진짜 메모리 부족인가(cardinality 폭증, fielddata, 비싼 쿼리) ② cluster state가 큰가(shard 폭증 — 10장) ③ 쿼리가 비싼가(deep agg, deep paging). 해결 후에도 부족할 때만 RAM 추가 — 단, <strong>heap 31GB는 절대 넘기지 않습니다</strong>(compressed oops, 10장).</p>
+
+<h2 id="s5">11.5 디스크 watermark — 85 / 90 / 95%의 3단 방어선</h2>
+
+<p>디스크가 차오르면 ES는 단계적으로 강하게 개입합니다. 마지막 단계는 꽤 충격적입니다: <strong>모든 인덱스가 read-only가 됩니다.</strong></p>
+
+<div class="anim" data-steps="4" data-title="디스크 watermark — low(85%) → high(90%) → flood_stage(95%)" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <!-- 디스크 게이지 -->
+      <text x="60" y="40" class="sv-label" font-size="13">node disk 사용률</text>
+      <rect x="60" y="56" width="90" height="200" rx="10" fill="none" stroke="var(--border)" stroke-width="1.6"/>
+      <!-- 채움: 아래에서 위로 -->
+      <g data-show="1-1"><rect x="64" y="116" width="82" height="136" rx="8" fill="var(--ok)"/></g>
+      <g data-show="2-2"><rect x="64" y="82" width="82" height="170" rx="8" fill="var(--warn)"/></g>
+      <g data-show="3-3"><rect x="64" y="70" width="82" height="182" rx="8" fill="color-mix(in srgb, var(--danger) 70%, var(--warn))"/></g>
+      <g data-show="4-4"><rect x="64" y="60" width="82" height="192" rx="8" fill="var(--danger)" class="blink"/></g>
+      <!-- 눈금 -->
+      <line x1="150" y1="86" x2="166" y2="86" class="sv-line"/>
+      <text x="172" y="90" class="sv-label-sm sv-mono">85%</text>
+      <line x1="150" y1="76" x2="166" y2="76" class="sv-line"/>
+      <text x="172" y="72" class="sv-label-sm sv-mono">90%</text>
+      <line x1="150" y1="66" x2="166" y2="66" class="sv-line"/>
+      <text x="172" y="56" class="sv-label-sm sv-mono">95%</text>
+
+      <!-- 단계 카드 -->
+      <g data-show="1-1">
+        <rect x="260" y="60" width="500" height="70" rx="10" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="510" y="90" text-anchor="middle" class="sv-label" font-size="13">~70% — 정상 운영</text>
+        <text x="510" y="112" text-anchor="middle" class="sv-label-sm">shard 할당·이동 자유롭게</text>
+      </g>
+      <g data-show="2-2">
+        <rect x="260" y="60" width="500" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="510" y="90" text-anchor="middle" class="sv-label" font-size="13">85% low watermark 돌파</text>
+        <text x="510" y="112" text-anchor="middle" class="sv-label-sm">이 노드에 새 shard 할당 중단</text>
+      </g>
+      <g data-show="3-3">
+        <rect x="260" y="60" width="500" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="510" y="90" text-anchor="middle" class="sv-label" font-size="13">90% high watermark 돌파</text>
+        <text x="510" y="112" text-anchor="middle" class="sv-label-sm">기존 shard를 다른 노드로 재배치 시도 (RELOCATING)</text>
+      </g>
+      <g data-show="4-4">
+        <rect x="260" y="60" width="500" height="70" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="510" y="90" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">🚨 95% flood_stage — 모든 인덱스 read-only 전환!</text>
+        <text x="510" y="112" text-anchor="middle" class="sv-label-sm sv-mono">index.blocks.read_only_allow_delete: true</text>
+      </g>
+
+      <!-- 하단 설명 -->
+      <g data-show="4">
+        <text x="430" y="190" text-anchor="middle" class="sv-label-sm">해제는 디스크 확보 후: <tspan class="sv-mono">PUT /my-index/_settings {"index.blocks.read_only_allow_delete": null}</tspan></text>
+        <text x="430" y="216" text-anchor="middle" class="sv-label-sm">영구 해결: 오래된 인덱스 삭제(ILM) · 노드/디스크 추가 · cold/frozen 티어 이전</text>
+        <text x="430" y="242" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">대용량 디스크는 %보다 절대값(예: low 200gb / high 100gb / flood 50gb)이 합리적</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>디스크 사용률 70% — 아직 아무 일도 없습니다. shard 할당과 이동이 자유롭습니다.</p>
+    <p><b style="color:var(--warn)">85%(low)</b> 돌파: 이 노드에는 <b>새 shard를 할당하지 않습니다</b>. 조용한 첫 번째 경고라 놓치기 쉽습니다.</p>
+    <p><b style="color:var(--warn)">90%(high)</b> 돌파: 기존 shard를 <b>다른 노드로 옮기기 시작</b>합니다. <code>_cat/shards</code>에 RELOCATING이 보인다면 이 단계일 수 있습니다.</p>
+    <p><b style="color:var(--danger)">95%(flood_stage)</b>: <b>모든 인덱스가 read-only로 전환</b>됩니다 — 색인이 전면 중단되는 운영 사고. 디스크를 확보한 뒤 read_only 블록을 수동 해제해야 하며, 디스크가 여전히 95% 위라면 다시 발동합니다. 근본 해결은 ILM 삭제 정책·노드 추가·티어 이전입니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">11.6 shard가 UNASSIGNED일 때 — allocation/explain</h2>
+
+<p>미할당 shard의 원인은 추측하지 말고 물어보세요. <strong>왜 할당이 안 되는지 ES가 직접 설명해 줍니다.</strong></p>
+
+<pre><code><span class="k">GET</span> /_cluster/allocation/explain
+{
+  <span class="s">"unassigned_info"</span>: { <span class="s">"reason"</span>: <span class="s">"NODE_LEFT"</span> },
+  <span class="s">"node_allocation_decisions"</span>: [{
+    <span class="s">"node_name"</span>: <span class="s">"es-03"</span>,
+    <span class="s">"deciders"</span>: [{
+      <span class="s">"decider"</span>: <span class="s">"disk_threshold"</span>,
+      <span class="s">"explanation"</span>: <span class="s">"the node is above the high watermark..."</span>   <span class="c">← 원인이 그대로</span>
+    }]
+  }]
+}</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th><code>reason</code></th><th>의미</th><th>처방</th></tr></thead>
+  <tbody>
+    <tr><td><code>INDEX_CREATED</code></td><td>신규 인덱스 할당 대기</td><td>대기, disk/awareness 확인</td></tr>
+    <tr><td><code>NODE_LEFT</code></td><td>노드 이탈</td><td>노드 복귀 대기 또는 재할당 확인</td></tr>
+    <tr><td><code>ALLOCATION_FAILED</code></td><td>5회 재시도 모두 실패</td><td><code>POST /_cluster/reroute?retry_failed=true</code></td></tr>
+    <tr><td><code>CLUSTER_RECOVERED</code></td><td>재시작 후 복구 진행</td><td>자동 복구 대기</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">allocate_empty_primary는 데이터를 지운다</div>
+    <p><code>POST /_cluster/reroute</code>의 <code>allocate_empty_primary</code> 명령은 <strong>빈 primary를 강제 할당</strong>합니다 — 그 shard의 기존 데이터는 사라집니다. 스냅샷 복원조차 불가능할 때의 마지막 수단으로만.</p>
+  </div>
+</div>
+
+<h2 id="s7">11.7 증상별 진단 플로우</h2>
+
+<pre><code><span class="c"># "검색이 갑자기 느려졌다"</span>
+1. _cluster/health          <span class="c">→ red? yellow? unassigned?</span>
+2. _cat/nodes?v             <span class="c">→ 어느 노드가 heap·CPU 높은가</span>
+3. _nodes/hot_threads       <span class="c">→ 지금 무슨 일을 하고 있나</span>
+4. _cat/thread_pool/search?v <span class="c">→ queue·rejected?</span>
+5. slow log                 <span class="c">→ 어떤 쿼리가 느린가 (query vs fetch phase 구분)</span>
+6. _nodes/stats/breaker     <span class="c">→ fielddata tripped?</span>
+
+<span class="c"># "색인이 느리다 / 429 폭주"</span>
+1. _cat/thread_pool/write?v      <span class="c">→ queue·rejected</span>
+2. _nodes/stats/indexing_pressure <span class="c">→ 거부 카운트 (8.x)</span>
+3. _cat/allocation?v             <span class="c">→ 디스크 watermark 임박?</span>
+4. _cluster/pending_tasks        <span class="c">→ master 큐 적체 (mapping 폭증?)</span>
+5. _nodes/hot_threads            <span class="c">→ merge 폭주? mapping update?</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">모니터링 데이터는 별도 클러스터로</div>
+    <p>운영 클러스터의 모니터링 데이터를 자기 자신에 저장하면, 클러스터가 죽는 순간 모니터링도 같이 죽습니다. Metricbeat/Elastic Agent로 <strong>별도 monitoring 클러스터</strong>에 보내는 것이 정석이며, Kibana Stack Monitoring이 이를 시각화해 줍니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">replica 1로 운영 중인 클러스터에서 노드 하나가 다운되어 그 노드의 primary shard가 사라졌다. 직후 클러스터의 동작으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">즉시 red가 되고 해당 인덱스 전체가 서비스 불가가 된다</button>
+    <button type="button" data-correct>다른 노드의 replica가 primary로 승격되어 yellow 상태로 서비스가 계속된다</button>
+    <button type="button">클러스터 전체가 read-only로 전환된다</button>
+    <button type="button">green 상태가 유지된다 — replica가 있었으므로 아무 변화 없음</button>
+  </div>
+  <div class="quiz-expl">✅ replica가 있으면 즉시 primary로 승격되어 모든 primary가 활성 상태를 유지합니다 = yellow(일부 replica 미할당). delayed_timeout 후 새 replica 복제가 끝나면 green으로 복귀합니다. red는 승격할 replica조차 없어 primary가 미할당일 때만 발생하며, 그때도 다른 인덱스는 정상 동작합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">디스크 사용률이 95%(flood_stage watermark)를 넘으면 Elasticsearch는 무엇을 하는가?</div>
+  <div class="quiz-opts">
+    <button type="button">가장 오래된 인덱스부터 자동 삭제해 공간을 확보한다</button>
+    <button type="button">해당 노드를 클러스터에서 제외한다</button>
+    <button type="button" data-correct>인덱스들을 read-only(read_only_allow_delete)로 전환해 색인을 차단한다</button>
+    <button type="button">새 shard 할당만 중단하고 색인은 계속 허용한다</button>
+  </div>
+  <div class="quiz-expl">✅ flood_stage(95%)에서는 index.blocks.read_only_allow_delete가 걸려 색인이 전면 차단됩니다. 데이터를 마음대로 지우지는 않습니다(삭제는 허용). 디스크 확보 후 블록을 수동 해제해야 하며, "새 shard 할당 중단"은 85%(low), "shard 재배치"는 90%(high)의 동작입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/elasticSearch-guide/blob/main/chapters/ch11_monitoring_troubleshooting.md" target="_blank" rel="noopener">chapters/ch11_monitoring_troubleshooting.md</a> — slow log 설정, OOM 진단 플로우, 진단 쿼리 15선이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch10.html"><span class="dir">← 이전</span><br><span class="title">10장. 안티패턴 모음</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="index.html"><span class="dir">다음 →</span><br><span class="title">학습 홈으로</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

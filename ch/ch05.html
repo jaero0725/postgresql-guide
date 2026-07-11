@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5장. Table Partitions — 파티션 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch05">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>5장. Table Partitions — 파티션</h1>
+<p class="lead">파티셔닝은 쿼리를 빠르게 하는 마법이 아닙니다. 데이터 lifecycle을 관리하는 도구입니다 — 오해하면 실측 7.5배 느려지는 이유까지, 숫자로 확인합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 28분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Table Parts</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① PARTITION BY가 INSERT를 바꾸는 방식 (파티션마다 별도 파트) ② "같은 파티션끼리만 머지"라는 절대 규칙 ③ 파티션의 진짜 용도 — TTL·tiered storage·DROP PARTITION ④ 파티션 프루닝이 통하는 조건과 역효과 실측</p>
+  </div>
+</div>
+
+<h2 id="s1">5.1 파티션 = 파트들의 논리적 그룹</h2>
+
+<p>4장의 <strong>파트</strong>가 물리적 저장 단위라면, <strong>파티션</strong>은 파트들을 특정 기준(시간 범위, 카테고리 등)으로 묶는 논리적 상위 개념입니다. 테이블 생성 시 <code>PARTITION BY</code> 절로 정의합니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> uk.uk_price_paid_simple_partitioned
+(
+    date   Date,
+    town   <span class="f">LowCardinality</span>(String),
+    street <span class="f">LowCardinality</span>(String),
+    price  UInt32
+)
+<span class="k">ENGINE</span> = MergeTree
+<span class="k">ORDER BY</span> (town, street)
+<span class="k">PARTITION BY</span> <span class="f">toStartOfMonth</span>(date);   <span class="c">-- 월 단위 파티션</span></code></pre>
+
+<p><code>toStartOfMonth(date)</code> 값이 같은 행들은 같은 파티션에 속합니다. 2020년 1월 데이터는 <code>2020-01-01</code> 파티션, 2월 데이터는 <code>2020-02-01</code> 파티션이 되는 식이죠. 시작하기 전에 이 장의 결론을 공식 문서 한 문장으로 미리 밝힙니다.</p>
+
+<div class="callout warn">
+  <span class="ico">📌</span>
+  <div>
+    <div class="callout-title">이 장의 핵심 메시지</div>
+    <p>"Partitioning is primarily a <strong>data management technique</strong> and <strong>not a query optimization tool</strong>." — ClickHouse 공식 Best Practices</p>
+  </div>
+</div>
+
+<h2 id="s2">5.2 INSERT가 달라진다 — 파티션마다 별도의 파트</h2>
+
+<p>파티셔닝이 없으면 INSERT 하나는 파트 하나를 만듭니다(4장). 파티셔닝이 있으면 ClickHouse는 삽입할 행들을 <strong>먼저 파티션 키 값으로 분류</strong>한 뒤, <strong>파티션마다 별도의 파트</strong>를 만듭니다.</p>
+
+<div class="anim" data-steps="5" data-title="PARTITION BY가 있는 테이블의 INSERT — 행 분류와 파트 생성" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 350">
+      <defs>
+        <marker id="arrP" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- step1: INSERT 4행 -->
+      <g data-show="1">
+        <rect x="290" y="24" width="240" height="88" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="410" y="46" text-anchor="middle" class="sv-label">INSERT 4행 (한 번에)</text>
+        <text x="410" y="66" text-anchor="middle" class="sv-label-sm sv-mono">행1: 2020-01-05 · London</text>
+        <text x="410" y="82" text-anchor="middle" class="sv-label-sm sv-mono">행2: 2020-01-22 · York</text>
+        <text x="410" y="98" text-anchor="middle" class="sv-label-sm sv-mono">행3·행4: 2020-03-xx · Leeds</text>
+      </g>
+
+      <!-- step2: 분류 -->
+      <g data-show="2">
+        <path d="M 410 112 L 410 140" class="sv-arrow flow-line" marker-end="url(#arrP)"/>
+        <rect x="270" y="144" width="280" height="40" rx="9" class="sv-box"/>
+        <text x="410" y="169" text-anchor="middle" class="sv-label-sm">파티션 키 <tspan class="sv-mono">toStartOfMonth(date)</tspan>로 분류</text>
+      </g>
+
+      <!-- step3: 파티션별 파트 생성 -->
+      <g data-show="3">
+        <path d="M 340 184 Q 280 210 240 224" class="sv-arrow flow-line"/>
+        <path d="M 480 184 Q 540 210 580 224" class="sv-arrow flow-line"/>
+        <rect x="80" y="228" width="320" height="92" rx="10" fill="none" stroke="var(--ok)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="240" y="250" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">📁 파티션 2020-01-01</text>
+        <rect x="120" y="262" width="240" height="44" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="240" y="282" text-anchor="middle" class="sv-label-sm sv-mono">202001_1_1_0 (행1, 행2)</text>
+        <text x="240" y="299" text-anchor="middle" class="sv-label-sm">정렬→분리→압축→기록</text>
+        <rect x="420" y="228" width="320" height="92" rx="10" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="580" y="250" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">📁 파티션 2020-03-01</text>
+        <rect x="460" y="262" width="240" height="44" rx="8" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="580" y="282" text-anchor="middle" class="sv-label-sm sv-mono">202003_2_2_0 (행3, 행4)</text>
+        <text x="580" y="299" text-anchor="middle" class="sv-label-sm">정렬→분리→압축→기록</text>
+      </g>
+
+      <!-- step4: MinMax -->
+      <g data-show="4">
+        <text x="240" y="336" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">+ date의 MinMax 인덱스 자동 생성</text>
+        <text x="580" y="336" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">+ date의 MinMax 인덱스 자동 생성</text>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <rect x="120" y="120" width="580" height="18" rx="4" fill="none" stroke="none"/>
+        <text x="410" y="210" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">⚠️ INSERT 1번 → 파트 2개. 파티션 30개가 섞이면? → 파트 30개!</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>한 번의 INSERT에 1월 데이터 2행과 3월 데이터 2행이 섞여 들어왔습니다.</p>
+    <p>ClickHouse는 파트를 만들기 전에, 행들을 <b>파티션 키 값별로 분류</b>합니다. <code>toStartOfMonth(date)</code>가 2020-01-01인 그룹과 2020-03-01인 그룹으로 나뉩니다.</p>
+    <p>그리고 <b>파티션마다 별도의 파트</b>를 생성합니다. 각 파트는 4장에서 배운 4단계(정렬→컬럼 분리→압축→기록)를 독립적으로 거칩니다. 파트 이름의 접두어가 파티션을 나타냅니다.</p>
+    <p>파티셔닝이 켜지면 각 파트에 파티션 키 컬럼의 <b>MinMax 인덱스</b>(최솟값/최댓값)가 자동 생성됩니다. 나중에 배울 파티션 프루닝의 기반입니다.</p>
+    <p>주의할 점 — INSERT 하나가 여러 파티션에 걸치면 <b style="color:var(--danger)">파티션 수만큼 파트가 생성</b>됩니다. 파티셔닝이 파트 수를 늘리는 메커니즘이 바로 이것입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">5.3 절대 규칙 — 머지는 같은 파티션 안에서만</h2>
+
+<p>파티셔닝의 가장 중요한 동작 특성입니다.</p>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">파티션 간 머지는 절대 일어나지 않는다</div>
+    <p>ClickHouse는 <strong>같은 파티션 내의 파트만</strong> 머지합니다. 파티셔닝이 없는 테이블은 모든 파트가 머지 대상이라 소수의 큰 파트로 수렴하지만, 파티셔닝된 테이블은 파티션별로만 머지되므로 <strong>파티션 수 × 파티션당 파트 수</strong>만큼의 파트가 유지됩니다. 공식 권장: 파티션 키 카디널리티는 <strong>1,000~10,000 이하</strong>.</p>
+  </div>
+</div>
+
+<p>여기서 고카디널리티 파티션 키의 재앙이 시작됩니다. 실제로 어떻게 무너지는지 애니메이션으로 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="잘못된 파티셔닝 — 파트 폭증과 'Too many parts'까지" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 340">
+      <!-- step1: 날짜 파티셔닝 -->
+      <g data-show="1">
+        <rect x="180" y="20" width="460" height="46" rx="9" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="410" y="40" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">PARTITION BY toDate(event_time)  -- 날짜 단위 ❌</text>
+        <text x="410" y="58" text-anchor="middle" class="sv-label-sm">3년치 데이터 = 파티션 1,095개</text>
+      </g>
+
+      <!-- 파티션 3개 표시 -->
+      <g data-show="2">
+        <rect x="60" y="90" width="220" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="170" y="112" text-anchor="middle" class="sv-label-sm">📁 2024-01-01</text>
+        <rect x="300" y="90" width="220" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="410" y="112" text-anchor="middle" class="sv-label-sm">📁 2024-01-02</text>
+        <rect x="540" y="90" width="220" height="130" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="650" y="112" text-anchor="middle" class="sv-label-sm">📁 2024-01-03 … ×1,095</text>
+        <!-- 소량 파트들 -->
+        <rect x="80" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="144" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="208" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="320" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="384" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="448" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="560" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="624" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <rect x="688" y="126" width="56" height="24" rx="5" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="410" y="245" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">INSERT 1번에 날짜 30개가 섞이면 → 파트 30개 동시 생성</text>
+      </g>
+
+      <!-- step3: 머지 벽 -->
+      <g data-show="3">
+        <path d="M 108 162 Q 170 185 232 162" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="170" y="200" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">파티션 안에서만 머지 ⭕</text>
+        <path d="M 268 138 L 316 138" stroke="var(--danger)" stroke-width="2.4" stroke-dasharray="5 4" fill="none"/>
+        <text x="292" y="128" text-anchor="middle" class="sv-label" font-size="14" fill="var(--danger)">✕</text>
+        <path d="M 508 138 L 556 138" stroke="var(--danger)" stroke-width="2.4" stroke-dasharray="5 4" fill="none"/>
+        <text x="532" y="128" text-anchor="middle" class="sv-label" font-size="14" fill="var(--danger)">✕</text>
+        <text x="410" y="200" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">파티션 간 머지 ❌ 절대 불가</text>
+      </g>
+
+      <!-- step4: 폭증 계산 -->
+      <g data-show="4">
+        <rect x="140" y="256" width="540" height="36" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+        <text x="410" y="279" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">1,095개 파티션 × 파티션당 수십 파트 = 전체 파트 수만 개 📈</text>
+      </g>
+
+      <!-- step5: too many parts -->
+      <g data-show="5">
+        <rect x="140" y="300" width="540" height="34" rx="9" fill="color-mix(in srgb, var(--danger) 18%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="410" y="322" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">DB::Exception: Too many parts (3000+) — INSERT 거부!</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>날짜 컬럼을 그대로 파티션 키로 쓰면(<code>toDate</code>, 일 단위) 3년치 데이터에 <b style="color:var(--danger)">파티션 1,095개</b>가 생깁니다. 권장 상한(1,000~10,000)의 경계를 이미 위협하죠.</p>
+    <p>여기에 소량 빈번 INSERT가 겹치면 최악입니다. INSERT마다 걸치는 날짜 수만큼 파트가 생성되어, <b>각 파티션에 작은 파트들이 흩뿌려집니다</b>.</p>
+    <p>머지는 <b style="color:var(--purple)">같은 파티션 안에서만</b> 가능합니다. 옆 파티션의 파트와는 <b style="color:var(--danger)">절대 합쳐지지 않으므로</b>, 파트 정리가 파티션 단위로 갇힙니다.</p>
+    <p>결과: 1,095개 파티션 × 수십 개 파트 = <b>전체 파트 수만 개</b>. 머지가 도저히 따라잡을 수 없는 규모입니다.</p>
+    <p>활성 파트가 <code>parts_to_throw_insert</code>(기본 3000)를 넘는 순간 <b style="color:var(--danger)">INSERT가 거부</b>되고 데이터 유입이 멈춥니다. 해법은 <code>toStartOfMonth</code> 같은 저카디널리티 키 — 3년치가 파티션 36개로 끝납니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">5.4 파티션의 진짜 용도 — 데이터 lifecycle 관리</h2>
+
+<p>그럼 파티셔닝은 언제 쓰는 걸까요? <strong>데이터를 덩어리째 관리해야 할 때</strong>입니다. 파티션 단위 작업은 행 단위 DELETE(mutation)와 달리 파트를 다시 쓰지 않는 <strong>메타데이터 수준 연산</strong>이라 수억 행도 즉시 처리됩니다.</p>
+
+<pre><code><span class="c">-- ① TTL: 12개월 지난 데이터 자동 삭제 (만료 파티션을 통째로 제거)</span>
+<span class="k">CREATE TABLE</span> uk.uk_price_paid_simple_partitioned ( ... )
+<span class="k">ENGINE</span> = MergeTree
+<span class="k">PARTITION BY</span> <span class="f">toStartOfMonth</span>(date)
+<span class="k">ORDER BY</span> (town, street)
+<span class="k">TTL</span> date + <span class="k">INTERVAL</span> <span class="n">12</span> <span class="k">MONTH</span> <span class="k">DELETE</span>;
+
+<span class="c">-- ② Tiered storage: 오래된 데이터를 저렴한 볼륨으로 이동 (hot/cold 분리)</span>
+<span class="k">TTL</span> date + <span class="k">INTERVAL</span> <span class="n">12</span> <span class="k">MONTH</span> <span class="k">TO VOLUME</span> <span class="s">'slow_but_cheap'</span>;
+
+<span class="c">-- ③ 수동 파티션 관리 — 전부 메타데이터 수준이라 즉시 완료</span>
+<span class="k">ALTER TABLE</span> mytable <span class="k">DROP PARTITION</span> <span class="s">'2023-01-01'</span>;              <span class="c">-- 삭제</span>
+<span class="k">ALTER TABLE</span> mytable <span class="k">DETACH PARTITION</span> <span class="s">'2023-01-01'</span>;            <span class="c">-- 분리</span>
+<span class="k">ALTER TABLE</span> mytable <span class="k">ATTACH PARTITION</span> <span class="s">'2023-01-01'</span>;            <span class="c">-- 재연결</span>
+<span class="k">ALTER TABLE</span> source <span class="k">MOVE PARTITION</span> <span class="s">'2023-01-01'</span> <span class="k">TO TABLE</span> archive;</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">파티션 키 선택의 3원칙</div>
+    <p>① <strong>목적 먼저</strong> — "어떤 데이터 관리 작업을 할 것인가"에서 출발 (쿼리 최적화가 목적이면 프라이머리 키·projection을 먼저 고려) ② <strong>저카디널리티</strong> — <code>toStartOfMonth</code>, <code>toMonday</code> 등으로 1,000~10,000 이하 유지 ③ <strong>쿼리 패턴과 정합</strong> — 대부분의 쿼리가 특정 파티션만 본다면 도움, 전체 스캔이 잦다면 해악.</p>
+  </div>
+</div>
+
+<h2 id="s5">5.5 파티션 프루닝 — 도움이 되는 유일한 시나리오</h2>
+
+<p>파티셔닝이 쿼리 성능을 <em>도울 수</em> 있는 경우는 조건이 모두 맞아떨어질 때뿐입니다: ① 쿼리가 <strong>소수의 파티션만</strong> 대상 (이상적으로 1개) ② 파티션 키가 <strong>프라이머리 키에 포함되지 않음</strong> ③ WHERE 절에서 <strong>파티션 키 컬럼으로 필터</strong>. 이때 ClickHouse는 3단계로 스캔 범위를 좁힙니다.</p>
+
+<div class="anim" data-steps="5" data-title="파티션 프루닝 3단계 — 436개 파트에서 granule 1개까지" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 330">
+      <text x="410" y="26" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE date BETWEEN '2020-12-01' AND '2020-12-31' AND town='LONDON'</text>
+
+      <!-- step1: 전체 파트 -->
+      <g data-show="1" data-active="1-1">
+        <rect x="60" y="48" width="700" height="56" rx="9" class="sv-box"/>
+        <text x="410" y="72" text-anchor="middle" class="sv-label">전체: 파트 436개 · granule 3,257개</text>
+        <text x="410" y="92" text-anchor="middle" class="sv-label-sm">월 단위 파티션 436개월치 데이터</text>
+      </g>
+
+      <!-- step2: MinMax -->
+      <g data-show="2">
+        <path d="M 410 104 L 410 126" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="150" y="130" width="520" height="48" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="410" y="150" text-anchor="middle" class="sv-label">① MinMax 인덱스: date 범위 밖 파트 제거</text>
+        <text x="410" y="168" text-anchor="middle" class="sv-label-sm sv-mono">Parts: 1/436 · Granules: 11/3257</text>
+      </g>
+
+      <!-- step3: Partition -->
+      <g data-show="3">
+        <path d="M 410 178 L 410 198" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="210" y="202" width="400" height="44" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="410" y="220" text-anchor="middle" class="sv-label">② 파티션 키 조건 확인</text>
+        <text x="410" y="238" text-anchor="middle" class="sv-label-sm sv-mono">Parts: 1/1 · Granules: 11/11</text>
+      </g>
+
+      <!-- step4: PrimaryKey -->
+      <g data-show="4">
+        <path d="M 410 246 L 410 264" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="270" y="268" width="280" height="44" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8" class="pulse"/>
+        <text x="410" y="286" text-anchor="middle" class="sv-label">③ Primary index: town='LONDON'</text>
+        <text x="410" y="304" text-anchor="middle" class="sv-label-sm sv-mono">Parts: 1/1 · Granules: 1/11</text>
+      </g>
+
+      <!-- step5: 결과 -->
+      <g data-show="5">
+        <rect x="620" y="255" width="170" height="60" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="705" y="280" text-anchor="middle" class="sv-label" fill="var(--ok)">최종 스캔:</text>
+        <text x="705" y="300" text-anchor="middle" class="sv-label sv-mono" font-size="13">8,192행 · 6ms ⚡</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>월 단위로 파티셔닝된 테이블에 파트 436개, granule 3,257개가 있습니다. 쿼리는 2020년 12월의 LONDON 데이터만 필요합니다.</p>
+    <p><b>① MinMax 프루닝</b>: 각 파트에 저장된 date의 최솟값/최댓값을 검사해 12월 범위 밖의 파트를 전부 제외합니다. 436개 파트 중 <b style="color:var(--accent)">1개만 생존</b>.</p>
+    <p><b>② 파티션 프루닝</b>: <code>toStartOfMonth(date)</code> 파티션 키 조건으로 남은 파트를 재확인합니다.</p>
+    <p><b>③ 프라이머리 키 프루닝</b>: 살아남은 파트 안에서 town의 희소 인덱스로 granule을 좁힙니다. 11개 중 <b style="color:var(--ok)">1개만 읽음</b>.</p>
+    <p>최종적으로 granule 1개 = 8,192행만 스캔해 <b>6ms</b>에 끝납니다. <code>EXPLAIN indexes = 1</code>로 각 단계의 Parts/Granules 수치를 직접 확인할 수 있습니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 프루닝 각 단계를 눈으로 확인</span>
+<span class="k">EXPLAIN</span> indexes = <span class="n">1</span>
+<span class="k">SELECT</span> <span class="f">MAX</span>(price) <span class="k">AS</span> highest_price
+<span class="k">FROM</span> uk.uk_price_paid_simple_partitioned
+<span class="k">WHERE</span> date &gt;= <span class="s">'2020-12-01'</span> <span class="k">AND</span> date &lt;= <span class="s">'2020-12-31'</span>
+  <span class="k">AND</span> town = <span class="s">'LONDON'</span>;
+
+<span class="c">-- MinMax:     Parts: 1/436,  Granules: 11/3257</span>
+<span class="c">-- Partition:  Parts: 1/1,    Granules: 11/11</span>
+<span class="c">-- PrimaryKey: Parts: 1/1,    Granules: 1/11</span></code></pre>
+
+<h2 id="s6">5.6 역효과 실측 — 파티션 키로 필터하지 않으면</h2>
+
+<p>같은 데이터, 같은 쿼리를 파티셔닝 유무만 바꿔 실측한 공식 문서의 비교입니다. 쿼리는 <code>WHERE town = 'LONDON'</code> — town은 프라이머리 키에는 있지만 파티션 키가 아니므로 <strong>파티션 프루닝이 작동하지 않습니다</strong>.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>지표</th><th>파티셔닝 없음</th><th>파티셔닝 있음</th></tr></thead>
+  <tbody>
+    <tr><td>활성 파트 수</td><td>1 (완전 머지됨)</td><td>436</td></tr>
+    <tr><td>스캔한 파트</td><td>1/1</td><td>431/436</td></tr>
+    <tr><td>스캔한 granule</td><td>241/3,083</td><td>671/3,257</td></tr>
+    <tr><td>처리 행 수</td><td>약 197만</td><td>약 548만</td></tr>
+    <tr><td>소요 시간</td><td><strong>12ms</strong></td><td><strong>90ms (7.5배 느림)</strong></td></tr>
+    <tr><td>피크 메모리</td><td>62 MiB</td><td>163 MiB (2.6배)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>느려진 이유는 명확합니다. 파티셔닝 없는 테이블은 하나의 큰 파트로 머지되어 primary index가 최대 효율로 작동하는 반면, 파티셔닝된 테이블은 <strong>431개 파트를 각각 열어 인덱스를 검사</strong>해야 하고, 파트마다 인덱스가 독립적이라 프루닝 효율도 떨어집니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">흔한 실수 3가지</div>
+    <p>① <code>PARTITION BY date</code> — 일 단위 고카디널리티 폭탄 ② 프라이머리 키로 충분한데 파티셔닝 추가 — 불필요한 복잡성 ③ 파티션 키를 프라이머리 키에도 포함 — 이미 PK로 필터 가능하므로 프루닝 이득이 사라짐</p>
+  </div>
+</div>
+
+<h2 id="s7">5.7 파티션 모니터링</h2>
+
+<pre><code><span class="c">-- 파티션별 파트 수·행 수 확인</span>
+<span class="k">SELECT</span> partition, <span class="f">count</span>() <span class="k">AS</span> parts, <span class="f">sum</span>(rows) <span class="k">AS</span> rows
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> database = <span class="s">'uk'</span>
+  <span class="k">AND</span> `table` = <span class="s">'uk_price_paid_simple_partitioned'</span>
+  <span class="k">AND</span> active
+<span class="k">GROUP BY</span> partition
+<span class="k">ORDER BY</span> partition;
+
+<span class="c">-- 파티셔닝 건강 진단: 평균 파트/파티션과 총 파티션 수</span>
+<span class="k">SELECT</span>
+    <span class="f">count</span>() <span class="k">AS</span> total_active_parts,
+    <span class="f">countDistinct</span>(partition) <span class="k">AS</span> total_partitions,
+    total_active_parts / total_partitions <span class="k">AS</span> avg_parts_per_partition
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> database = <span class="s">'mydb'</span> <span class="k">AND</span> `table` = <span class="s">'mytable'</span> <span class="k">AND</span> active;
+<span class="c">-- total_partitions가 수천 이상이면 파티션 키 재검토!</span></code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">ClickHouse 파티셔닝의 <em>주된</em> 용도로 공식 문서가 강조하는 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">모든 SELECT 쿼리의 속도 향상</button>
+    <button type="button" data-correct>TTL 삭제·tiered storage·DROP PARTITION 같은 데이터 lifecycle 관리</button>
+    <button type="button">파트 수를 줄여 머지 부담 감소</button>
+    <button type="button">복제(replication) 단위 지정</button>
+  </div>
+  <div class="quiz-expl">✅ "Partitioning is primarily a data management technique and not a query optimization tool." 파티션 단위 DROP/DETACH/MOVE는 메타데이터 수준 연산이라 수억 행도 즉시 처리됩니다. 쿼리 최적화는 프라이머리 키의 몫이며, 파티션 키로 필터하지 않는 쿼리는 오히려 느려집니다(실측 7.5배).</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q"><code>PARTITION BY toDate(event_time)</code>(일 단위)로 3년치 데이터를 운영하면 위험한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">파티션이 많으면 SELECT가 파티션 락을 오래 기다리기 때문</button>
+    <button type="button">일 단위 파티션은 TTL을 지원하지 않기 때문</button>
+    <button type="button" data-correct>머지가 같은 파티션 안에서만 가능해, 1,000개 이상의 파티션에 작은 파트가 분산·누적되어 "Too many parts"로 이어지기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 3년치 일 단위 파티션은 1,095개. 파티션 간 머지는 절대 불가능하므로 각 파티션의 작은 파트들이 정리되지 못하고 전체 파트 수가 폭증합니다. <code>parts_to_throw_insert</code>(기본 3000)를 넘으면 INSERT가 거부됩니다. <code>toStartOfMonth</code>로 바꾸면 36개 파티션으로 끝납니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch05_table_partitions.md" target="_blank" rel="noopener">chapters/ch05_table_partitions.md</a> — 파티셔닝 유무 실측 비교의 전체 수치, 파티션 키 선택 원칙, 진단 쿼리 모음이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch04.html"><span class="dir">← 이전</span><br><span class="title">4장. Table Parts — 파트 구조</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch06.html"><span class="dir">다음 →</span><br><span class="title">6장. Part Merges — 백그라운드 머지</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

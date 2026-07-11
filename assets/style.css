@@ -20,6 +20,8 @@
   --ch-soft: #ffdd66;
   --es: #10b981;
   --es-soft: #34d399;
+  --or: #c74634;
+  --or-soft: #e2705a;
 
   --accent: #58a6ff;
   --accent-soft: rgba(88, 166, 255, .12);
@@ -113,6 +115,7 @@ a:hover { text-decoration: underline; }
 .topbar .db-switch a.on-pg { color: #fff; background: var(--pg); }
 .topbar .db-switch a.on-ch { color: #1f2328; background: var(--ch); }
 .topbar .db-switch a.on-es { color: #fff; background: var(--es); }
+.topbar .db-switch a.on-or { color: #fff; background: var(--or); }
 .topbar .spacer { flex: 1; }
 .topbar button {
   background: none;
@@ -567,6 +570,7 @@ tr:last-child td { border-bottom: none; }
 .db-card.pg:hover { border-color: var(--pg-soft); }
 .db-card.ch:hover { border-color: var(--ch); }
 .db-card.es:hover { border-color: var(--es); }
+.db-card.or:hover { border-color: var(--or-soft); }
 .db-card .db-ico { font-size: 40px; margin-bottom: 10px; display: block; animation: floaty 3.4s ease-in-out infinite; }
 .db-card h2 { border: none; margin: 0 0 6px; padding: 0; font-size: 22px; }
 .db-card .db-desc { color: var(--text-dim); font-size: 14.5px; min-height: 66px; }
@@ -575,6 +579,7 @@ tr:last-child td { border-bottom: none; }
 .db-card.pg .bar { background: linear-gradient(90deg, var(--pg), var(--pg-soft)); }
 .db-card.ch .bar { background: linear-gradient(90deg, #d9a514, var(--ch)); }
 .db-card.es .bar { background: linear-gradient(90deg, #0b8a61, var(--es)); }
+.db-card.or .bar { background: linear-gradient(90deg, #96352a, var(--or-soft)); }
 
 .home-section { max-width: 1150px; margin: 0 auto 70px; padding: 0 24px; }
 .home-section > h2 { border: none; text-align: center; font-size: 26px; margin-bottom: 8px; }

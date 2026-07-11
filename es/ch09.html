@@ -218,7 +218,7 @@
 
       <!-- write pointer step1-2 -->
       <g data-show="1-2">
-        <path d="M 130 66 C 140 90 155 100 165 116" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <path d="M 130 66 C 140 90 155 100 165 116" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
         <text x="95 " y="98" class="sv-label-sm" fill="var(--accent)">write ✍️</text>
       </g>
 
@@ -236,7 +236,7 @@
         <rect x="544" y="160" width="172" height="14" rx="7" fill="none" stroke="var(--border)"/>
         <rect x="544" y="160" width="14" height="14" rx="7" fill="var(--es)"/>
         <text x="630" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--es)">새 write index</text>
-        <path d="M 150 66 C 300 70 500 80 610 116" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <path d="M 150 66 C 300 70 500 80 610 116" class="sv-arrow flow-line" marker-end="url(#arr2)"/>
         <text x="400" y="70" class="sv-label-sm" fill="var(--es)">write 포인터 이동 ✍️</text>
         <text x="170" y="240" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">000001은 read-only로 (색인 중단)</text>
       </g>
@@ -248,7 +248,7 @@
       </g>
 
       <defs>
-        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
           <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
         </marker>
       </defs>
@@ -306,19 +306,19 @@
         <rect x="245" y="130" width="130" height="52" rx="9" fill="var(--bg-inset)" stroke="var(--warn)" stroke-width="1.8"/>
         <text x="310" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">.ds-logs-000001</text>
         <text x="310" y="170" text-anchor="middle" class="sv-label-sm">forcemerge + shrink</text>
-        <path d="M 175 156 L 237 156" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <path d="M 175 156 L 237 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
       </g>
       <g data-show="3-3">
         <rect x="445" y="130" width="130" height="52" rx="9" fill="var(--bg-inset)" stroke="var(--accent)" stroke-width="1.8"/>
         <text x="510" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">.ds-logs-000001</text>
         <text x="510" y="170" text-anchor="middle" class="sv-label-sm">searchable snapshot</text>
-        <path d="M 375 156 L 437 156" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <path d="M 375 156 L 437 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
       </g>
       <g data-show="4-4">
         <rect x="645" y="130" width="110" height="52" rx="9" fill="none" stroke="var(--text-faint)" stroke-width="1.6" stroke-dasharray="5 4"/>
         <text x="700" y="152" text-anchor="middle" class="sv-label sv-mono" font-size="11.5">000001</text>
         <text x="700" y="170" text-anchor="middle" class="sv-label-sm">영구 삭제</text>
-        <path d="M 575 156 L 637 156" class="sv-arrow flow-line" marker-end="url(#arr1)"/>
+        <path d="M 575 156 L 637 156" class="sv-arrow flow-line" marker-end="url(#arr3)"/>
       </g>
 
       <!-- 타임라인 -->
@@ -333,7 +333,7 @@
       </g>
 
       <defs>
-        <marker id="arr1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <marker id="arr3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
           <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
         </marker>
       </defs>
@@ -343,7 +343,7 @@
     <p><b>hot phase</b>: 갓 태어난 인덱스는 NVMe·고RAM 노드에서 색인과 검색을 모두 감당합니다. rollover도 이 단계의 액션입니다.</p>
     <p>rollover 후 7일이 지나면 <b style="color:var(--warn)">warm 티어로 이동</b>. 더 이상 색인이 없으므로 <code>forcemerge(segment 1개)</code>와 <code>shrink(shard 수 축소)</code>로 검색 효율을 최적화합니다.</p>
     <p>30일 후 <b style="color:var(--accent)">cold/frozen</b>으로. frozen은 데이터를 S3 같은 object storage에 두고 노드는 캐시만 가지는 <b>searchable snapshot</b> — 검색은 되지만 수 초 단위로 느려질 수 있습니다.</p>
-    <p>365일이 지나면 <b>delete phase</b>가 인덱스를 영구 삭제합니다. 디스크가 가득 차서 새벽에 삭칠 작업을 하는 대신, 정책이 알아서 합니다.</p>
+    <p>365일이 지나면 <b>delete phase</b>가 인덱스를 영구 삭제합니다. 디스크가 가득 차서 새벽에 삭제 작업을 하는 대신, 정책이 알아서 합니다.</p>
     <p>주의: 각 phase의 <code>min_age</code>는 인덱스 생성이 아니라 <b>rollover 시점부터</b> 측정됩니다. 전체 흐름이 자동화되면 보존 비용은 hot 대비 frozen 기준 1/10 이하로 떨어집니다.</p>
   </div>
 </div>

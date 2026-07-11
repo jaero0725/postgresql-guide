@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6장. Undo와 읽기 일관성 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch06">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>6장. Undo와 읽기 일관성</h1>
+<p class="lead">Oracle에서 SELECT는 절대 남의 미커밋 데이터를 보지 않고, 그렇다고 기다리지도 않습니다. 비밀은 "과거를 복원하는 데이터", undo입니다. PostgreSQL과 정반대 방향의 MVCC를 만나봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 저장 구조</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① undo tablespace와 undo segment — 되돌리기 데이터의 집 ② DML이 undo를 기록하는 순간 ③ 읽기 일관성 — undo로 CR 블록을 만들어내는 마법 ④ ORA-01555 snapshot too old의 원인과 대책, 그리고 보너스인 Flashback Query</p>
+  </div>
+</div>
+
+<h2 id="s1">6.1 Undo란 — "되돌리기 위한 데이터"</h2>
+
+<p><strong>Undo</strong>는 이름 그대로 변경을 <strong>되돌리기(undo) 위한 정보</strong>입니다. UPDATE로 값을 100에서 200으로 바꾸면, Oracle은 "원래 값은 100이었다"라는 <strong>변경 전 이미지(before image)</strong>를 따로 보관합니다. 이 정보가 하는 일은 세 가지입니다.</p>
+
+<ul>
+  <li><strong>ROLLBACK</strong> — 트랜잭션을 취소할 때 undo를 적용해 원래대로 되돌립니다.</li>
+  <li><strong>읽기 일관성(read consistency)</strong> — 다른 세션의 SELECT가 미커밋 변경을 "지우고" 과거 시점의 데이터를 볼 수 있게 합니다. 이 장의 주인공입니다.</li>
+  <li><strong>Flashback</strong> — "10분 전의 이 테이블"을 조회하는 시간여행 기능의 재료가 됩니다.</li>
+</ul>
+
+<p>undo는 어디에 저장될까요? 전용 <strong>undo tablespace</strong> 안의 <strong>undo segment</strong>들입니다. 현대 Oracle(9i 이후)은 <strong>Automatic Undo Management</strong>가 기본이라, DBA는 undo tablespace 크기만 관리하면 세그먼트 할당은 Oracle이 알아서 합니다.</p>
+
+<pre><code><span class="c">-- undo 관리 방식과 undo tablespace 확인</span>
+<span class="k">SHOW PARAMETER</span> undo;
+
+NAME             TYPE     VALUE
+---------------- -------- ---------
+undo_management  string   AUTO       <span class="c">← 자동 undo 관리 (기본)</span>
+undo_retention   integer  900        <span class="c">← undo를 최소 900초(15분) 보존 시도</span>
+undo_tablespace  string   UNDOTBS1
+
+<span class="c">-- 트랜잭션이 지금 어느 undo segment를 쓰는지</span>
+<span class="k">SELECT</span> s.sid, s.username, t.xidusn <span class="k">AS</span> undo_seg_num, t.used_ublk
+<span class="k">FROM</span>   v$transaction t <span class="k">JOIN</span> v$session s <span class="k">ON</span> t.ses_addr = s.saddr;</code></pre>
+
+<h2 id="s2">6.2 DML의 순간 — 블록은 제자리에서 고치고, 과거는 undo로</h2>
+
+<p>여기가 Oracle을 이해하는 갈림길입니다. <strong>Oracle의 UPDATE는 데이터 블록을 제자리에서(in-place) 고칩니다.</strong> 새 버전 행을 만들지 않습니다. 대신 덮어쓰기 직전의 값을 undo segment에 복사해 둡니다.</p>
+
+<div class="anim" data-steps="4" data-title="UPDATE 한 번 — 블록은 제자리 수정, 과거는 undo에 백업" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="arr6a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- session -->
+      <g data-show="1">
+        <rect x="40" y="40" width="230" height="56" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="155" y="63" text-anchor="middle" class="sv-label">세션 A (TX 시작)</text>
+        <text x="155" y="83" text-anchor="middle" class="sv-label-sm sv-mono">UPDATE acc SET bal=200 WHERE id=7</text>
+      </g>
+      <!-- data block -->
+      <rect x="70" y="160" width="300" height="130" rx="10" class="sv-box"/>
+      <text x="86" y="186" class="sv-label">데이터 블록 (Buffer Cache)</text>
+      <g data-show="1-2">
+        <rect x="86" y="200" width="268" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="98" y="222" class="sv-label-sm sv-mono">id=7  bal=100</text>
+      </g>
+      <g data-show="3">
+        <rect x="86" y="200" width="268" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="98" y="222" class="sv-label-sm sv-mono" fill="var(--warn)">id=7  bal=200 ✍️ (제자리 수정!)</text>
+        <text x="86" y="262" class="sv-label-sm" fill="var(--warn)">+ ITL에 "TX A 작업 중" 기록 = 행 락</text>
+      </g>
+      <path d="M 155 96 C 155 120 170 140 190 158" class="sv-arrow flow-line" data-show="1"/>
+      <!-- undo segment -->
+      <rect x="470" y="160" width="290" height="130" rx="10" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="486" y="186" class="sv-label" fill="var(--purple)">Undo Segment (UNDOTBS1)</text>
+      <g data-show="2">
+        <rect x="486" y="200" width="258" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)"/>
+        <text x="498" y="222" class="sv-label-sm sv-mono" fill="var(--purple)">before image: id=7, bal=100</text>
+        <path d="M 372 217 C 420 217 430 217 466 217" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr6a)"/>
+        <text x="418" y="205" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">과거 백업</text>
+      </g>
+      <!-- commit note -->
+      <g data-show="4">
+        <rect x="470" y="40" width="290" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="615" y="66" text-anchor="middle" class="sv-label" fill="var(--ok)">커밋해도 undo는 즉시 안 지움</text>
+        <text x="615" y="88" text-anchor="middle" class="sv-label-sm">다른 세션의 읽기 일관성을 위해</text>
+        <text x="615" y="104" text-anchor="middle" class="sv-label-sm">undo_retention 동안 보존 시도</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>세션 A가 <code>UPDATE acc SET bal=200 WHERE id=7</code>을 실행합니다. 서버 프로세스가 대상 블록을 Buffer Cache에서 찾습니다. 현재 값은 <code>bal=100</code>.</p>
+    <p>덮어쓰기 전에, 변경 전 값 <b style="color:var(--purple)">"bal=100"이라는 before image를 undo segment에 기록</b>합니다. (이 undo 기록조차 redo의 보호를 받습니다 — 7장에서.)</p>
+    <p>이제 데이터 블록의 행을 <b style="color:var(--warn)">제자리에서 200으로 수정</b>합니다. PostgreSQL처럼 새 버전 행을 만들지 않습니다! 동시에 블록의 ITL에 "TX A가 이 행을 잡고 있다"는 락 정보도 새깁니다.</p>
+    <p>커밋 후에도 undo는 바로 버려지지 않습니다. <b style="color:var(--ok)">다른 세션의 SELECT가 과거를 복원할 재료</b>로 당분간(undo_retention) 보존됩니다. 이것이 다음 절의 읽기 일관성입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">undo도 데이터다</div>
+    <p>undo segment도 결국 undo tablespace 안의 <strong>데이터 블록</strong>입니다. 그래서 undo 변경도 redo에 기록되고, Buffer Cache에 캐시되고, DBWn이 디스크에 씁니다. "undo는 redo의 보호를 받는다"는 문장은 7장 인스턴스 복구에서 다시 만납니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">6.3 읽기 일관성 — CR 블록을 만드는 마법</h2>
+
+<p>세션 A가 아직 커밋하지 않은 상태에서, 세션 B가 같은 행을 SELECT하면 어떻게 될까요? 블록에는 이미 <code>bal=200</code>이 적혀 있는데요. Oracle의 답은 <strong>"블록을 복제한 뒤 undo를 거꾸로 적용해서 과거 시점의 블록을 재조립한다"</strong>입니다. 이렇게 만든 사본을 <strong>CR(Consistent Read) 블록</strong>이라고 부릅니다.</p>
+
+<p>기준점은 <strong>SCN(System Change Number)</strong> — Oracle 내부의 논리적 시계입니다. 쿼리가 시작되는 순간의 SCN이 "내가 봐야 할 세상의 시각"으로 고정되고, 그보다 미래의 변경(그리고 모든 미커밋 변경)은 undo로 지워냅니다.</p>
+
+<div class="anim" data-steps="5" data-title="SELECT가 미커밋 변경을 지우는 법 — CR 블록 생성" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <defs>
+        <marker id="arr6b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+        <marker id="arr6c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- session B -->
+      <g data-show="1">
+        <rect x="40" y="30" width="250" height="56" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="165" y="53" text-anchor="middle" class="sv-label">세션 B: SELECT bal WHERE id=7</text>
+        <text x="165" y="73" text-anchor="middle" class="sv-label-sm sv-mono">쿼리 시작 SCN = 5000 📸</text>
+      </g>
+      <!-- current block -->
+      <rect x="40" y="130" width="290" height="120" rx="10" class="sv-box"/>
+      <text x="56" y="156" class="sv-label">현재 블록 (current)</text>
+      <rect x="56" y="170" width="258" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+      <text x="68" y="192" class="sv-label-sm sv-mono" fill="var(--warn)">id=7 bal=200 (미커밋, TX A)</text>
+      <g data-show="2">
+        <text x="56" y="236" class="sv-label-sm" fill="var(--danger)">ITL 확인: "미커밋 TX A의 변경 있음" ⚠️</text>
+      </g>
+      <!-- clone -->
+      <g data-show="3">
+        <rect x="470" y="130" width="290" height="120" rx="10" fill="none" stroke="var(--ok)" stroke-width="1.8" stroke-dasharray="6 5"/>
+        <text x="486" y="156" class="sv-label" fill="var(--ok)">CR 블록 (복제본)</text>
+        <rect x="486" y="170" width="258" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)"/>
+        <text x="498" y="192" class="sv-label-sm sv-mono">id=7 bal=200 (복사됨)</text>
+        <path d="M 334 190 C 390 190 410 190 466 190" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="400" y="176" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">블록 복제</text>
+      </g>
+      <!-- undo apply -->
+      <g data-show="4">
+        <rect x="470" y="296" width="290" height="50" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="615" y="318" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--purple)">undo: before image bal=100</text>
+        <text x="615" y="336" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">undo segment에서 조회</text>
+        <path d="M 615 294 L 615 256" stroke="var(--purple)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr6b)"/>
+        <rect x="486" y="170" width="258" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)" stroke-width="1.8"/>
+        <text x="498" y="192" class="sv-label-sm sv-mono" fill="var(--purple)">id=7 bal=100 ← undo 적용!</text>
+      </g>
+      <!-- result -->
+      <g data-show="5">
+        <path d="M 470 120 C 380 80 330 70 296 62" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr6c)"/>
+        <text x="420" y="60" text-anchor="middle" class="sv-label" fill="var(--ok)">결과: bal=100 반환 ✅</text>
+        <text x="420" y="336" text-anchor="middle" class="sv-label-sm">세션 B는 기다리지도, 미커밋 값을 보지도 않았다 — 읽기 일관성</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>세션 A가 커밋하기 전, 세션 B가 SELECT를 시작합니다. 이 순간의 <b>SCN 5000</b>이 "봐야 할 세상의 시각"으로 고정됩니다.</p>
+    <p>블록을 열어보니 ITL에 <b style="color:var(--danger)">미커밋 트랜잭션 A의 흔적</b>이 있습니다. 현재 블록의 <code>bal=200</code>을 그대로 읽으면 dirty read — Oracle은 절대 허용하지 않습니다.</p>
+    <p>그렇다고 기다리지도 않습니다. Buffer Cache 안에 <b style="color:var(--ok)">블록의 복제본(CR 블록)</b>을 만듭니다.</p>
+    <p>복제본에 <b style="color:var(--purple)">undo의 before image를 거꾸로 적용</b>해 TX A의 변경을 지웁니다. 복제본은 이제 SCN 5000 시점의 모습, <code>bal=100</code>이 됩니다.</p>
+    <p>세션 B는 CR 블록에서 <code>bal=100</code>을 읽고 즉시 반환합니다. <b>기다림도, dirty read도 없이</b> — 이것이 Oracle 읽기 일관성이고, "SELECT는 락을 잡지 않는다"(8장)의 토대입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">CR 블록 생성을 눈으로 확인하기</div>
+    <p>통계 <code>consistent gets</code>(일관된 읽기)와 <code>data blocks consistent reads - undo records applied</code>를 보면 SELECT가 undo를 몇 번 적용했는지 알 수 있습니다. <code>SELECT name, value FROM v$sysstat WHERE name LIKE '%undo records applied%';</code></p>
+  </div>
+</div>
+
+<h2 id="s4">6.4 🏆 PostgreSQL과 정반대 방향 — 같은 MVCC, 다른 설계</h2>
+
+<p>PostgreSQL도 Oracle도 MVCC(다중 버전 동시성 제어)를 씁니다. 그런데 <strong>버전을 어디에 두는가</strong>가 정반대입니다. 이 차이 하나에서 두 DB의 운영 특성 대부분이 갈라져 나옵니다.</p>
+
+<div class="callout info">
+  <span class="ico">⚖️</span>
+  <div>
+    <div class="callout-title">구조 비교 — 이 장의 백미</div>
+    <p><strong>PostgreSQL</strong>: UPDATE가 <strong>새 버전 행을 heap에 추가</strong>하고 옛 버전을 남깁니다(<a href="../pg/ch03.html">PostgreSQL 3장 MVCC</a>). 과거가 테이블 안에 그대로 있으므로 옛 스냅샷 읽기는 공짜지만, dead tuple 청소(VACUUM)가 숙제입니다.<br>
+    <strong>Oracle</strong>: UPDATE가 <strong>블록을 제자리에서 고치고</strong>, 과거는 undo라는 별도 공간에 둡니다. 테이블은 항상 최신 버전만 담아 깔끔하고 VACUUM도 없지만, 과거를 읽으려면 undo를 적용해 <strong>재조립하는 비용</strong>이 들고, undo가 재사용되면 ORA-01555라는 벽에 부딪힙니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>PostgreSQL</th><th>Oracle</th></tr></thead>
+  <tbody>
+    <tr><td>UPDATE 방식</td><td>새 버전 튜플을 heap에 INSERT</td><td>블록을 제자리(in-place) 수정</td></tr>
+    <tr><td>과거 버전 위치</td><td>테이블(heap) 안에 그대로</td><td>undo tablespace (별도 공간)</td></tr>
+    <tr><td>과거 읽기 비용</td><td>낮음 — 옛 튜플을 그냥 읽음</td><td>CR 블록 재조립 비용 (undo 적용)</td></tr>
+    <tr><td>버전 청소</td><td>VACUUM 필요 (Bloat 위험)</td><td>불필요 — undo는 자동 순환 재사용</td></tr>
+    <tr><td>오래된 스냅샷의 한계</td><td>long TX가 VACUUM을 막아 Bloat 유발</td><td>undo 재사용 시 ORA-01555 발생</td></tr>
+    <tr><td>ROLLBACK 비용</td><td>저렴 — 새 버전을 무효화만 하면 됨</td><td>비쌈 — undo를 실제로 적용해 되돌림</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>재미있는 대칭이죠. <strong>PostgreSQL은 ROLLBACK이 싸고 청소가 비싸며, Oracle은 청소가 없는 대신 ROLLBACK이 비쌉니다.</strong> "대량 배치가 실패해서 ROLLBACK했더니 실행 시간만큼 또 걸렸다"는 Oracle 단골 사연이 여기서 나옵니다.</p>
+
+<h2 id="s5">6.5 ORA-01555: snapshot too old — 유통기한 지난 과거</h2>
+
+<p>undo tablespace는 무한하지 않습니다. 공간이 차면 Oracle은 <strong>커밋된 지 오래된 undo부터 순환식으로 덮어씁니다</strong>. 문제는 아직 그 과거를 필요로 하는 장기 실행 쿼리가 있을 때입니다.</p>
+
+<div class="anim" data-steps="4" data-title="ORA-01555가 터지는 순간 — 사라진 과거" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <!-- long query -->
+      <g data-show="1">
+        <rect x="40" y="36" width="300" height="56" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="190" y="59" text-anchor="middle" class="sv-label">🐢 장기 리포트 쿼리 (1시간짜리)</text>
+        <text x="190" y="79" text-anchor="middle" class="sv-label-sm sv-mono">시작 SCN=5000 기준으로 읽는 중...</text>
+      </g>
+      <!-- undo ring -->
+      <text x="40" y="140" class="sv-label">Undo Tablespace (순환 재사용)</text>
+      <g>
+        <rect x="40" y="156" width="130" height="52" rx="8" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)"/>
+        <text x="105" y="178" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--purple)">undo @SCN 4800</text>
+        <text x="105" y="196" text-anchor="middle" class="sv-label-sm">(쿼리에 필요!)</text>
+      </g>
+      <rect x="182" y="156" width="130" height="52" rx="8" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)"/>
+      <text x="247" y="178" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--purple)">undo @SCN 5100</text>
+      <text x="247" y="196" text-anchor="middle" class="sv-label-sm">(커밋됨)</text>
+      <rect x="324" y="156" width="130" height="52" rx="8" fill="color-mix(in srgb, var(--purple) 15%, transparent)" stroke="var(--purple)"/>
+      <text x="389" y="178" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--purple)">undo @SCN 5300</text>
+      <text x="389" y="196" text-anchor="middle" class="sv-label-sm">(커밋됨)</text>
+      <!-- heavy dml -->
+      <g data-show="2">
+        <rect x="470" y="36" width="290" height="56" rx="10" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="615" y="59" text-anchor="middle" class="sv-label" fill="var(--warn)">🔥 다른 세션들의 대량 DML + 커밋</text>
+        <text x="615" y="79" text-anchor="middle" class="sv-label-sm">undo 공간을 계속 소비</text>
+        <path d="M 615 92 C 615 120 560 140 500 154" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <rect x="466" y="156" width="130" height="52" rx="8" fill="color-mix(in srgb, var(--warn) 15%, transparent)" stroke="var(--warn)"/>
+        <text x="531" y="178" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--warn)">undo @SCN 5600</text>
+        <text x="531" y="196" text-anchor="middle" class="sv-label-sm">새 undo 기록</text>
+      </g>
+      <!-- overwrite -->
+      <g data-show="3">
+        <rect x="40" y="156" width="130" height="52" rx="8" fill="color-mix(in srgb, var(--danger) 15%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="105" y="178" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">덮어써짐! 💥</text>
+        <text x="105" y="196" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">SCN 4800 소실</text>
+        <text x="400" y="242" text-anchor="middle" class="sv-label-sm">공간 부족 → 가장 오래된 (커밋된) undo부터 재사용</text>
+      </g>
+      <!-- error -->
+      <g data-show="4">
+        <rect x="190" y="264" width="420" height="44" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8"/>
+        <text x="400" y="292" text-anchor="middle" class="sv-label" fill="var(--danger)">ORA-01555: snapshot too old ❌ (쿼리 실패)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>1시간짜리 리포트 쿼리가 SCN 5000 기준으로 읽기 시작했습니다. 도중에 다른 세션들이 바꾼 데이터는 <b>SCN 5000 시점으로 복원</b>해서 읽어야 하므로, 과거 undo가 계속 필요합니다.</p>
+    <p>그 사이 다른 세션들이 <b style="color:var(--warn)">대량 DML을 실행하고 커밋</b>합니다. 새 undo가 쏟아져 들어와 undo tablespace가 가득 찹니다.</p>
+    <p>공간이 부족해진 Oracle은 <b style="color:var(--danger)">커밋된 지 가장 오래된 undo부터 덮어씁니다</b>. 하필 리포트 쿼리가 필요로 하던 SCN 4800의 before image가 사라졌습니다.</p>
+    <p>리포트 쿼리가 그 블록의 CR 버전을 만들려는 순간 — 재료가 없습니다. <b style="color:var(--danger)">ORA-01555: snapshot too old</b>. 쿼리는 실패하고 처음부터 다시 실행해야 합니다.</p>
+  </div>
+</div>
+
+<p>대책은 "과거를 더 오래 보관하거나, 과거를 덜 오래 필요로 하거나" 둘 중 하나입니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>대책</th><th>방법</th></tr></thead>
+  <tbody>
+    <tr><td>undo 보존 기간 확보</td><td><code>undo_retention</code>(기본 900초) 상향 + <strong>undo tablespace 크기 증설</strong>. 공간이 없으면 retention은 지켜지지 않는 '희망 사항'일 뿐입니다.</td></tr>
+    <tr><td>보존 강제</td><td><code>ALTER TABLESPACE undotbs1 RETENTION GUARANTEE;</code> — 단, 공간 부족 시 <strong>DML이 실패</strong>하는 부작용을 감수해야 합니다.</td></tr>
+    <tr><td>쿼리 짧게</td><td>장기 리포트를 야간 등 DML이 적은 시간대로 이동, 또는 쿼리 자체를 분할·튜닝.</td></tr>
+    <tr><td>fetch across commit 금지</td><td>커서를 열어둔 채 루프 안에서 조금씩 커밋하는 패턴은 자기 자신이 필요로 하는 undo를 스스로 밀어내는 자충수입니다.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">undo_retention은 보증서가 아니다</div>
+    <p><code>undo_retention=900</code>은 "900초 동안 보존하려고 <strong>노력</strong>한다"는 뜻입니다. 진행 중인 트랜잭션의 undo(active undo)는 절대 덮어쓰지 않지만, <strong>커밋된 undo는 공간이 부족하면 retention 이전이라도 재사용</strong>될 수 있습니다. 확실한 보장이 필요하면 RETENTION GUARANTEE + 충분한 공간이 답입니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">6.6 Flashback Query — undo가 주는 보너스, 시간여행</h2>
+
+<p>undo에 과거가 남아 있다면, 그걸 사용자에게도 열어주면 어떨까요? 그것이 <strong>Flashback Query</strong>입니다. 실수로 지우고 커밋해버린 데이터를 백업 없이 되살리는 실전 필살기입니다.</p>
+
+<pre><code><span class="c">-- 10분 전의 테이블 모습 조회 (undo가 남아있는 한)</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> emp
+<span class="k">AS OF TIMESTAMP</span> SYSTIMESTAMP - <span class="k">INTERVAL</span> <span class="s">'10'</span> <span class="k">MINUTE</span>
+<span class="k">WHERE</span>  empno = <span class="n">7369</span>;
+
+<span class="c">-- 실수로 DELETE + COMMIT한 행 복구</span>
+<span class="k">INSERT INTO</span> emp
+<span class="k">SELECT</span> * <span class="k">FROM</span> emp <span class="k">AS OF TIMESTAMP</span> SYSTIMESTAMP - <span class="k">INTERVAL</span> <span class="s">'10'</span> <span class="k">MINUTE</span>
+<span class="k">WHERE</span>  empno <span class="k">NOT IN</span> (<span class="k">SELECT</span> empno <span class="k">FROM</span> emp);
+
+<span class="c">-- 행의 변경 이력을 버전별로 추적</span>
+<span class="k">SELECT</span> versions_starttime, versions_operation, sal
+<span class="k">FROM</span>   emp <span class="k">VERSIONS BETWEEN SCN MINVALUE AND MAXVALUE</span>
+<span class="k">WHERE</span>  empno = <span class="n">7369</span>;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">Flashback의 유통기한 = undo의 수명</div>
+    <p>Flashback Query는 undo를 재료로 쓰므로, <strong>undo가 재사용된 과거는 조회할 수 없고 똑같이 ORA-01555가 납니다</strong>. "어제 지운 데이터"를 flashback으로 찾으려면 undo_retention과 undo 공간이 그만큼 받쳐줘야 합니다. DDL(TRUNCATE 등)로 날아간 데이터도 이 방법으로는 복구 불가입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">Oracle에서 세션 B가 SELECT하려는 블록에 세션 A의 미커밋 변경이 있을 때 일어나는 일은?</div>
+  <div class="quiz-opts">
+    <button type="button">세션 B는 세션 A가 커밋할 때까지 대기한다</button>
+    <button type="button">세션 B는 미커밋 값을 그대로 읽는다 (dirty read)</button>
+    <button type="button" data-correct>블록 복제본에 undo를 적용해 쿼리 시작 SCN 시점의 CR 블록을 만들어 읽는다</button>
+    <button type="button">heap에 남아 있는 이전 버전 행을 찾아 읽는다</button>
+  </div>
+  <div class="quiz-expl">✅ Oracle은 블록을 복제하고 undo의 before image를 거꾸로 적용해 과거 시점의 CR(Consistent Read) 블록을 재조립합니다. 기다리지도, dirty read를 하지도 않습니다. 마지막 보기는 PostgreSQL 방식입니다 — Oracle은 이전 버전을 heap에 남기지 않고 undo에 보관합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">ORA-01555 (snapshot too old)의 직접적인 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">쿼리가 너무 많은 행을 읽어 Buffer Cache가 가득 차서</button>
+    <button type="button" data-correct>장기 실행 쿼리가 필요로 하는 커밋된 undo가 공간 부족으로 이미 덮어써져서</button>
+    <button type="button">진행 중인 트랜잭션의 active undo가 삭제되어서</button>
+    <button type="button">redo log가 아카이브되기 전에 재사용되어서</button>
+  </div>
+  <div class="quiz-expl">✅ 쿼리 시작 SCN 시점을 복원할 undo가 이미 재사용(덮어쓰기)된 것이 원인입니다. active undo(진행 중 트랜잭션)는 절대 덮어쓰지 않으며, 재사용 대상은 커밋된 undo입니다. 대책: undo tablespace 증설 + undo_retention 상향, 필요 시 RETENTION GUARANTEE, 장기 쿼리 시간대 조정.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html" target="_blank" rel="noopener">Data Concurrency and Consistency</a> — multiversion read consistency와 SCN의 정식 정의 · <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-undo.html" target="_blank" rel="noopener">Managing Undo</a> (Administrator's Guide) — undo 자동 튜닝과 retention 관리.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch05.html"><span class="dir">← 이전</span><br><span class="title">5장. 저장 구조</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch07.html"><span class="dir">다음 →</span><br><span class="title">7장. Redo · 커밋 · 인스턴스 복구</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

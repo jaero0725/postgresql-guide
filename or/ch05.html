@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5장. 저장 구조 — 테이블스페이스와 블록 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch05">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>5장. 저장 구조 — 테이블스페이스와 블록</h1>
+<p class="lead">CREATE TABLE 한 줄이 디스크 위에서는 테이블스페이스 → 세그먼트 → 익스텐트 → 블록이라는 4단 계층으로 펼쳐집니다. 블록 안을 들여다보면 row migration과 "지웠는데 왜 느리죠?"의 답이 보입니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 1장 Instance/Database, 2장 SGA</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 논리 저장 계층(tablespace → segment → extent → block)과 물리 파일의 대응 ② 블록 내부 구조(헤더 · ITL · row data · free space) ③ PCTFREE와 row migration / row chaining ④ High Water Mark가 full scan 성능을 좌우하는 이유</p>
+  </div>
+</div>
+
+<h2 id="s1">5.1 논리 계층 — 테이블은 4단 서랍장에 담긴다</h2>
+
+<p>Oracle은 데이터를 <strong>논리 구조</strong>와 <strong>물리 구조</strong>로 나눠서 관리합니다. SQL을 쓰는 우리는 논리 구조(테이블스페이스, 세그먼트)를 보고, OS는 물리 구조(datafile)만 봅니다. 이 분리 덕분에 "테이블을 어느 디스크 파일에 둘까"를 SQL 세계와 독립적으로 바꿀 수 있습니다.</p>
+
+<p>논리 계층은 큰 것부터 작은 것 순서로 이렇습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>계층</th><th>무엇인가</th><th>비유</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Tablespace</strong></td><td>세그먼트를 담는 논리적 저장 공간. 하나 이상의 datafile로 구성</td><td>서랍장 전체</td></tr>
+    <tr><td><strong>Segment</strong></td><td>테이블 하나, 인덱스 하나처럼 <strong>저장 공간을 차지하는 객체 1개</strong></td><td>서랍 한 칸</td></tr>
+    <tr><td><strong>Extent</strong></td><td>세그먼트에 할당되는 <strong>연속된 블록 묶음</strong>. 공간이 부족하면 extent 단위로 확장</td><td>서랍 속 칸막이 박스</td></tr>
+    <tr><td><strong>Data Block</strong></td><td>Oracle I/O의 최소 단위. 기본 8KB (<code>DB_BLOCK_SIZE</code>)</td><td>박스 속 종이 한 장</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="anim" data-steps="5" data-title="줌인! 테이블스페이스 → 세그먼트 → 익스텐트 → 블록 → 물리 파일" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <!-- tablespace -->
+      <g data-show="1">
+        <rect x="30" y="36" width="500" height="200" rx="12" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="46" y="60" class="sv-label" fill="var(--accent)">📦 Tablespace: USERS</text>
+      </g>
+      <!-- segment -->
+      <g data-show="2">
+        <rect x="50" y="76" width="460" height="140" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="64" y="98" class="sv-label" fill="var(--purple)">Segment: EMP 테이블</text>
+      </g>
+      <!-- extents -->
+      <g data-show="3">
+        <rect x="66" y="110" width="208" height="90" rx="8" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="76" y="129" class="sv-label-sm" fill="var(--warn)">Extent #0 (연속 블록)</text>
+        <rect x="288" y="110" width="208" height="90" rx="8" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="298" y="129" class="sv-label-sm" fill="var(--warn)">Extent #1 (확장으로 추가)</text>
+      </g>
+      <!-- blocks -->
+      <g data-show="4">
+        <rect x="78" y="140" width="42" height="42" rx="5" class="sv-box"/>
+        <rect x="126" y="140" width="42" height="42" rx="5" class="sv-box"/>
+        <rect x="174" y="140" width="42" height="42" rx="5" class="sv-box"/>
+        <rect x="222" y="140" width="42" height="42" rx="5" class="sv-box"/>
+        <text x="99" y="167" text-anchor="middle" class="sv-label-sm sv-mono">8K</text>
+        <text x="147" y="167" text-anchor="middle" class="sv-label-sm sv-mono">8K</text>
+        <text x="195" y="167" text-anchor="middle" class="sv-label-sm sv-mono">8K</text>
+        <text x="243" y="167" text-anchor="middle" class="sv-label-sm sv-mono">8K</text>
+        <text x="171" y="196" class="sv-label-sm">Data Block = I/O 최소 단위</text>
+      </g>
+      <!-- physical mapping -->
+      <g data-show="5">
+        <rect x="30" y="280" width="500" height="52" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="46" y="302" class="sv-label" fill="var(--ok)">💾 물리: /u01/oradata/users01.dbf (datafile)</text>
+        <text x="46" y="322" class="sv-label-sm">extent = 이 파일 안의 연속된 구간에 대응</text>
+        <path d="M 170 200 C 170 240 140 260 130 278" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 392 200 C 392 240 420 260 430 278" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+      <!-- side legend -->
+      <g data-show="1">
+        <text x="560" y="60" class="sv-label-sm">① 서랍장: 논리적 저장 공간</text>
+      </g>
+      <g data-show="2">
+        <text x="560" y="98" class="sv-label-sm">② 서랍 한 칸 = 객체 하나</text>
+      </g>
+      <g data-show="3">
+        <text x="560" y="135" class="sv-label-sm">③ 공간 부족 → extent 추가</text>
+      </g>
+      <g data-show="4">
+        <text x="560" y="170" class="sv-label-sm">④ 블록: 기본 8KB</text>
+      </g>
+      <g data-show="5">
+        <text x="560" y="305" class="sv-label-sm">⑤ OS 눈에는 그냥 큰 파일</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>Tablespace</b>는 가장 큰 논리 단위입니다. <code>USERS</code>, <code>SYSTEM</code>, <code>UNDOTBS1</code>처럼 용도별로 나뉩니다.</p>
+    <p><code>CREATE TABLE emp ...</code>을 실행하면 그 테이블스페이스 안에 <b>segment</b> 하나가 생깁니다. 테이블 1개 = 세그먼트 1개 (파티션·LOB은 각각 별도 세그먼트).</p>
+    <p>세그먼트에 공간이 할당되는 단위가 <b>extent</b> — 연속된 블록 묶음입니다. 데이터가 차서 공간이 모자라면 extent를 하나 더 받아 늘어납니다.</p>
+    <p>extent를 쪼개면 <b>data block</b>(기본 8KB)이 나옵니다. Oracle이 읽고 쓰는 <b>I/O의 최소 단위</b>입니다. Buffer Cache에 올라가는 단위도 블록이죠.</p>
+    <p>이 모든 논리 구조는 결국 <b style="color:var(--ok)">datafile이라는 물리 파일의 구간</b>에 대응됩니다. 논리와 물리를 분리했기에 datafile을 추가·이동해도 SQL은 그대로입니다.</p>
+  </div>
+</div>
+
+<p>실제로 눈으로 확인해 봅시다. 딕셔너리 뷰 세 개면 계층 전체가 보입니다.</p>
+
+<pre><code><span class="c">-- 테이블이 어느 테이블스페이스에, 얼마나 크게 자리 잡았나</span>
+<span class="k">SELECT</span> segment_name, tablespace_name, extents, blocks, bytes/1024/1024 <span class="k">AS</span> mb
+<span class="k">FROM</span>   user_segments
+<span class="k">WHERE</span>  segment_name = <span class="s">'EMP'</span>;
+
+<span class="c">-- extent 하나하나가 어느 파일의 몇 번 블록부터인지</span>
+<span class="k">SELECT</span> extent_id, file_id, block_id, blocks
+<span class="k">FROM</span>   dba_extents
+<span class="k">WHERE</span>  segment_name = <span class="s">'EMP'</span>
+<span class="k">ORDER BY</span> extent_id;
+
+<span class="c">-- 테이블스페이스를 구성하는 물리 파일</span>
+<span class="k">SELECT</span> file_name, bytes/1024/1024 <span class="k">AS</span> mb, autoextensible
+<span class="k">FROM</span>   dba_data_files
+<span class="k">WHERE</span>  tablespace_name = <span class="s">'USERS'</span>;</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">블록 크기는 왜 8KB인가</div>
+    <p>블록 크기는 DB 생성 시 <code>DB_BLOCK_SIZE</code>로 정하며 기본값이자 가장 무난한 값이 <strong>8KB</strong>입니다(2K~32K 지원). 한 번 만들면 바꿀 수 없고, PostgreSQL의 8KB 페이지와 같은 크기라 두 DB를 비교 학습하기에도 좋습니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">5.2 블록 내부 해부 — 8KB 안에 무엇이 들어있나</h2>
+
+<p>블록은 단순한 데이터 덩어리가 아니라 잘 짜인 문서 양식입니다. 위에서 아래로 이렇게 배치됩니다.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 800 300">
+    <rect x="200" y="20" width="400" height="260" rx="10" fill="none" stroke="var(--border)" stroke-width="2"/>
+    <!-- header -->
+    <rect x="210" y="30" width="380" height="46" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+    <text x="400" y="50" text-anchor="middle" class="sv-label" fill="var(--accent)">블록 헤더 (block header)</text>
+    <text x="400" y="68" text-anchor="middle" class="sv-label-sm">블록 주소 · 세그먼트 타입 · SCN 정보</text>
+    <!-- ITL -->
+    <rect x="210" y="82" width="380" height="40" rx="6" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.4"/>
+    <text x="400" y="99" text-anchor="middle" class="sv-label" fill="var(--purple)">ITL (Interested Transaction List)</text>
+    <text x="400" y="115" text-anchor="middle" class="sv-label-sm">이 블록을 고치는 중인 트랜잭션 명단 — 행 락의 집 (8장)</text>
+    <!-- row directory -->
+    <rect x="210" y="128" width="380" height="32" rx="6" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+    <text x="400" y="149" text-anchor="middle" class="sv-label-sm">Table / Row Directory — 행들의 블록 내 위치 목차</text>
+    <!-- free space -->
+    <rect x="210" y="166" width="380" height="46" rx="6" fill="none" stroke="var(--ok)" stroke-width="1.4" stroke-dasharray="6 5"/>
+    <text x="400" y="186" text-anchor="middle" class="sv-label" fill="var(--ok)">Free Space (빈 공간)</text>
+    <text x="400" y="204" text-anchor="middle" class="sv-label-sm">PCTFREE가 지키는 UPDATE 대비 여유분</text>
+    <!-- row data -->
+    <rect x="210" y="218" width="380" height="52" rx="6" class="sv-box"/>
+    <text x="400" y="240" text-anchor="middle" class="sv-label">Row Data (행 데이터)</text>
+    <text x="400" y="258" text-anchor="middle" class="sv-label-sm">아래에서 위로 채워짐</text>
+    <!-- side labels -->
+    <text x="120" y="55" text-anchor="middle" class="sv-label-sm">관리 영역</text>
+    <path d="M 160 50 L 200 50" class="sv-line"/>
+    <text x="680" y="192" text-anchor="middle" class="sv-label-sm">free space는 가운데서</text>
+    <text x="680" y="208" text-anchor="middle" class="sv-label-sm">양쪽으로 줄어든다</text>
+    <path d="M 620 195 L 600 195" class="sv-line"/>
+  </svg>
+  <div class="diagram-caption">Oracle 데이터 블록의 내부 배치 — 헤더는 위에서 아래로, 행 데이터는 아래에서 위로 자란다</div>
+</div>
+
+<ul>
+  <li><strong>블록 헤더</strong> — 블록 주소, 담긴 세그먼트 종류(테이블/인덱스), 최근 변경 SCN 등 관리 정보.</li>
+  <li><strong>ITL(Interested Transaction List)</strong> — "지금 이 블록의 행을 고치는 중인 트랜잭션" 명단. Oracle 행 락의 실체가 바로 여기 있습니다. <a href="ch08.html">8장</a>에서 집중적으로 다룹니다.</li>
+  <li><strong>Row Directory</strong> — 각 행이 블록 안 어디서 시작하는지 가리키는 목차. ROWID의 마지막 조각(행 번호)이 이 목차의 인덱스입니다.</li>
+  <li><strong>Free Space</strong> — 새 행 INSERT와 기존 행이 커지는 UPDATE를 위해 남겨둔 빈 공간.</li>
+  <li><strong>Row Data</strong> — 실제 행. 블록의 아래쪽 끝에서 위로 채워 올라옵니다.</li>
+</ul>
+
+<h2 id="s3">5.3 PCTFREE — "UPDATE를 위해 자리를 비워둬라"</h2>
+
+<p>행은 INSERT 이후에도 UPDATE로 커질 수 있습니다. <code>NULL</code>이던 컬럼에 긴 문자열이 들어오는 순간이 대표적이죠. 그래서 Oracle은 블록마다 <strong>PCTFREE</strong>(기본값 <strong>10</strong>, 단위 %)만큼을 INSERT용으로 쓰지 않고 남겨둡니다.</p>
+
+<pre><code><span class="c">-- 블록의 20%를 UPDATE 대비 여유 공간으로 남긴다</span>
+<span class="k">CREATE TABLE</span> emp (
+  empno  <span class="k">NUMBER</span>(6),
+  ename  <span class="k">VARCHAR2</span>(50),
+  bio    <span class="k">VARCHAR2</span>(4000)   <span class="c">-- 나중에 채워질 큰 컬럼</span>
+) PCTFREE <span class="n">20</span> <span class="k">TABLESPACE</span> users;</code></pre>
+
+<p>규칙은 간단합니다. <strong>블록의 빈 공간이 PCTFREE 밑으로 내려가면 그 블록에는 더 이상 새 행을 INSERT하지 않습니다.</strong> 남은 공간은 오직 기존 행이 커질 때를 위해 예약됩니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">PCTFREE는 트레이드오프</div>
+    <p>UPDATE가 잦고 행이 자주 커지는 테이블은 PCTFREE를 키워야 row migration을 막을 수 있습니다. 반대로 INSERT 후 거의 수정하지 않는 로그성 테이블에 큰 PCTFREE를 주면 <strong>블록의 그만큼이 영원히 놀게</strong> 되어 저장 공간과 캐시를 낭비합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">5.4 Row Migration vs Row Chaining — 행이 블록을 넘칠 때</h2>
+
+<p>여유 공간을 남겨도 한계는 옵니다. UPDATE로 커진 행이 블록에 도저히 안 들어가면 어떻게 될까요? Oracle은 두 가지 다른 상황을 구분합니다.</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🚚 Row Migration (행 이주)</h4>
+    <p><strong>UPDATE로 커진 행</strong>이 원래 블록에 안 들어가서 <strong>행 전체가 다른 블록으로 이사</strong>. 원래 자리에는 새 주소를 가리키는 포인터만 남습니다. ROWID는 그대로 → 인덱스는 수정 안 해도 되지만, 조회 때마다 블록을 2번 읽습니다.</p>
+  </div>
+  <div class="card">
+    <h4>🔗 Row Chaining (행 사슬)</h4>
+    <p>행이 <strong>애초에 블록 하나보다 커서</strong>(예: 8KB 블록에 10KB짜리 행) 여러 블록에 걸쳐 쪼개져 저장되는 것. PCTFREE를 아무리 조절해도 못 막고, 블록 크기를 키우거나 행 설계를 바꿔야 합니다.</p>
+  </div>
+</div>
+
+<div class="anim" data-steps="4" data-title="UPDATE로 행이 커지면 — row migration의 순간" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="arr5a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+        <marker id="arr5b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- Block 7 -->
+      <rect x="40" y="50" width="300" height="230" rx="10" class="sv-box"/>
+      <text x="56" y="76" class="sv-label">Block #7</text>
+      <rect x="56" y="90" width="268" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="68" y="112" class="sv-label-sm sv-mono">row 1: (101, 'Kim', ...)</text>
+      <!-- row 2 normal -->
+      <g data-show="1-1">
+        <rect x="56" y="132" width="160" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="68" y="154" class="sv-label-sm sv-mono">row 2: bio=NULL</text>
+      </g>
+      <!-- row 2 grown, doesn't fit -->
+      <g data-show="2-2">
+        <rect x="56" y="132" width="268" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)" stroke-width="1.8" class="pulse"/>
+        <text x="68" y="154" class="sv-label-sm sv-mono" fill="var(--warn)">row 2: bio='아주 긴 자기소개...' 💥</text>
+      </g>
+      <!-- forwarding pointer -->
+      <g data-show="3">
+        <rect x="56" y="132" width="268" height="34" rx="6" fill="none" stroke="var(--warn)" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <text x="68" y="154" class="sv-label-sm sv-mono" fill="var(--warn)">row 2 → 포인터: Block #12로 이사감</text>
+      </g>
+      <rect x="56" y="174" width="220" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="68" y="196" class="sv-label-sm sv-mono">row 3: (103, 'Park', ...)</text>
+      <g data-show="1-2">
+        <text x="56" y="248" class="sv-label-sm" fill="var(--ok)">free space: 얼마 안 남음</text>
+      </g>
+      <!-- Block 12 -->
+      <g data-show="3">
+        <rect x="460" y="50" width="300" height="230" rx="10" class="sv-box"/>
+        <text x="476" y="76" class="sv-label">Block #12 (여유 있음)</text>
+        <rect x="476" y="90" width="268" height="52" rx="6" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="488" y="112" class="sv-label-sm sv-mono">row 2 전체: (102, 'Lee',</text>
+        <text x="488" y="130" class="sv-label-sm sv-mono">bio='아주 긴 자기소개...')</text>
+        <path d="M 330 149 C 400 149 400 110 456 108" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr5a)"/>
+      </g>
+      <!-- index lookup 2 reads -->
+      <g data-show="4">
+        <text x="400" y="26" text-anchor="middle" class="sv-label" fill="var(--accent)">인덱스는 여전히 Block #7의 ROWID를 가리킴</text>
+        <path d="M 260 32 C 200 40 170 40 150 48" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#arr5b)"/>
+        <text x="400" y="316" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">조회 1건 = Block #7 읽기 + 포인터 따라 Block #12 읽기 = I/O 2배 ("table fetch continued row")</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>Block #7에 행 3개가 살고 있습니다. <code>row 2</code>의 bio 컬럼은 아직 NULL이라 행이 작고, 블록의 free space도 얼마 남지 않았습니다.</p>
+    <p><code>UPDATE emp SET bio='아주 긴 자기소개...'</code> 실행! row 2가 확 커졌는데 <b style="color:var(--warn)">블록에 남은 공간으로는 부족</b>합니다.</p>
+    <p>Oracle은 <b>행 전체를 여유 있는 Block #12로 이사</b>시키고, 원래 자리엔 새 주소를 가리키는 <b>포인터만</b> 남깁니다. ROWID가 안 바뀌므로 인덱스를 고칠 필요는 없습니다. 이것이 <b>row migration</b>.</p>
+    <p>대가는 조회 성능입니다. 인덱스로 이 행을 찾으면 Block #7 → 포인터 → Block #12, <b style="color:var(--danger)">블록을 2번</b> 읽습니다. 통계 <code>table fetch continued row</code>가 치솟으면 이 현상을 의심하세요. 예방책은 넉넉한 PCTFREE입니다.</p>
+  </div>
+</div>
+
+<p>migration/chaining이 실제로 있는지 이렇게 진단합니다.</p>
+
+<pre><code><span class="c">-- 방법 1: 통계로 의심하기 — 포인터를 따라간 횟수</span>
+<span class="k">SELECT</span> name, value <span class="k">FROM</span> v$sysstat
+<span class="k">WHERE</span>  name = <span class="s">'table fetch continued row'</span>;
+
+<span class="c">-- 방법 2: 테이블 통계 수집 후 확인</span>
+<span class="k">EXEC</span> DBMS_STATS.GATHER_TABLE_STATS(<span class="s">'SCOTT'</span>, <span class="s">'EMP'</span>);
+<span class="k">SELECT</span> chain_cnt, num_rows <span class="k">FROM</span> user_tables <span class="k">WHERE</span> table_name = <span class="s">'EMP'</span>;
+
+<span class="c">-- 해결: migration된 행은 테이블 재구성으로 정리</span>
+<span class="k">ALTER TABLE</span> emp <span class="k">MOVE</span>;          <span class="c">-- 주의: ROWID가 바뀌므로 인덱스 리빌드 필요</span>
+<span class="k">ALTER INDEX</span> emp_pk <span class="k">REBUILD</span>;</code></pre>
+
+<h2 id="s5">5.5 High Water Mark — "지웠는데 왜 full scan이 느리죠?"</h2>
+
+<p><strong>High Water Mark(HWM)</strong>는 세그먼트에서 <strong>"여기까지는 데이터가 채워진 적이 있다"</strong>를 표시하는 수위선입니다. 홍수가 지나간 강둑의 물자국과 같습니다 — 물이 빠져도 자국은 남죠.</p>
+
+<p>핵심 규칙 두 가지:</p>
+<ul>
+  <li><strong>Full table scan은 HWM 아래의 모든 블록을 읽습니다.</strong> 행이 있든 없든.</li>
+  <li><strong>DELETE는 HWM을 내리지 않습니다.</strong> 1억 건을 지워도 수위선은 그대로입니다.</li>
+</ul>
+
+<div class="anim" data-steps="4" data-title="DELETE 후에도 full scan이 느린 이유 — HWM" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <defs>
+        <marker id="arr5c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--danger)"/>
+        </marker>
+      </defs>
+      <text x="40" y="34" class="sv-label">EMP 세그먼트의 블록들</text>
+      <!-- 10 blocks -->
+      <!-- filled state (step1) -->
+      <g data-show="1-1">
+        <rect x="40" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="110" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="180" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="250" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="320" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="390" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="460" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <rect x="530" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="315" y="97" text-anchor="middle" class="sv-label-sm">1억 건 INSERT됨</text>
+      </g>
+      <!-- emptied state (step2+) -->
+      <g data-show="2">
+        <rect x="40" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="110" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="180" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="250" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="320" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="390" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="460" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="5 4"/>
+        <rect x="530" y="60" width="60" height="60" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="280" y="97" text-anchor="middle" class="sv-label-sm" fill="var(--text-faint)">DELETE로 텅 빔</text>
+      </g>
+      <!-- unused blocks beyond HWM -->
+      <rect x="600" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border-soft)"/>
+      <rect x="670" y="60" width="60" height="60" rx="7" fill="none" stroke="var(--border-soft)"/>
+      <text x="665" y="97" text-anchor="middle" class="sv-label-sm" fill="var(--text-faint)">미사용</text>
+      <!-- HWM marker -->
+      <g data-show="1-3">
+        <line x1="596" y1="44" x2="596" y2="136" stroke="var(--danger)" stroke-width="3"/>
+        <text x="596" y="158" text-anchor="middle" class="sv-label" fill="var(--danger)">HWM 🌊</text>
+      </g>
+      <g data-show="2-3">
+        <text x="596" y="178" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">DELETE해도 안 내려감!</text>
+      </g>
+      <!-- full scan sweep -->
+      <g data-show="3-3">
+        <path d="M 46 220 L 580 220" stroke="var(--danger)" stroke-width="2.5" class="flow-line" marker-end="url(#arr5c)"/>
+        <text x="300" y="245" text-anchor="middle" class="sv-label" fill="var(--danger)">SELECT COUNT(*) → 빈 블록 포함 HWM까지 전부 읽음 🐢</text>
+      </g>
+      <!-- after shrink -->
+      <g data-show="4">
+        <line x1="106" y1="44" x2="106" y2="136" stroke="var(--ok)" stroke-width="3"/>
+        <text x="106" y="158" text-anchor="middle" class="sv-label" fill="var(--ok)">새 HWM ✂️</text>
+        <path d="M 46 220 L 96 220" stroke="var(--ok)" stroke-width="2.5" class="flow-line"/>
+        <text x="330" y="245" text-anchor="middle" class="sv-label" fill="var(--ok)">SHRINK/TRUNCATE 후: 1블록만 읽고 끝 🚀</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>1억 건을 INSERT해 블록 8개가 찼습니다. <b style="color:var(--danger)">HWM(수위선)</b>은 8번째 블록 뒤에 있습니다.</p>
+    <p>대청소! <code>DELETE</code>로 대부분을 지웠습니다. 블록들은 텅 비었지만 <b style="color:var(--danger)">HWM은 1mm도 내려가지 않습니다</b>. 물자국은 그대로죠.</p>
+    <p>이제 <code>SELECT COUNT(*)</code> 같은 full scan을 하면? Oracle은 <b>HWM 아래 블록을 전부</b> 읽습니다. 빈 블록도 "행이 있는지 없는지 열어봐야" 알기 때문입니다. 데이터 100건 남은 테이블의 조회가 여전히 느린 이유입니다.</p>
+    <p>해결은 수위선 자체를 내리는 것 — <code>TRUNCATE</code>(전체 비우기) 또는 <code>ALTER TABLE ... SHRINK SPACE</code>(온라인 축소). 이후 full scan은 <b style="color:var(--ok)">진짜 데이터가 있는 만큼만</b> 읽습니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 대량 DELETE 후 HWM 내리기 (온라인, 세그먼트 축소)</span>
+<span class="k">ALTER TABLE</span> emp <span class="k">ENABLE ROW MOVEMENT</span>;   <span class="c">-- 행 이동 허용 (ROWID 변경 허용)</span>
+<span class="k">ALTER TABLE</span> emp <span class="k">SHRINK SPACE</span>;          <span class="c">-- 행을 앞쪽으로 모으고 HWM 하향</span>
+
+<span class="c">-- 전부 비울 거라면 DELETE 대신 이것 — HWM이 즉시 리셋된다</span>
+<span class="k">TRUNCATE TABLE</span> emp;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">TRUNCATE는 되돌릴 수 없다</div>
+    <p>TRUNCATE는 DDL이라 undo를 거의 남기지 않고 <strong>ROLLBACK이 불가능</strong>합니다. HWM 리셋 효과만 보고 무심코 실행하면 안 됩니다. 6장에서 배울 flashback으로도 TRUNCATE된 데이터는 undo 기반으로는 복구할 수 없습니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">UPDATE로 행이 커져 블록에 들어가지 못할 때 일어나는 row migration의 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">행이 여러 블록에 걸쳐 쪼개져 저장되며, 블록 크기를 키워야만 해결된다</button>
+    <button type="button" data-correct>행 전체가 다른 블록으로 이동하고 원래 자리에는 포인터가 남으며, ROWID는 유지된다</button>
+    <button type="button">ROWID가 바뀌기 때문에 관련된 모든 인덱스가 즉시 갱신된다</button>
+    <button type="button">Oracle이 자동으로 PCTFREE를 늘려 재발을 방지한다</button>
+  </div>
+  <div class="quiz-expl">✅ row migration은 행 전체가 이사하고 원래 자리에 포인터만 남는 현상입니다. ROWID가 유지되어 인덱스는 그대로지만, 조회 시 블록을 2번 읽게 됩니다(첫 번째 보기는 row chaining의 설명). 예방은 적절한 PCTFREE 설정, 사후 정리는 ALTER TABLE MOVE + 인덱스 리빌드입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">1억 건 테이블에서 9,900만 건을 DELETE했는데 <code>SELECT COUNT(*)</code>가 여전히 느립니다. 가장 가능성 높은 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">DELETE가 아직 커밋되지 않아 락 대기가 발생해서</button>
+    <button type="button">인덱스가 삭제된 행을 계속 가리키고 있어서</button>
+    <button type="button" data-correct>HWM이 내려가지 않아 full scan이 빈 블록까지 전부 읽어서</button>
+    <button type="button">DELETE된 블록이 Buffer Cache에서 빠지지 않아서</button>
+  </div>
+  <div class="quiz-expl">✅ DELETE는 HWM을 내리지 않으므로, full scan은 여전히 HWM 아래의 (대부분 빈) 블록을 모두 읽습니다. <code>ALTER TABLE ... SHRINK SPACE</code>나 테이블 재구성(MOVE), 전량 삭제라면 TRUNCATE로 HWM을 내려야 합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/logical-storage-structures.html" target="_blank" rel="noopener">Logical Storage Structures</a> · <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/physical-storage-structures.html" target="_blank" rel="noopener">Physical Storage Structures</a> — 블록 포맷, extent 할당 알고리즘, ASSM(Automatic Segment Space Management) 등 심화 내용이 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch04.html"><span class="dir">← 이전</span><br><span class="title">4장. 백그라운드 프로세스</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch06.html"><span class="dir">다음 →</span><br><span class="title">6장. Undo와 읽기 일관성</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

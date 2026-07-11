@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8장. Shards &amp; Replicas — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch08">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>8장. Shards &amp; Replicas — 분산 아키텍처</h1>
+<p class="lead">한 대로 감당이 안 되면 나누고(Shard), 장애가 두려우면 복사한다(Replica). 그리고 그 전체를 하나의 테이블처럼 보이게 하는 Distributed 테이블 — ClickHouse 클러스터의 구조와 솔직한 한계까지 살펴봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Parts, 6장 Merges</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Shard와 Distributed 테이블 — 데이터 분산과 쿼리 라우팅 ② 분산 SELECT/INSERT의 실행 흐름과 "global query plan이 없다"는 제약 ③ ReplicatedMergeTree의 비동기 멀티마스터 복제와 Keeper의 역할 ④ 클러스터의 구조적 한계(not elastic)와 운영 주의점</p>
+  </div>
+</div>
+
+<h2 id="s1">8.1 Shard — 데이터를 나누는 단위</h2>
+
+<p>샤딩이 필요한 경우는 두 가지입니다: <strong>데이터가 단일 서버의 스토리지를 초과</strong>하거나, <strong>단일 서버의 처리 성능이 부족</strong>할 때. 샤딩은 테이블의 데이터를 여러 서버로 <strong>수평 분할</strong>합니다. 각 shard는 데이터의 부분 집합을 담은 평범한 ClickHouse 테이블이며, 독립적으로 쿼리할 수도 있습니다.</p>
+
+<pre><code>[전체 데이터]
+   ├── Shard 1 (Server A): 행 1 ~ 1000만
+   ├── Shard 2 (Server B): 행 1000만+1 ~ 2000만
+   └── Shard 3 (Server C): 행 2000만+1 ~ 3000만</code></pre>
+
+<p>그런데 개별 shard에 직접 쿼리하면 부분 데이터만 보입니다. 전체를 하나의 테이블처럼 보여주는 것이 <strong>Distributed 테이블</strong> — 데이터를 <em>전혀 저장하지 않는</em> 라우팅 레이어입니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> uk.uk_price_paid_simple_dist <span class="k">ON CLUSTER</span> test_cluster
+(
+    date   <span class="f">Date</span>,
+    town   <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    street <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    price  <span class="f">UInt32</span>
+)
+<span class="k">ENGINE</span> = <span class="f">Distributed</span>(<span class="s">'test_cluster'</span>, <span class="s">'uk'</span>, <span class="s">'uk_price_paid_simple'</span>, <span class="f">rand</span>())
+<span class="c">--                     클러스터         DB      로컬 테이블            sharding key</span></code></pre>
+
+<ul>
+  <li><strong>SELECT</strong>: 모든 shard에 쿼리를 전달하고, 결과를 수집·병합합니다.</li>
+  <li><strong>INSERT</strong>: 각 행마다 sharding key를 평가해 적절한 shard로 라우팅합니다.</li>
+</ul>
+
+<h2 id="s2">8.2 분산 SELECT — 쿼리는 어떻게 흩어지고 다시 모이는가</h2>
+
+<div class="anim" data-steps="5" data-title="Distributed 테이블의 SELECT 실행 흐름" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <defs>
+        <marker id="arr8a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr8b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- client -->
+      <g data-show="1">
+        <rect x="40" y="30" width="150" height="44" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="115" y="50" text-anchor="middle" class="sv-label" font-size="12.5">🧑‍💻 클라이언트</text>
+        <text x="115" y="66" text-anchor="middle" class="sv-label-sm sv-mono">SELECT count() ...</text>
+        <path d="M 190 52 L 280 52" class="sv-arrow flow-line" marker-end="url(#arr8a)"/>
+      </g>
+      <!-- initiator -->
+      <g data-active="1-5">
+        <rect x="285" y="24" width="230" height="56" rx="10" class="sv-box"/>
+        <text x="400" y="47" text-anchor="middle" class="sv-label" font-size="13">Initiator 노드</text>
+        <text x="400" y="66" text-anchor="middle" class="sv-label-sm sv-mono">Distributed: events_dist</text>
+      </g>
+
+      <!-- shards -->
+      <g>
+        <rect x="60" y="160" width="180" height="86" rx="10" class="sv-box"/>
+        <text x="150" y="182" text-anchor="middle" class="sv-label" font-size="12.5">Shard 1</text>
+        <text x="150" y="204" text-anchor="middle" class="sv-label-sm">Replica A ✓ / Replica B</text>
+        <rect x="310" y="160" width="180" height="86" rx="10" class="sv-box"/>
+        <text x="400" y="182" text-anchor="middle" class="sv-label" font-size="12.5">Shard 2</text>
+        <text x="400" y="204" text-anchor="middle" class="sv-label-sm">Replica A / Replica B ✓</text>
+        <rect x="560" y="160" width="180" height="86" rx="10" class="sv-box"/>
+        <text x="650" y="182" text-anchor="middle" class="sv-label" font-size="12.5">Shard 3</text>
+        <text x="650" y="204" text-anchor="middle" class="sv-label-sm">Replica A ✓ / Replica B</text>
+      </g>
+
+      <!-- step2: fan out -->
+      <g data-show="2">
+        <path d="M 330 80 Q 220 110 165 156" class="sv-arrow flow-line" marker-end="url(#arr8a)"/>
+        <path d="M 400 80 L 400 156" class="sv-arrow flow-line" marker-end="url(#arr8a)"/>
+        <path d="M 470 80 Q 580 110 635 156" class="sv-arrow flow-line" marker-end="url(#arr8a)"/>
+        <text x="640" y="110" class="sv-label-sm" fill="var(--accent)">shard마다 레플리카 1개 선택</text>
+      </g>
+
+      <!-- step3: local exec -->
+      <g data-show="3">
+        <text x="150" y="232" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">count = 150</text>
+        <text x="400" y="232" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">count = 200</text>
+        <text x="650" y="232" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">count = 180</text>
+        <text x="400" y="270" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">⚡ 각 shard가 로컬에서 독립·병렬 실행 (인덱스, granule skip 모두 로컬에서)</text>
+      </g>
+
+      <!-- step4: gather & merge -->
+      <g data-show="4">
+        <path d="M 165 160 Q 240 110 340 84" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8b)"/>
+        <path d="M 400 156 L 400 84" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8b)"/>
+        <path d="M 635 160 Q 560 110 460 84" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8b)"/>
+        <text x="555" y="130" class="sv-label-sm" fill="var(--ok)">중간 결과 수집</text>
+      </g>
+
+      <!-- step5: final -->
+      <g data-show="5" class="rise">
+        <rect x="130" y="290" width="540" height="52" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="312" text-anchor="middle" class="sv-label" font-size="13">Initiator가 병합: 150 + 200 + 180 = 530 → 클라이언트에 반환</text>
+        <text x="400" y="331" text-anchor="middle" class="sv-label-sm">"가능한 많은 작업을 원격에서, 네트워크 전송은 최소로"</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 <b>Distributed 테이블</b>에 SELECT를 보냅니다. 이 쿼리를 받은 서버가 <b>Initiator</b>가 됩니다.</p>
+    <p>Distributed 테이블이 <b>모든 shard에 쿼리를 전달</b>합니다. 각 shard에서는 레플리카 중 <b>하나만</b> 선택됩니다.</p>
+    <p>각 서버가 <b style="color:var(--warn)">로컬에서 독립적으로, 병렬로</b> 쿼리를 실행합니다. 7장의 granule skip 같은 최적화는 전부 로컬에서 일어납니다.</p>
+    <p>각 shard의 중간 결과(로컬 count)가 <b style="color:var(--ok)">Initiator로 수집</b>됩니다. 중간 결과만 전송하므로 네트워크 부담이 최소화됩니다.</p>
+    <p>Initiator가 결과를 병합해 최종 글로벌 결과(530)를 만들고 클라이언트에 반환합니다. 이것이 ClickHouse의 <b>1-pass 분산 실행</b>의 전부입니다.</p>
+  </div>
+</div>
+
+<h3>"Global Query Plan이 없다" — 가장 중요한 구조적 제약</h3>
+
+<p>공식 architecture 문서는 이렇게 솔직하게 말합니다: <em>"분산 쿼리 실행을 위한 global query plan은 없다. 각 노드는 자기 몫에 대한 로컬 플랜만 가진다. 우리는 단순한 1-pass 분산 실행만 지원한다 — 원격 노드에 쿼리를 보내고 결과를 머지할 뿐."</em> 노드 간 데이터 재분배(reshuffle)가 필요한 실행은 지원하지 않습니다.</p>
+
+<p>이 제약이 문제 되는 쿼리 유형:</p>
+
+<div class="grid g3">
+  <div class="card">
+    <h4>😵 고카디널리티 GROUP BY</h4>
+    <p><code>GROUP BY user_id</code>처럼 유니크 키가 수백만이면, 각 shard의 방대한 중간 결과가 전부 Initiator로 몰려 네트워크·메모리가 폭증합니다.</p>
+  </div>
+  <div class="card">
+    <h4>😵 대용량 분산 JOIN</h4>
+    <p>Distributed 테이블끼리 JOIN하면 한쪽 데이터를 모든 shard에 브로드캐스트해야 할 수 있습니다. 큰 테이블이면 OOM 위험.</p>
+  </div>
+  <div class="card">
+    <h4>🛠 우회 전략</h4>
+    <p>같은 sharding key로 co-locate, 작은 테이블은 Dictionary화, GLOBAL JOIN 명시, MV로 pre-aggregation.</p>
+  </div>
+</div>
+
+<h2 id="s3">8.3 분산 INSERT — sharding key가 행의 목적지를 정한다</h2>
+
+<div class="anim" data-steps="4" data-title="INSERT 라우팅 — sharding key 평가와 행 분배" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="arr8c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- step1: insert arrives -->
+      <g data-show="1">
+        <rect x="230" y="20" width="340" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="400" y="40" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">INSERT INTO events_dist VALUES</text>
+        <text x="400" y="58" text-anchor="middle" class="sv-label-sm sv-mono">(user_id=1001, ...), (user_id=1002, ...)</text>
+      </g>
+
+      <!-- step2: key evaluation -->
+      <g data-show="2">
+        <path d="M 400 66 L 400 96" class="sv-arrow flow-line" marker-end="url(#arr8c)" stroke="var(--warn)"/>
+        <rect x="200" y="100" width="400" height="64" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="400" y="124" text-anchor="middle" class="sv-label" font-size="12.5">Initiator: 행마다 sharding key 평가</text>
+        <text x="400" y="146" text-anchor="middle" class="sv-label-sm sv-mono">cityHash64(1001) % 3 = 1 → Shard 2 · cityHash64(1002) % 3 = 0 → Shard 1</text>
+      </g>
+
+      <!-- shards -->
+      <g>
+        <rect x="70" y="210" width="180" height="70" rx="10" class="sv-box"/>
+        <text x="160" y="235" text-anchor="middle" class="sv-label" font-size="12.5">Shard 1 (로컬 테이블)</text>
+        <rect x="410" y="210" width="180" height="70" rx="10" class="sv-box"/>
+        <text x="500" y="235" text-anchor="middle" class="sv-label" font-size="12.5">Shard 2 (로컬 테이블)</text>
+        <rect x="620" y="210" width="150" height="70" rx="10" class="sv-box"/>
+        <text x="695" y="235" text-anchor="middle" class="sv-label" font-size="12.5">Shard 3</text>
+      </g>
+
+      <!-- step3: rows routed -->
+      <g data-show="3">
+        <path d="M 300 164 Q 220 185 175 206" class="sv-arrow flow-line" marker-end="url(#arr8c)" stroke="var(--warn)"/>
+        <path d="M 480 164 Q 500 185 500 206" class="sv-arrow flow-line" marker-end="url(#arr8c)" stroke="var(--warn)"/>
+        <text x="160" y="262" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">+ user_1002 (새 파트)</text>
+        <text x="500" y="262" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--ok)">+ user_1001 (새 파트)</text>
+        <text x="695" y="262" text-anchor="middle" class="sv-label-sm">(해당 없음)</text>
+      </g>
+
+      <!-- step4: warning -->
+      <g data-show="4" class="rise">
+        <rect x="70" y="292" width="660" height="30" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+        <text x="400" y="312" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">⚠️ Distributed INSERT는 Initiator에 임시 저장 후 비동기 전달 — Initiator 장애 시 유실 위험 → 로컬 테이블 직접 INSERT 권장</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 Distributed 테이블에 여러 행을 INSERT합니다.</p>
+    <p>Initiator가 <b>각 행에 대해 sharding key를 평가</b>합니다: 키 값 % shard 수 = 대상 서버. <code>rand()</code>는 균등 분산, <code>cityHash64(user_id)</code> 같은 결정적 키는 같은 사용자를 같은 shard에 모아줍니다.</p>
+    <p>각 행이 계산된 대상 shard의 <b>로컬 테이블</b>로 전달되어 새 파트로 저장됩니다.</p>
+    <p>주의: 이 전달은 <b style="color:var(--danger)">Initiator에 임시 저장 후 비동기</b>로 일어납니다. Initiator 장애 시 임시 데이터가 유실될 수 있으므로, 프로덕션에서는 클라이언트가 sharding key를 직접 계산해 <b>로컬 테이블에 직접 INSERT</b>하는 것이 가장 안전합니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">Sharding key 선택과 데이터 쏠림(skew)</div>
+    <p><code>rand()</code>는 균등 분산을 보장하지만 같은 엔티티가 여러 shard에 흩어져 JOIN이 비효율적입니다. 결정적 키는 JOIN·GROUP BY에 유리하지만 특정 shard에 데이터가 쏠릴 수 있습니다. shard 간 크기 차이를 주기적으로 모니터링하세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- shard별 데이터 분포 확인 (쏠림 감지)</span>
+<span class="k">SELECT</span>
+    <span class="f">hostName</span>() <span class="k">AS</span> host,
+    <span class="f">count</span>() <span class="k">AS</span> rows,
+    <span class="f">formatReadableSize</span>(<span class="f">sum</span>(bytes_on_disk)) <span class="k">AS</span> size
+<span class="k">FROM</span> <span class="f">clusterAllReplicas</span>(<span class="s">'test_cluster'</span>, system.parts)
+<span class="k">WHERE</span> database = <span class="s">'uk'</span> <span class="k">AND</span> `table` = <span class="s">'uk_price_paid_simple'</span> <span class="k">AND</span> active
+<span class="k">GROUP BY</span> host;</code></pre>
+
+<h2 id="s4">8.4 Replica — 비동기 멀티마스터 복제</h2>
+
+<p>복제의 목적은 세 가지입니다: <strong>데이터 무결성</strong>(하드웨어 장애 시 손실 방지), <strong>페일오버</strong>(장애 시 다른 레플리카로 서비스 지속), <strong>쿼리 처리량</strong>(여러 레플리카에 읽기 분산). 각 shard 안의 모든 레플리카는 동일한 데이터를 보유하며, 복제는 <code>ReplicatedMergeTree</code> 엔진으로 구현됩니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> uk.uk_price_paid_simple <span class="k">ON CLUSTER</span> test_cluster
+(
+    date   <span class="f">Date</span>,
+    town   <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    street <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    price  <span class="f">UInt32</span>
+)
+<span class="k">ENGINE</span> = <span class="f">ReplicatedMergeTree</span>(<span class="s">'/clickhouse/tables/{shard}/uk_price_paid'</span>, <span class="s">'{replica}'</span>)
+<span class="k">ORDER BY</span> (town, street);
+<span class="c">-- 같은 Keeper 경로를 가진 테이블들이 서로의 레플리카가 된다</span></code></pre>
+
+<p>ClickHouse 복제의 세 가지 핵심 특성:</p>
+<ul>
+  <li><strong>비동기(Asynchronous)</strong>: 어느 레플리카에 INSERT되면 다른 레플리카로 비동기 복제됩니다. INSERT가 모든 레플리카의 확인을 기다리지 않습니다.</li>
+  <li><strong>멀티마스터(Multi-master)</strong>: Keeper 세션이 있는 <strong>어떤 레플리카에든 INSERT 가능</strong>. 단일 마스터 병목이 없습니다.</li>
+  <li><strong>Conflict-free</strong>: ClickHouse는 제자리 UPDATE가 없으므로(INSERT only + 머지 기반 변환) 복제 충돌 자체가 발생하지 않습니다.</li>
+</ul>
+
+<div class="anim" data-steps="5" data-title="복제 동작 — 파트 전파와 머지 조율 (물리적 복제)" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 370">
+      <defs>
+        <marker id="arr8d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+      <!-- keeper -->
+      <rect x="250" y="16" width="300" height="52" rx="10" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.8"/>
+      <text x="400" y="38" text-anchor="middle" class="sv-label" font-size="13">🗂 ClickHouse Keeper</text>
+      <text x="400" y="58" text-anchor="middle" class="sv-label-sm">복제 로그 · 리더 선출 · 체크섬</text>
+
+      <!-- replicas -->
+      <g data-active="1-1">
+        <rect x="50" y="130" width="200" height="96" rx="10" class="sv-box"/>
+        <text x="150" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Replica A</text>
+        <text x="150" y="178" text-anchor="middle" class="sv-label-sm sv-mono">[파트1] [파트2]</text>
+      </g>
+      <g data-active="1-1">
+        <rect x="300" y="130" width="200" height="96" rx="10" class="sv-box"/>
+        <text x="400" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Replica B</text>
+        <text x="400" y="178" text-anchor="middle" class="sv-label-sm sv-mono">[파트1] [파트2]</text>
+      </g>
+      <g data-active="1-1">
+        <rect x="550" y="130" width="200" height="96" rx="10" class="sv-box"/>
+        <text x="650" y="154" text-anchor="middle" class="sv-label" font-size="12.5">Replica C</text>
+        <text x="650" y="178" text-anchor="middle" class="sv-label-sm sv-mono">[파트1] [파트2]</text>
+      </g>
+
+      <!-- step2: insert to B -->
+      <g data-show="2">
+        <rect x="330" y="196" width="140" height="24" rx="6" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)"/>
+        <text x="400" y="213" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">+ 파트3 (INSERT)</text>
+        <path d="M 420 126 L 405 72" class="sv-arrow flow-line" marker-end="url(#arr8d)" stroke="var(--purple)"/>
+        <text x="470" y="100" class="sv-label-sm" fill="var(--purple)">"파트3 생성됨" 로그 기록</text>
+      </g>
+
+      <!-- step3: A, C fetch -->
+      <g data-show="3">
+        <path d="M 330 68 Q 220 90 160 126" class="sv-arrow flow-line" marker-end="url(#arr8d)" stroke="var(--purple)"/>
+        <path d="M 470 68 Q 580 90 640 126" class="sv-arrow flow-line" marker-end="url(#arr8d)" stroke="var(--purple)"/>
+        <path d="M 300 208 Q 240 214 253 208" stroke="var(--ok)" stroke-width="2" fill="none"/>
+        <rect x="80" y="196" width="140" height="24" rx="6" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)"/>
+        <text x="150" y="213" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">+ 파트3 (다운로드)</text>
+        <rect x="580" y="196" width="140" height="24" rx="6" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)"/>
+        <text x="650" y="213" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--ok)">+ 파트3 (다운로드)</text>
+      </g>
+      <g data-show="3-3">
+        <text x="400" y="250" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">쿼리가 아니라 압축된 파트 자체가 전송된다 = 물리적 복제 📦</text>
+      </g>
+
+      <!-- step4: merge coordination -->
+      <g data-show="4">
+        <text x="150" y="250" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">👑 리더: "파트1+2 머지" 로그 기록</text>
+        <rect x="80" y="260" width="640" height="30" rx="8" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)"/>
+        <text x="400" y="280" text-anchor="middle" class="sv-label-sm">세 레플리카 모두 로그를 읽고 같은 머지를 각자 독립 실행 → 파트12 생성</text>
+      </g>
+
+      <!-- step5: byte identical -->
+      <g data-show="5" class="rise">
+        <rect x="80" y="304" width="640" height="52" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="326" text-anchor="middle" class="sv-label" font-size="13">결과는 byte-identical → 머지 결과를 네트워크로 보낼 필요 없음 ✨</text>
+        <text x="400" y="346" text-anchor="middle" class="sv-label-sm">네트워크 증폭 회피 — 복제 지연이 심할 때만 머지된 파트를 전송</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>시점 T0: 세 레플리카가 동일한 파트 목록 <code>[파트1, 파트2]</code>를 갖고 있고, Keeper가 상태(파트 목록 + 체크섬)를 관리합니다.</p>
+    <p>Replica B에 INSERT가 들어와 <b>파트3</b>이 생깁니다. B는 Keeper의 <b style="color:var(--purple)">복제 로그</b>에 "파트3 생성됨"(get part) 액션을 기록합니다. 멀티마스터라 어느 레플리카든 INSERT를 받을 수 있습니다.</p>
+    <p>A와 C가 로그를 감지하고 자신의 큐에 복사한 뒤, B로부터 <b style="color:var(--ok)">압축된 파트3 자체를 다운로드</b>합니다. 쿼리 재실행이 아닌 <b>물리적 복제</b>입니다.</p>
+    <p>머지도 조율됩니다: <b style="color:var(--warn)">리더</b> 하나가 "merge parts" 액션을 로그에 기록하면, 모든 레플리카가 <b>같은 머지를 각자 독립 실행</b>합니다.</p>
+    <p>결과 파트는 모든 레플리카에서 <b>byte-identical</b> — 그래서 머지 결과를 네트워크로 전송할 필요가 없습니다(네트워크 증폭 회피). 복제 지연이 심각할 때만 예외적으로 머지된 파트를 전송합니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">일관성 복구도 Keeper 기준</div>
+    <p>각 레플리카는 로컬 파일시스템 상태를 Keeper의 참조 상태와 비교합니다. 누락·손상 파트는 다른 레플리카에서 다운로드해 복구하고, 예상치 못한 데이터는 <strong>삭제하지 않고</strong> 별도 디렉터리로 옮깁니다. 데이터 유실이 허용되지 않는 환경이라면 <code>SET insert_quorum = 2;</code>로 N개 레플리카 확인 후 INSERT를 완료하도록 할 수 있습니다(레이턴시 증가 트레이드오프).</p>
+  </div>
+</div>
+
+<h2 id="s5">8.5 클러스터의 구조적 한계 — "Not Elastic"</h2>
+
+<p>공식 문서가 스스로 인정하는 한계를 아는 것이 중요합니다.</p>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">새 shard를 추가해도 데이터는 저절로 재분배되지 않는다</div>
+    <p>"The cluster is <strong>not elastic</strong>, so after adding a new shard, data is not rebalanced between shards automatically." — 리밸런싱은 수동 작업입니다. 또한 노드 간 데이터 reshuffle을 지원하지 않아 복잡한 분산 JOIN·고카디널리티 GROUP BY에 한계가 있으며, 공식 문서는 "수십 노드까지는 괜찮지만 수백 노드에서는 심각한 단점"이라고 명시합니다.</p>
+  </div>
+</div>
+
+<p>ClickHouse Cloud는 이 한계를 다른 아키텍처로 우회합니다: 오브젝트 스토리지 기반 <strong>SharedMergeTree</strong>가 레플리카를 대체해 고가용성을 확보하고, <strong>Parallel Replicas</strong>가 전통적 shard처럼 동작합니다.</p>
+
+<h3>ClickHouse Keeper 운영 요점</h3>
+
+<ul>
+  <li>Keeper는 ZooKeeper의 ClickHouse 네이티브 대체품으로, <code>ReplicatedMergeTree</code>·<code>ON CLUSTER</code> DDL·분산 <code>INSERT ... SELECT</code>에 필수입니다.</li>
+  <li>과반수 합의를 위해 <strong>홀수 노드</strong>(3, 5, 7)로 구성하세요.</li>
+  <li>Keeper 장애 시 <strong>INSERT와 머지는 중단</strong>되지만, <strong>SELECT는 정상 동작</strong>합니다 (읽기는 Keeper에 의존하지 않음).</li>
+</ul>
+
+<pre><code><span class="c">-- 복제 지연(replication lag) 모니터링</span>
+<span class="k">SELECT</span>
+    database, `table`, replica_name, is_leader,
+    absolute_delay,      <span class="c">-- 최신 레플리카 대비 지연(초)</span>
+    queue_size,
+    inserts_in_queue,    <span class="c">-- 높으면: 네트워크/파트 다운로드 병목</span>
+    merges_in_queue      <span class="c">-- 높으면: 머지 스레드 부족</span>
+<span class="k">FROM</span> system.replicas
+<span class="k">WHERE</span> absolute_delay &gt; <span class="n">0</span>
+<span class="k">ORDER BY</span> absolute_delay <span class="k">DESC</span>;</code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">Distributed 테이블에 대한 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">모든 shard 데이터의 전체 복사본을 저장한다</button>
+    <button type="button" data-correct>데이터를 저장하지 않는 라우팅 레이어로, SELECT를 shard들에 전달하고 INSERT를 sharding key로 분배한다</button>
+    <button type="button">각 shard의 primary index만 모아서 저장한다</button>
+    <button type="button">레플리카 간 데이터 동기화를 담당한다</button>
+  </div>
+  <div class="quiz-expl">✅ Distributed 테이블은 로컬 테이블들에 대한 "view"일 뿐 데이터를 자체 저장하지 않습니다. SELECT는 모든 shard(각각 레플리카 1개 선택)에 전달 후 결과를 병합하고, INSERT는 행마다 sharding key를 평가해 라우팅합니다. 레플리카 동기화는 ReplicatedMergeTree + Keeper의 몫입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">레플리카 간 머지가 네트워크 전송 없이 동기화될 수 있는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">머지 결과를 리더가 모든 레플리카에 브로드캐스트하기 때문</button>
+    <button type="button" data-correct>모든 레플리카가 복제 로그의 같은 머지 액션을 읽고 각자 독립 실행하며, 결과가 byte-identical이기 때문</button>
+    <button type="button">머지는 리더 레플리카에서만 일어나고 나머지는 읽기 전용이기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 리더가 Keeper의 복제 로그에 "merge parts" 액션을 기록하면 각 레플리카가 동일한 머지를 독립적으로 수행합니다. 결과 파트가 byte-identical하므로 전송이 불필요해 네트워크 증폭을 회피합니다. 대용량 머지 파트는 복제 지연이 심각할 때만 예외적으로 전송됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch08_shards_replicas.md" target="_blank" rel="noopener">chapters/ch08_shards_replicas.md</a> — INSERT quorum, 분산 안티패턴별 해결책, Keeper 모니터링 상세가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch07.html"><span class="dir">← 이전</span><br><span class="title">7장. Primary Index</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch09.html"><span class="dir">다음 →</span><br><span class="title">9장. INSERT 전략</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

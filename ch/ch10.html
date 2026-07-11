@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10장. 안티패턴 모음 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch10">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>10장. 피해야 할 패턴들 — 안티패턴 모음</h1>
+<p class="lead">MySQL·PostgreSQL에서 하던 습관을 ClickHouse에 그대로 가져오는 순간 성능은 무너집니다. 공식 best-practices가 명시적으로 경고하는 7가지 안티패턴을 "왜 위험한지"부터 대안까지 정리합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 22분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 5~9장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Mutation(ALTER UPDATE/DELETE)이 파트 전체를 다시 쓰는 이유와 대안 ② OPTIMIZE FINAL이 안전 제한까지 무시하는 위험한 명령인 이유 ③ Nullable·과도한 파티셔닝·소량 INSERT 등 자잘하지만 치명적인 습관들 ④ 안티패턴 → 대안 매핑 총정리</p>
+  </div>
+</div>
+
+<h2 id="s1">10.1 Mutation 남용 — ALTER TABLE UPDATE/DELETE</h2>
+
+<p>ClickHouse에도 <code>ALTER TABLE ... UPDATE / DELETE</code> 구문이 있습니다. SQL 문법은 낯익지만, 내부 동작은 OLTP DB와 <strong>근본적으로 다릅니다</strong>. 공식 문서의 표현: <em>"행을 제자리에서 수정하는 대신, mutation은 변경의 영향을 받는 데이터 파트 전체를 다시 쓰는 비동기 백그라운드 프로세스다."</em></p>
+
+<p>4장에서 배운 대로 파트는 불변(immutable)입니다. 그래서 <strong>단 한 행을 고치려 해도 그 행이 든 파트 전체를 재작성</strong>해야 합니다.</p>
+
+<div class="anim" data-steps="4" data-title="Mutation의 실체 — 행 1개 수정 = 파트 전체 재작성" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 330">
+      <defs>
+        <marker id="arr10a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--danger)"/>
+        </marker>
+      </defs>
+      <!-- step1: parts with one target row -->
+      <g data-show="1">
+        <text x="20" y="26" class="sv-label-sm">테이블 = 파트 3개 (각 1,000만 행)</text>
+        <rect x="20" y="40" width="200" height="90" rx="9" class="sv-box"/>
+        <text x="120" y="64" text-anchor="middle" class="sv-label-sm sv-mono">part_1 (10M rows)</text>
+        <rect x="240" y="40" width="200" height="90" rx="9" class="sv-box"/>
+        <text x="340" y="64" text-anchor="middle" class="sv-label-sm sv-mono">part_2 (10M rows)</text>
+        <rect x="40" y="80" width="160" height="22" rx="5" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)"/>
+        <text x="120" y="96" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--warn)">user_id=123 ← 이 한 행만!</text>
+        <rect x="460" y="40" width="200" height="90" rx="9" class="sv-box"/>
+        <text x="560" y="64" text-anchor="middle" class="sv-label-sm sv-mono">part_3 (10M rows)</text>
+      </g>
+
+      <!-- step2: mutation submitted -->
+      <g data-show="2">
+        <rect x="150" y="150" width="480" height="36" rx="8" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="390" y="174" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">ALTER TABLE t UPDATE status='inactive' WHERE user_id=123</text>
+        <text x="700" y="174" class="sv-label-sm" fill="var(--danger)">← 비동기 큐로</text>
+      </g>
+
+      <!-- step3: whole part rewrite -->
+      <g data-show="3">
+        <path d="M 120 130 Q 120 190 160 224" class="sv-arrow flow-line" marker-end="url(#arr10a)" stroke="var(--danger)"/>
+        <rect x="60" y="228" width="280" height="64" rx="9" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="200" y="252" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">part_1 전체(1,000만 행) 재작성 🔥</text>
+        <text x="200" y="274" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">압축 해제 → 수정 → 재압축 → 재기록</text>
+        <text x="480" y="252" class="sv-label-sm" fill="var(--danger)">행 1개 ÷ 1,000만 행</text>
+        <text x="480" y="272" class="sv-label-sm" fill="var(--danger)">= 엄청난 write amplification</text>
+      </g>
+
+      <!-- step4: alternative -->
+      <g data-show="4" class="rise">
+        <rect x="60" y="300" width="660" height="26" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="390" y="318" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✅ 대안: ReplacingMergeTree에 새 행 INSERT — 가볍고, 머지가 나중에 정리해 준다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>1,000만 행짜리 파트 3개로 이뤄진 테이블. 수정하고 싶은 것은 part_1의 <b style="color:var(--warn)">단 한 행</b>(user_id=123)입니다.</p>
+    <p><code>ALTER TABLE ... UPDATE</code>를 제출합니다. 이 명령은 즉시 완료되지 않고 <b style="color:var(--danger)">비동기 백그라운드 큐</b>에 들어갑니다. 롤백은 불가능하고(<code>KILL MUTATION</code>으로 취소만 가능), 서버를 재시작해도 큐에 남아 계속 실행됩니다.</p>
+    <p>파트는 불변이므로 <b style="color:var(--danger)">part_1의 1,000만 행 전체를 압축 해제 → 수정 → 재압축 → 재기록</b>합니다. 행 1개 때문에 파트 하나를 통째로 다시 쓰는 극단적인 write amplification! 진행 중에는 SELECT가 mutated + unmutated 파트의 혼합을 읽을 수도 있습니다.</p>
+    <p>대안: <b style="color:var(--ok)">ReplacingMergeTree에 새 행을 INSERT</b>하면 끝. 쓰기는 가볍고, 중복 정리는 백그라운드 머지가 처리합니다(6장). 대량 삭제라면 파티션 DROP, 가벼운 삭제라면 Lightweight Delete를 쓰세요.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 피하라: 행 몇 개 때문에 파트 전체 재작성</span>
+<span class="k">ALTER TABLE</span> mytable <span class="k">UPDATE</span> status = <span class="s">'inactive'</span> <span class="k">WHERE</span> user_id = <span class="n">123</span>;
+<span class="k">ALTER TABLE</span> mytable <span class="k">DELETE WHERE</span> date &lt; <span class="s">'2023-01-01'</span>;
+
+<span class="c">-- 대안 1: ReplacingMergeTree에 새 행 INSERT (UPDATE 대체)</span>
+<span class="k">INSERT INTO</span> mytable <span class="k">VALUES</span> (<span class="n">123</span>, <span class="s">'inactive'</span>, <span class="f">now</span>());
+
+<span class="c">-- 대안 2: Lightweight Delete — 파트를 다시 쓰지 않고 마스크 파일로 처리</span>
+<span class="k">DELETE FROM</span> mytable <span class="k">WHERE</span> user_id = <span class="n">123</span>;
+
+<span class="c">-- 대안 3: 대량 삭제는 파티션 단위로 (초 단위 완료)</span>
+<span class="k">ALTER TABLE</span> mytable <span class="k">DROP PARTITION</span> <span class="s">'2022-01-01'</span>;</code></pre>
+
+<h2 id="s2">10.2 OPTIMIZE TABLE FINAL 남용</h2>
+
+<p><code>OPTIMIZE TABLE ... FINAL</code>은 모든 활성 파트를 <strong>하나의 파트로 강제 머지</strong>하는 명령입니다. "머지를 빨리 끝내면 좋은 것 아닌가?"라고 생각하기 쉽지만, 공식 문서가 별도 문서("Avoid OPTIMIZE FINAL")로 경고하는 대표 안티패턴입니다.</p>
+
+<div class="anim" data-steps="4" data-title="OPTIMIZE FINAL — 안전 제한을 무시하는 강제 머지" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 330">
+      <!-- step1: healthy background merges -->
+      <g data-show="1">
+        <text x="20" y="26" class="sv-label-sm">평상시: 백그라운드 머지는 안전 제한을 지킨다</text>
+        <rect x="30" y="40" width="150" height="46" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="105" y="60" text-anchor="middle" class="sv-label-sm sv-mono">part (120GB)</text>
+        <text x="105" y="78" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 머지 대상 제외</text>
+        <rect x="200" y="40" width="150" height="46" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="275" y="60" text-anchor="middle" class="sv-label-sm sv-mono">part (150GB)</text>
+        <text x="275" y="78" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✓ 상한 도달</text>
+        <rect x="370" y="40" width="110" height="46" rx="8" class="sv-box"/>
+        <text x="425" y="68" text-anchor="middle" class="sv-label-sm sv-mono">작은 파트들</text>
+        <text x="620" y="58" class="sv-label-sm sv-mono">max_bytes_to_merge_</text>
+        <text x="620" y="76" class="sv-label-sm sv-mono">at_max_space ≈ 150GB</text>
+      </g>
+
+      <!-- step2: OPTIMIZE FINAL issued -->
+      <g data-show="2">
+        <rect x="200" y="110" width="380" height="36" rx="8" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8"/>
+        <text x="390" y="134" text-anchor="middle" class="sv-label sv-mono" font-size="13" fill="var(--danger)">OPTIMIZE TABLE mytable FINAL;</text>
+        <text x="620" y="134" class="sv-label-sm" fill="var(--danger)">← 150GB 제한 무시!</text>
+      </g>
+
+      <!-- step3: resource explosion -->
+      <g data-show="3">
+        <rect x="80" y="166" width="620" height="70" rx="10" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-dasharray="6 4" class="blink"/>
+        <text x="390" y="192" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">모든 파트 압축 해제 → 병합 → 재압축 → 재기록</text>
+        <text x="390" y="216" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">CPU·디스크 I/O 폭증 🔥 일시적으로 디스크 2배 필요 · 장시간 점유 · OOM 위험</text>
+      </g>
+
+      <!-- step4: giant part aftermath -->
+      <g data-show="4" class="rise">
+        <rect x="130" y="256" width="520" height="40" rx="9" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="390" y="281" text-anchor="middle" class="sv-label" font-size="12.5">거대 단일 파트 (300GB+) — 이후 머지에도 짐이 된다</text>
+        <text x="390" y="318" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✅ 결론: 파트 관리는 백그라운드 머지에 맡겨라. 수동 개입은 거의 항상 유해하다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>평상시 백그라운드 머지는 <code>max_bytes_to_merge_at_max_space_in_pool</code>(약 150GB) 제한을 지킵니다. 상한에 도달한 파트는 더 이상 머지 대상이 되지 않아 시스템이 안정적으로 유지됩니다.</p>
+    <p><code>OPTIMIZE TABLE ... FINAL</code>이 실행되면 이 <b style="color:var(--danger)">안전 제한을 무시</b>하고 모든 활성 파트를 하나로 합치려 시도합니다 — 이미 150GB인 파트들까지도.</p>
+    <p>전체 테이블 데이터를 압축 해제 → 병합 → 재압축 → 재기록하므로 <b style="color:var(--danger)">CPU와 I/O가 폭증</b>하고, 원본+결과가 공존해 디스크가 일시적으로 2배 필요하며, 장시간 머지·OOM으로 이어질 수 있습니다.</p>
+    <p>남는 것은 거대 단일 파트 — 이후 머지에도 부담이고, ReplacingMergeTree에서는 오히려 중복이 누적되는 상황도 생깁니다. <b style="color:var(--ok)">백그라운드 머지에 맡기는 것</b>이 거의 항상 정답입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">OPTIMIZE FINAL ≠ SELECT ... FINAL</div>
+    <p>혼동 주의! <code>OPTIMIZE TABLE ... FINAL</code>은 <strong>물리적으로 파트를 병합</strong>하는 명령(피해야 함)이고, <code>SELECT ... FINAL</code>은 <strong>쿼리 시점에 머지 로직을 적용</strong>하는 키워드입니다. 후자는 프라이머리 키 필터가 있으면 성능이 괜찮을 수 있어, 필요하면 사용할 수 있습니다(6장 참조).</p>
+  </div>
+</div>
+
+<h2 id="s3">10.3 나머지 안티패턴 — 습관이 부르는 성능 저하</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🗂 과도한 파티셔닝</h4>
+    <p>파티션 간에는 머지가 일어나지 않으므로 파티션이 많을수록 파트 수가 폭증합니다. <strong>파티션 수는 1,000~10,000 이하</strong>로 유지하고, 파티션 키가 프라이머리 키에 이미 있다면 중복 효과일 뿐입니다. 쿼리 최적화 목적이라면 대부분 <strong>파티셔닝하지 않는 것이 낫습니다</strong>(5장).</p>
+  </div>
+  <div class="card">
+    <h4>❓ Nullable 컬럼 남용</h4>
+    <p><code>Nullable(T)</code>는 내부적으로 <strong>별도의 UInt8 컬럼</strong>(NULL 마스크)을 추가로 만듭니다. 스토리지가 늘고 모든 연산에 추가 컬럼 처리가 붙어 <strong>거의 항상 성능이 저하</strong>됩니다. 비즈니스상 NULL이 꼭 필요하지 않다면 <code>DEFAULT 0</code> 같은 기본값으로 회피하세요.</p>
+  </div>
+  <div class="card">
+    <h4>💧 소량 빈번 INSERT</h4>
+    <p>INSERT마다 파트가 생겨 초당 수백 회면 파트 폭증 → <code>parts_to_throw_insert</code>(기본 3000) 초과 시 INSERT 거부. <strong>10,000~100,000행 배치</strong> 또는 async insert로 해결합니다(9장).</p>
+  </div>
+  <div class="card">
+    <h4>📮 Distributed 테이블에 직접 INSERT</h4>
+    <p>Initiator에 임시 저장 후 비동기 전달되므로 장애 시 유실 위험 + 추가 네트워크 홉. <strong>로컬 테이블(ReplicatedMergeTree)에 직접 INSERT</strong>하고 라우팅은 클라이언트/로드밸런서에 맡기세요(8장).</p>
+  </div>
+  <div class="card">
+    <h4>🔤 LowCardinality 미사용</h4>
+    <p>고유값이 수천 이하인 String 컬럼은 <code>LowCardinality(String)</code>으로! 딕셔너리 인코딩이 적용되어 스토리지와 쿼리 성능이 모두 크게 향상됩니다.</p>
+  </div>
+  <div class="card">
+    <h4>📏 과도하게 넓은 타입</h4>
+    <p><code>UInt16</code>이면 충분한데 습관적으로 <code>Int64</code>를 쓰지 마세요. 컬럼 지향 스토리지에서 타입 크기는 디스크·메모리 소비에 직결됩니다. 일 단위면 <code>Date</code>(2B), 꼭 필요할 때만 <code>DateTime</code>(4B)/<code>DateTime64</code>(8B).</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 피하라: Nullable + 넓은 타입 + 일반 String</span>
+<span class="k">CREATE TABLE</span> t_bad (
+    x    <span class="f">Int64</span>,
+    y    <span class="f">Nullable</span>(<span class="f">Int8</span>),
+    town <span class="f">String</span>,
+    ts   <span class="f">DateTime64</span>
+) <span class="k">ENGINE</span> = MergeTree <span class="k">ORDER BY</span> x;
+
+<span class="c">-- 권장: 적정 타입 + DEFAULT + LowCardinality + Date</span>
+<span class="k">CREATE TABLE</span> t_good (
+    x    <span class="f">UInt16</span>,
+    y    <span class="f">Int8</span> <span class="k">DEFAULT</span> <span class="n">0</span>,
+    town <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    d    <span class="f">Date</span>
+) <span class="k">ENGINE</span> = MergeTree <span class="k">ORDER BY</span> x;</code></pre>
+
+<h2 id="s4">10.4 총정리 — 안티패턴 → 대안 매핑</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>안티패턴</th><th>문제</th><th>대안</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Mutation (ALTER UPDATE/DELETE)</strong></td><td>파트 전체 재작성 → I/O 폭증</td><td>ReplacingMergeTree, Lightweight Delete, 파티션 DROP</td></tr>
+    <tr><td><strong>OPTIMIZE FINAL</strong></td><td>모든 파트 강제 병합, 150GB 안전 제한 무시</td><td>백그라운드 머지에 위임</td></tr>
+    <tr><td><strong>과도한 파티셔닝</strong></td><td>파티션 간 머지 불가 → Too many parts</td><td>저카디널리티 파티션 키, 1,000개 이하</td></tr>
+    <tr><td><strong>Nullable 컬럼</strong></td><td>추가 UInt8 마스크 컬럼 → 스토리지·성능 저하</td><td>DEFAULT 값 사용</td></tr>
+    <tr><td><strong>소량 빈번 INSERT</strong></td><td>파트 폭증 → 머지 지연 → INSERT 거부</td><td>배칭(1만~10만 행), async insert</td></tr>
+    <tr><td><strong>Distributed INSERT</strong></td><td>Initiator 임시 저장 → 장애 시 유실</td><td>로컬 테이블 직접 INSERT</td></tr>
+    <tr><td><strong>부적절한 타입</strong></td><td>불필요한 스토리지·메모리 소비</td><td>LowCardinality, 적정 크기 타입, Date</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">관통하는 원칙 하나</div>
+    <p>모든 안티패턴의 뿌리는 같습니다 — <strong>"파트는 불변이고, 무거운 처리는 백그라운드 머지의 몫"</strong>이라는 설계를 거스르는 것. 제자리 수정(mutation), 수동 머지(OPTIMIZE FINAL), 파트 남발(소량 INSERT·과도한 파티셔닝)은 전부 이 원칙과의 충돌입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q"><code>ALTER TABLE mytable UPDATE status='x' WHERE user_id=123</code>으로 단 한 행을 수정하면 내부에서 일어나는 일은?</div>
+  <div class="quiz-opts">
+    <button type="button">해당 행만 제자리에서 즉시 덮어쓴다</button>
+    <button type="button">해당 행에 삭제 표시만 하고 새 행을 추가한다</button>
+    <button type="button" data-correct>그 행이 포함된 파트 전체를 비동기적으로 다시 쓴다</button>
+    <button type="button">트랜잭션 롤백을 위해 undo 로그를 먼저 기록한다</button>
+  </div>
+  <div class="quiz-expl">✅ 파트는 불변이므로 mutation은 영향받는 파트 전체를 재작성하는 비동기 백그라운드 프로세스입니다. 행 1개를 위해 수천만 행을 다시 쓸 수 있고, 롤백도 불가능합니다(KILL MUTATION으로 취소만 가능). UPDATE가 필요하면 ReplacingMergeTree + 새 행 INSERT 패턴을 쓰세요.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">OPTIMIZE TABLE FINAL이 일반 백그라운드 머지보다 더 위험한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">머지 결과가 레플리카에 복제되지 않기 때문</button>
+    <button type="button" data-correct>~150GB 머지 상한 같은 안전 제한을 무시하고 모든 파트를 하나로 강제 병합하기 때문</button>
+    <button type="button">SELECT ... FINAL 쿼리를 전부 차단하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 일반 머지는 <code>max_bytes_to_merge_at_max_space_in_pool</code>(~150GB) 제한을 준수하지만 OPTIMIZE FINAL은 이를 무시합니다. 전체 데이터를 다시 쓰면서 CPU·I/O 폭증, 일시적 2배 디스크, OOM 위험을 만들고, 결과로 남은 거대 파트는 이후 머지에도 부담이 됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch10_anti_patterns.md" target="_blank" rel="noopener">chapters/ch10_anti_patterns.md</a> — mutation의 totally-ordered 특성, Lightweight Delete 동작 방식 등 상세 내용이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch09.html"><span class="dir">← 이전</span><br><span class="title">9장. INSERT 전략</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch11.html"><span class="dir">다음 →</span><br><span class="title">11장. 모니터링과 트러블슈팅</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

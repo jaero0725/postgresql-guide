@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6장. Part Merges — 백그라운드 머지 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch06">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>6장. Part Merges — 백그라운드 머지의 동작 원리</h1>
+<p class="lead">INSERT는 가볍게, 무거운 일은 나중에 몰아서 — ClickHouse가 "Merge-time Computation"이라 부르는 이 전략의 심장부, 백그라운드 머지를 단계별로 들여다봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Parts, 5장 Partitions</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 왜 백그라운드 머지가 필수인가 ② 머지의 4단계(압축 해제 → 병합 → 인덱싱 → 압축 저장)와 머지 레벨 계층 ③ ReplacingMergeTree 등 엔진별로 달라지는 머지의 실체 ④ "머지 시점은 제어할 수 없다"가 운영에 갖는 의미와 FINAL·OPTIMIZE의 함정</p>
+  </div>
+</div>
+
+<h2 id="s1">6.1 왜 머지가 필요한가</h2>
+
+<p>4장에서 배웠듯이 ClickHouse는 <strong>INSERT 한 번마다 불변(immutable) 파트를 하나씩</strong> 만듭니다. 파트는 한번 쓰이면 절대 수정되지 않죠. 그런데 이대로 방치하면 어떻게 될까요? 파트가 수천, 수만 개로 늘어나고, SELECT 쿼리는 그 파트를 <em>전부 열어서</em> 읽어야 합니다. 파일을 여는 비용, 인덱스를 각각 확인하는 비용이 눈덩이처럼 불어납니다.</p>
+
+<p>그래서 ClickHouse는 백그라운드에서 <strong>작은 파트들을 끊임없이 큰 파트로 합칩니다</strong>. 공식 문서는 이 설계를 두 문장으로 요약합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">공식 문서 요약</div>
+    <p>"① Inserts create sorted, immutable data parts. ② All data processing is offloaded to background part merges. — This makes data writes lightweight and highly efficient."</p>
+  </div>
+</div>
+
+<p>즉 머지는 단순한 청소부가 아닙니다. <strong>파트 수 제어</strong> + <strong>엔진별 데이터 처리(중복 제거, 집계 등)</strong>라는 두 가지 임무를 수행하는, ClickHouse 성능 철학의 핵심 장치입니다. 머지는 파티션 단위로 일어나며, 압축 크기가 약 <strong>150GB</strong>(<code>max_bytes_to_merge_at_max_space_in_pool</code>)에 도달한 파트는 더 이상 머지 대상이 되지 않습니다.</p>
+
+<h2 id="s2">6.2 머지 트리 — 작은 파트가 큰 파트로 수렴하는 과정</h2>
+
+<p>파트가 머지를 거칠 때마다 이름 끝의 <strong>merge level</strong>이 1씩 증가합니다. INSERT 직후의 파트는 level 0, 한 번 머지되면 level 1, 다시 머지되면 level 2… 이렇게 시간이 지나며 <strong>계층 구조(트리)</strong>가 만들어집니다. 이것이 <strong>MergeTree</strong>라는 이름의 유래입니다.</p>
+
+<div class="anim" data-steps="5" data-title="머지 트리 — 작은 파트들이 단계적으로 큰 파트로 수렴한다" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 350">
+      <defs>
+        <marker id="arr6a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <text x="20" y="26" class="sv-label-sm">level 0 (INSERT 직후)</text>
+      <text x="20" y="150" class="sv-label-sm">level 1 (1회 머지)</text>
+      <text x="20" y="256" class="sv-label-sm">level 2 (최종 수렴)</text>
+      <line x1="20" y1="130" x2="760" y2="130" class="sv-line" stroke-dasharray="3 7" opacity=".4"/>
+      <line x1="20" y1="236" x2="760" y2="236" class="sv-line" stroke-dasharray="3 7" opacity=".4"/>
+
+      <!-- step1: 3 level-0 parts -->
+      <g data-show="1">
+        <rect x="60" y="42" width="96" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="108" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_0_0_0</text>
+        <rect x="170" y="42" width="96" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="218" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_1_1_0</text>
+        <rect x="280" y="42" width="96" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="328" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_2_2_0</text>
+      </g>
+
+      <!-- step2: merge worker picks them -->
+      <g data-show="2">
+        <path d="M 108 80 Q 130 120 180 158" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <path d="M 218 80 L 218 156" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <path d="M 328 80 Q 306 120 256 158" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <text x="440" y="66" class="sv-label-sm" fill="var(--warn)">⚙️ 백그라운드 머지 스레드가 3개를 선택</text>
+      </g>
+
+      <!-- step3: level 1 part appears, originals dimmed -->
+      <g data-show="3" class="rise">
+        <rect x="120" y="160" width="196" height="40" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="218" y="185" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">all_0_2_1 (level 1)</text>
+      </g>
+      <g data-show="3">
+        <rect x="60" y="42" width="316" height="36" rx="7" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="395" y="65" class="sv-label-sm" fill="var(--danger)">← inactive (8분 후 삭제)</text>
+      </g>
+
+      <!-- step4: new inserts, second level-1 -->
+      <g data-show="4">
+        <rect x="440" y="42" width="88" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="484" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_3_3_0</text>
+        <rect x="540" y="42" width="88" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="584" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_4_4_0</text>
+        <rect x="640" y="42" width="88" height="36" rx="7" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="684" y="65" text-anchor="middle" class="sv-label-sm sv-mono">all_5_5_0</text>
+        <path d="M 484 80 Q 510 120 550 158" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <path d="M 584 80 L 584 156" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <path d="M 684 80 Q 660 120 620 158" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <rect x="486" y="160" width="196" height="40" rx="8" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="584" y="185" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">all_3_5_1 (level 1)</text>
+      </g>
+
+      <!-- step5: final level 2 -->
+      <g data-show="5">
+        <path d="M 218 200 Q 260 240 330 264" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+        <path d="M 584 200 Q 540 240 470 264" class="sv-arrow flow-line" marker-end="url(#arr6a)"/>
+      </g>
+      <g data-show="5" class="rise">
+        <rect x="270" y="268" width="260" height="46" rx="9" fill="color-mix(in srgb, var(--ch) 18%, transparent)" stroke="var(--warn)" stroke-width="2"/>
+        <text x="400" y="290" text-anchor="middle" class="sv-label sv-mono" font-size="13">all_0_5_2 (level 2)</text>
+        <text x="400" y="307" text-anchor="middle" class="sv-label-sm">추가 INSERT가 없으면 결국 하나로 수렴 🌲</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>INSERT 3번 → <b>level 0 파트 3개</b>가 생깁니다. 이 시점에 SELECT 하면 파트 3개를 전부 열어 읽어야 합니다.</p>
+    <p>백그라운드 <b>머지 스레드</b>가 작은 파트 3개를 다음 머지 대상으로 선택해 메모리에 로드합니다.</p>
+    <p>병합 결과로 <b style="color:var(--ok)">all_0_2_1 (level 1)</b>이 생성됩니다. 원본 파트 3개는 <b style="color:var(--danger)">inactive로 마킹</b>되고 <code>old_parts_lifetime</code>(기본 8분) 후 삭제됩니다.</p>
+    <p>INSERT는 계속 들어오고, 새 level 0 파트들도 같은 방식으로 <b>또 다른 level 1 파트</b>로 합쳐집니다.</p>
+    <p>level 1 파트들끼리 다시 머지되어 <b>level 2</b>가 됩니다. 파티셔닝이 없다면 결국 파트 하나로 수렴 — 이 계층 구조가 <b>MergeTree</b>라는 이름의 유래입니다.</p>
+  </div>
+</div>
+
+<p>실제 <code>system.parts</code>에서 이 수렴 과정을 관찰할 수 있습니다.</p>
+
+<pre><code><span class="c">-- 초기: 24개 파트가 4개로 머지된 상태 (level 1)</span>
+   ┌─name────────┬─level─┬────rows─┐
+1. │ all_0_5_1   │     <span class="n">1</span> │ <span class="n">6368414</span> │
+2. │ all_12_17_1 │     <span class="n">1</span> │ <span class="n">6442494</span> │
+3. │ all_18_23_1 │     <span class="n">1</span> │ <span class="n">5977762</span> │
+4. │ all_6_11_1  │     <span class="n">1</span> │ <span class="n">6459763</span> │
+   └─────────────┴───────┴─────────┘
+
+<span class="c">-- 시간 경과 후: 하나로 최종 수렴 (level 2)</span>
+   ┌─name───────┬─level─┬─────rows─┐
+1. │ all_0_23_2 │     <span class="n">2</span> │ <span class="n">25248433</span> │
+   └────────────┴───────┴──────────┘</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">level 0 파트가 많다 = 머지가 밀리고 있다</div>
+    <p><code>system.parts</code>에서 <code>level = 0</code>인 파트의 비율이 높으면, INSERT 속도를 머지가 따라잡지 못하고 있다는 신호입니다. 11장 모니터링에서 이 지표를 경보로 활용합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">6.3 머지 한 번의 내부 — 4단계 파이프라인</h2>
+
+<p>머지 스레드 하나가 파트 몇 개를 골라 합칠 때, 내부적으로는 항상 같은 4단계를 거칩니다. 압축된 컬럼 파일을 풀고 → 정렬 순서를 유지하며 합치고 → 새 인덱스를 만들고 → 다시 압축해 저장하는 흐름입니다.</p>
+
+<div class="anim" data-steps="5" data-title="머지의 4단계 — 압축 해제 → 병합 → 인덱싱 → 압축 저장" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="arr6b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- source parts on disk -->
+      <text x="20" y="26" class="sv-label-sm">💾 디스크 (압축된 파트들)</text>
+      <rect x="20" y="40" width="120" height="90" rx="9" class="sv-box"/>
+      <text x="80" y="62" text-anchor="middle" class="sv-label-sm sv-mono">all_0_0_0</text>
+      <text x="80" y="80" text-anchor="middle" class="sv-label-sm sv-mono">col.bin 🗜️</text>
+      <rect x="20" y="145" width="120" height="90" rx="9" class="sv-box"/>
+      <text x="80" y="167" text-anchor="middle" class="sv-label-sm sv-mono">all_1_1_0</text>
+      <text x="80" y="185" text-anchor="middle" class="sv-label-sm sv-mono">col.bin 🗜️</text>
+
+      <!-- step1: decompress & load -->
+      <g data-show="1">
+        <path d="M 140 85 Q 190 100 230 118" class="sv-arrow flow-line" marker-end="url(#arr6b)" stroke="var(--warn)"/>
+        <path d="M 140 190 Q 190 175 230 152" class="sv-arrow flow-line" marker-end="url(#arr6b)" stroke="var(--warn)"/>
+        <rect x="235" y="95" width="150" height="86" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="310" y="120" text-anchor="middle" class="sv-label" font-size="12.5">① 압축 해제 &amp; 로드</text>
+        <text x="310" y="140" text-anchor="middle" class="sv-label-sm">column.bin을 풀어</text>
+        <text x="310" y="157" text-anchor="middle" class="sv-label-sm">메모리에 올림</text>
+      </g>
+
+      <!-- step2: merging -->
+      <g data-show="2">
+        <path d="M 385 138 L 425 138" class="sv-arrow flow-line" marker-end="url(#arr6b)" stroke="var(--warn)"/>
+        <rect x="430" y="95" width="150" height="86" rx="9" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="505" y="120" text-anchor="middle" class="sv-label" font-size="12.5">② 병합 (merge sort)</text>
+        <text x="505" y="140" text-anchor="middle" class="sv-label-sm">sorting key 순서 유지</text>
+        <text x="505" y="157" text-anchor="middle" class="sv-label-sm">+ 엔진별 처리</text>
+      </g>
+
+      <!-- step3: indexing -->
+      <g data-show="3">
+        <path d="M 580 138 L 620 138" class="sv-arrow flow-line" marker-end="url(#arr6b)" stroke="var(--warn)"/>
+        <rect x="625" y="95" width="150" height="86" rx="9" fill="color-mix(in srgb, var(--purple) 14%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="700" y="120" text-anchor="middle" class="sv-label" font-size="12.5">③ 인덱싱</text>
+        <text x="700" y="140" text-anchor="middle" class="sv-label-sm">새 sparse index +</text>
+        <text x="700" y="157" text-anchor="middle" class="sv-label-sm">mark·checksum 재생성</text>
+      </g>
+
+      <!-- step4: compress & store -->
+      <g data-show="4">
+        <path d="M 700 181 Q 690 230 620 252" class="sv-arrow flow-line" marker-end="url(#arr6b)" stroke="var(--warn)"/>
+        <rect x="380" y="235" width="230" height="66" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="495" y="260" text-anchor="middle" class="sv-label" font-size="12.5">④ 압축 &amp; 저장</text>
+        <text x="495" y="280" text-anchor="middle" class="sv-label-sm sv-mono">새 디렉터리 all_0_1_1 = 새 파트</text>
+      </g>
+
+      <!-- step5: cleanup -->
+      <g data-show="5">
+        <rect x="14" y="34" width="132" height="207" rx="10" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="80" y="262" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">inactive 마킹</text>
+        <text x="80" y="280" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">→ 8분 후 삭제 🧹</text>
+        <text x="80" y="298" text-anchor="middle" class="sv-label-sm sv-mono">old_parts_lifetime</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>① Decompression &amp; Loading</b> — 머지 대상 파트들의 압축된 <code>column.bin</code> 파일을 압축 해제하고 메모리에 로드합니다.</p>
+    <p><b>② Merging</b> — sorting key 순서를 유지하며 하나의 큰 컬럼 파일로 병합합니다(merge sort). 엔진에 따라 이 단계에서 중복 제거·집계 같은 추가 처리가 일어납니다.</p>
+    <p><b>③ Indexing</b> — 병합된 컬럼 파일에 대해 새 sparse primary index를 만들고, skipping index·통계·체크섬·min-max 인덱스 등 메타데이터도 재생성합니다.</p>
+    <p><b>④ Compression &amp; Storage</b> — 새 컬럼 파일과 인덱스를 압축해 <b style="color:var(--ok)">새 디렉터리 = 새 파트</b>로 저장합니다. 머지 중에는 원본 + 결과가 동시에 존재하므로 일시적으로 2배 공간이 필요합니다.</p>
+    <p>원본 파트들은 <b style="color:var(--danger)">inactive</b>로 마킹되고 <code>old_parts_lifetime</code>(기본 8분) 후 디스크에서 삭제됩니다.</p>
+  </div>
+</div>
+
+<p>단일 서버는 <code>background_pool_size</code>(기본값은 대략 CPU 코어 수의 절반 수준)만큼의 <strong>머지 스레드를 동시에</strong> 돌립니다. 파트가 너무 커서 한꺼번에 메모리에 올리기 부담스러우면, 블록 청크 단위로 나눠 처리하는 <strong>vertical merging</strong> 모드가 자동으로 선택됩니다(메모리 절약 ↔ 속도 저하 트레이드오프).</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">Write Amplification — 같은 데이터를 여러 번 쓴다</div>
+    <p>INSERT로 1번, level 0→1 머지로 2번째, level 1→2 머지로 3번째… 데이터는 머지 계층을 오를 때마다 다시 쓰입니다. ClickHouse 24.10부터는 내장 대시보드(<code>/merges</code> HTTP 핸들러)에서 write amplification을 시각적으로 추적할 수 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">6.4 엔진별 머지 — "Merge-time Computation"의 실체</h2>
+
+<p>머지의 ② 병합 단계는 테이블 엔진에 따라 <strong>근본적으로 다른 일</strong>을 합니다. "모든 데이터 처리를 백그라운드 머지로 이관한다"는 원칙이 바로 여기서 실현됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>엔진</th><th>머지 시 하는 일</th><th>예시</th></tr></thead>
+  <tbody>
+    <tr><td><code>MergeTree</code></td><td>정렬 순서 유지하며 그냥 합침 (변환 없음)</td><td>중복 행도 그대로 유지</td></tr>
+    <tr><td><code>ReplacingMergeTree</code></td><td>같은 sorting key 중 <strong>최신 행만 유지</strong></td><td>UPDATE 대체 패턴</td></tr>
+    <tr><td><code>SummingMergeTree</code></td><td>같은 키의 숫자 컬럼을 <strong>합산</strong>해 한 행으로</td><td>price 100+200+150 → 450</td></tr>
+    <tr><td><code>AggregatingMergeTree</code></td><td><strong>부분 집계 상태</strong>를 결합 (90+ 집계 함수)</td><td>avg, uniq도 증분 처리 가능</td></tr>
+    <tr><td><code>CollapsingMergeTree</code></td><td><code>sign</code> 컬럼(+1/−1)이 서로 <strong>상쇄</strong></td><td>삽입/취소 표현</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>가장 많이 쓰이는 <strong>ReplacingMergeTree</strong>로 "머지 시점의 중복 제거"가 어떻게 동작하는지 봅시다. 핵심은 <em>머지 전에는 중복이 그대로 보인다</em>는 점입니다.</p>
+
+<div class="anim" data-steps="4" data-title="ReplacingMergeTree — 머지가 중복을 제거하는 순간" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <defs>
+        <marker id="arr6c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- part A -->
+      <g data-show="1">
+        <text x="150" y="28" text-anchor="middle" class="sv-label-sm">파트 A (오전 INSERT)</text>
+        <rect x="40" y="38" width="220" height="46" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="150" y="66" text-anchor="middle" class="sv-label sv-mono" font-size="12">user_123 · Bronze · ver=1</text>
+        <text x="150" y="112" text-anchor="middle" class="sv-label-sm">파트 B (낮 INSERT)</text>
+        <rect x="40" y="122" width="220" height="46" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="150" y="150" text-anchor="middle" class="sv-label sv-mono" font-size="12">user_123 · Gold · ver=2</text>
+      </g>
+      <g data-show="1-1">
+        <rect x="320" y="60" width="420" height="86" rx="9" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)" stroke-dasharray="5 4"/>
+        <text x="530" y="88" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">머지 전 SELECT → 행 2개 (중복!)</text>
+        <text x="530" y="112" text-anchor="middle" class="sv-label-sm sv-mono">user_123 Bronze ver=1</text>
+        <text x="530" y="130" text-anchor="middle" class="sv-label-sm sv-mono">user_123 Gold&nbsp;&nbsp;&nbsp;ver=2</text>
+      </g>
+
+      <!-- step2: merge compares -->
+      <g data-show="2">
+        <path d="M 260 61 Q 310 90 340 115" class="sv-arrow flow-line" marker-end="url(#arr6c)" stroke="var(--ok)"/>
+        <path d="M 260 145 Q 300 135 340 128" class="sv-arrow flow-line" marker-end="url(#arr6c)" stroke="var(--ok)"/>
+        <rect x="345" y="96" width="180" height="58" rx="9" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="435" y="120" text-anchor="middle" class="sv-label" font-size="12.5">⚙️ replacing merge</text>
+        <text x="435" y="140" text-anchor="middle" class="sv-label-sm">같은 키 → ver 비교</text>
+      </g>
+
+      <!-- step3: keep latest -->
+      <g data-show="3">
+        <text x="435" y="185" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">ver=1 (Bronze) 은 버려짐 🗑️</text>
+        <path d="M 525 125 L 575 125" class="sv-arrow flow-line" marker-end="url(#arr6c)" stroke="var(--ok)"/>
+        <rect x="580" y="96" width="180" height="58" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="670" y="120" text-anchor="middle" class="sv-label sv-mono" font-size="12">user_123 · Gold · ver=2</text>
+        <text x="670" y="140" text-anchor="middle" class="sv-label-sm">최신 버전만 유지 ✨</text>
+      </g>
+
+      <!-- step4: takeaway -->
+      <g data-show="4" class="rise">
+        <rect x="40" y="220" width="700" height="80" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="390" y="248" text-anchor="middle" class="sv-label" font-size="13.5">⚠️ 머지 시점은 사용자가 제어할 수 없다</text>
+        <text x="390" y="270" text-anchor="middle" class="sv-label-sm">머지 전에 정확한 결과가 필요하면 → SELECT ... FINAL (느림)</text>
+        <text x="390" y="288" text-anchor="middle" class="sv-label-sm sv-mono">또는 argMax(grade, ver) + GROUP BY 패턴 (권장)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>같은 <code>user_id</code>에 대해 오전(Bronze, ver=1)과 낮(Gold, ver=2)에 INSERT — 서로 다른 파트에 존재합니다. 머지 전 SELECT는 <b style="color:var(--danger)">중복 2행</b>을 반환합니다.</p>
+    <p>백그라운드 머지가 시작되면 두 파트를 정렬 병합하면서, <b>같은 sorting key</b>를 가진 행들의 version을 비교합니다.</p>
+    <p>ver=2(최신)만 살아남고 ver=1은 버려집니다. <b style="color:var(--ok)">머지된 파트에는 최신 행 1개만</b> 남습니다.</p>
+    <p>하지만 머지가 <b>언제</b> 일어날지는 ClickHouse 내부 스케줄러가 결정합니다. "진짜 UPDATE"가 아니므로, 정확한 최신 상태가 필요하면 <code>FINAL</code>이나 <code>argMax</code> 패턴으로 쿼리에서 직접 처리해야 합니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">6.5 FINAL과 OPTIMIZE — 머지를 기다릴 수 없을 때의 선택지</h2>
+
+<p>머지 전의 중복이 문제라면 두 가지 "강제" 수단이 있지만, 둘 다 비용이 큽니다.</p>
+
+<h3>SELECT ... FINAL — 쿼리 시점에 머지 로직 적용</h3>
+
+<p><code>FINAL</code>은 올바른 결과를 주지만 느립니다. 이유는 세 가지입니다: ① 파트별 병렬 읽기가 깨지고 같은 키끼리 비교하는 단일 스레드 구간이 생김, ② primary index로 좁힌 granule보다 더 넓게 읽어야 함, ③ 메모리에서 머지 로직을 실행하는 추가 CPU·메모리 비용. <strong>파트 수가 많을수록 저하가 심해집니다.</strong> 프로덕션에서는 아래 <code>argMax</code> 패턴이 더 일반적입니다.</p>
+
+<pre><code><span class="c">-- 머지 전: 중복 2행이 보인다</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> user_grade <span class="k">WHERE</span> user_id = <span class="n">123</span>;
+
+<span class="c">-- FINAL: 올바르지만 느림 (병렬성 깨짐 + 추가 스캔)</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> user_grade <span class="k">FINAL</span> <span class="k">WHERE</span> user_id = <span class="n">123</span>;
+
+<span class="c">-- 권장 패턴: argMax — ver이 최대인 행의 grade 반환. 병렬 실행 유지</span>
+<span class="k">SELECT</span> user_id, <span class="f">argMax</span>(grade, ver) <span class="k">AS</span> latest_grade
+<span class="k">FROM</span> user_grade
+<span class="k">WHERE</span> user_id = <span class="n">123</span>
+<span class="k">GROUP BY</span> user_id;</code></pre>
+
+<h3>OPTIMIZE TABLE — 수동 머지 트리거</h3>
+
+<pre><code><span class="c">-- 하나의 머지 사이클 실행</span>
+<span class="k">OPTIMIZE TABLE</span> mydb.mytable;
+
+<span class="c">-- 모든 파트를 하나로 최종 머지 (매우 무거움!)</span>
+<span class="k">OPTIMIZE TABLE</span> mydb.mytable <span class="k">FINAL</span>;
+
+<span class="c">-- 특정 파티션만 최종 머지</span>
+<span class="k">OPTIMIZE TABLE</span> mydb.mytable <span class="k">PARTITION</span> <span class="s">'2024-01-01'</span> <span class="k">FINAL</span>;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">OPTIMIZE FINAL은 프로덕션에서 극히 주의</div>
+    <p>전체 테이블 데이터를 다시 쓰므로 막대한 I/O와 CPU를 소비합니다. 공식 best-practices가 <strong>"Avoid OPTIMIZE FINAL"</strong>이라는 별도 문서로 다룰 만큼 강조하는 사항입니다. 자세한 함정은 <a href="ch10.html">10장 안티패턴</a>에서 다룹니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">6.6 머지 모니터링과 운영 체크리스트</h2>
+
+<p>머지 상태는 <code>system.merges</code>(진행 중), <code>system.part_log</code>(이력), <code>system.parts</code>(파트 건강)로 관찰합니다.</p>
+
+<pre><code><span class="c">-- 진행 중인 머지 확인</span>
+<span class="k">SELECT</span> database, `table`, partition_id,
+    <span class="f">round</span>(progress * <span class="n">100</span>, <span class="n">1</span>) <span class="k">AS</span> progress_pct,
+    num_parts,
+    <span class="f">formatReadableSize</span>(total_size_bytes_compressed) <span class="k">AS</span> total_size,
+    <span class="f">formatReadableTimeDelta</span>(elapsed) <span class="k">AS</span> elapsed,
+    merge_type, merge_algorithm
+<span class="k">FROM</span> system.merges
+<span class="k">ORDER BY</span> elapsed <span class="k">DESC</span>;
+
+<span class="c">-- 파트 수가 위험 수위인 테이블 식별 (level 0가 많으면 머지 지연)</span>
+<span class="k">SELECT</span> database, `table`,
+    <span class="f">count</span>() <span class="k">AS</span> active_parts,
+    <span class="f">min</span>(level) <span class="k">AS</span> min_level
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> active
+<span class="k">GROUP BY</span> database, `table`
+<span class="k">HAVING</span> active_parts &gt; <span class="n">100</span>
+<span class="k">ORDER BY</span> active_parts <span class="k">DESC</span>;</code></pre>
+
+<p><strong>머지가 밀릴 때</strong>는 다음 순서로 원인을 확인하세요.</p>
+<ol>
+  <li>INSERT 속도가 머지 속도를 초과 → 배치 크기 증가(9장) 또는 <code>background_pool_size</code> 증가</li>
+  <li>디스크 I/O 병목 → 디스크 처리량 확인 (특히 HDD 환경)</li>
+  <li>파티셔닝 과다 → 파티션당 파트 수 확인 (5장)</li>
+  <li>Mutation 진행 중 → <code>system.mutations</code>에서 <code>is_done = 0</code> 확인. Mutation이 머지 스레드를 점유합니다</li>
+</ol>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">디스크 여유 공간 — 일시적으로 2배</div>
+    <p>머지 중에는 원본 파트와 결과 파트가 동시에 존재합니다. 대형 테이블 머지 시 일시적으로 <strong>2배 공간</strong>이 필요하니, <code>system.merges</code>의 <code>total_size_bytes_compressed</code>로 여유를 점검하세요. 또한 <code>background_pool_size</code>는 Background context 설정이므로 <code>SET</code>이 아닌 config 파일에서 변경해야 합니다(3장 참조).</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">ReplacingMergeTree 테이블에 같은 키로 두 번 INSERT한 직후(머지 전) SELECT하면 어떤 결과가 나올까요?</div>
+  <div class="quiz-opts">
+    <button type="button">항상 최신 행 1개만 반환된다</button>
+    <button type="button" data-correct>중복 행 2개가 모두 보일 수 있다</button>
+    <button type="button">INSERT 시점에 중복이 거부되어 에러가 난다</button>
+    <button type="button">오래된 행 1개만 반환된다</button>
+  </div>
+  <div class="quiz-expl">✅ ReplacingMergeTree의 중복 제거는 <strong>백그라운드 머지 시점</strong>에 일어나며, 머지가 언제 실행될지는 사용자가 제어할 수 없습니다. 머지 전에는 두 행이 서로 다른 파트에 그대로 존재하므로 중복이 보입니다. 정확한 결과가 필요하면 <code>FINAL</code> 또는 <code>argMax</code> 패턴을 사용하세요.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">머지의 4단계 파이프라인 순서로 올바른 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">병합 → 압축 해제 → 압축 저장 → 인덱싱</button>
+    <button type="button">인덱싱 → 병합 → 압축 해제 → 압축 저장</button>
+    <button type="button" data-correct>압축 해제·로드 → 병합 → 인덱싱 → 압축·저장</button>
+  </div>
+  <div class="quiz-expl">✅ ① 압축된 column.bin을 풀어 메모리에 로드 → ② sorting key 순서를 유지하며 병합(엔진별 추가 처리 포함) → ③ 새 sparse primary index와 메타데이터 생성 → ④ 압축해서 새 디렉터리(=새 파트)에 저장. 원본 파트는 inactive로 마킹되어 8분 후 삭제됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch06_table_part_merges.md" target="_blank" rel="noopener">chapters/ch06_table_part_merges.md</a> — vertical merging, write amplification 수치, 고객 행동 데이터로 보는 머지 전 과정 등 심화 내용이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch05.html"><span class="dir">← 이전</span><br><span class="title">5장. Table Partitions</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch07.html"><span class="dir">다음 →</span><br><span class="title">7장. Primary Index</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

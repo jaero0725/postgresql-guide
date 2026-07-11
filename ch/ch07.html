@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7장. Primary Index — 희소 인덱스 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch07">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>7장. Primary Index — 희소 인덱스의 원리와 키 설계</h1>
+<p class="lead">모든 행이 아니라 8,192행마다 하나만 기록하는 "듬성듬성한" 인덱스 — 그런데도 3천만 행에서 3개 granule만 읽어냅니다. B-Tree와 완전히 다른 이 인덱스를 이해해야 키 설계에서 실수하지 않습니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 28분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 Parts, 6장 Merges</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① sparse index가 B-Tree와 어떻게 다른가 ② granule 분할과 primary.idx가 만들어지는 과정 ③ 쿼리 시 인덱스가 granule을 건너뛰며 스캔 범위를 좁히는 원리 ④ ORDER BY 키 설계 5원칙과 흔한 실수(키 순서만 바꿔도 850배 차이!)</p>
+  </div>
+</div>
+
+<h2 id="s1">7.1 Sparse Index — B-Tree와 무엇이 다른가</h2>
+
+<p>PostgreSQL 같은 전통적 RDBMS의 B-Tree 인덱스는 <strong>모든 행</strong>을 인덱싱합니다. 행이 10억 개면 인덱스 엔트리도 10억 개죠. 반면 ClickHouse의 primary index는 <strong>희소(sparse)</strong>합니다 — 데이터를 <strong>granule</strong>(기본 8,192행)이라는 덩어리로 나누고, <strong>각 granule의 첫 번째 행의 키 값만</strong> 기록합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">공식 문서 한 문장</div>
+    <p>"The primary key itself is 'sparse'. It does not address every single row, but only some ranges of data." — 행 하나하나가 아니라 <strong>데이터의 범위</strong>를 가리키는 인덱스입니다.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>B-Tree (PostgreSQL 등)</th><th>Sparse Index (ClickHouse)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>인덱싱 단위</strong></td><td>모든 행 (row-level)</td><td>granule마다 1개 (8,192행)</td></tr>
+    <tr><td><strong>인덱스 크기</strong></td><td>행 수에 비례 (대용량 시 TB급)</td><td>행 수 ÷ 8,192 (항상 메모리 상주 가능)</td></tr>
+    <tr><td><strong>유니크 제약</strong></td><td>지원</td><td><strong>미지원</strong> (중복 키 행 허용)</td></tr>
+    <tr><td><strong>Point query</strong></td><td>O(log n) 후 행 직접 접근</td><td>O(log n) 후 <strong>granule 전체(8,192행) 읽기</strong></td></tr>
+    <tr><td><strong>Range scan</strong></td><td>효율적</td><td>매우 효율적 (연속 granule skip)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>왜 이렇게 만들었을까요? 공식 문서의 답: <em>"단일 서버에서 수조(trillions) 행을 유지하면서도 인덱스의 메모리 소비가 눈에 띄지 않아야 하기 때문"</em>. 1조 행 ÷ 8,192 ≈ 1.2억 엔트리, 키가 10바이트면 <strong>약 1.2GB</strong> — B-Tree라면 TB 단위가 필요한 데이터입니다. 대신 단일 행을 찾을 때도 최소 1 granule을 읽어야 하고, 유니크 제약을 걸 수 없다는 대가를 치릅니다.</p>
+
+<h2 id="s2">7.2 인덱스는 어떻게 만들어지는가</h2>
+
+<p>예시 테이블로 INSERT 시 일어나는 일을 따라가 봅시다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> uk.uk_price_paid_simple
+(
+    date   <span class="f">Date</span>,
+    town   <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    street <span class="f">LowCardinality</span>(<span class="f">String</span>),
+    price  <span class="f">UInt32</span>
+)
+<span class="k">ENGINE</span> = MergeTree
+<span class="k">ORDER BY</span> (town, street);   <span class="c">-- sorting key = 인덱스의 기반</span></code></pre>
+
+<div class="anim" data-steps="4" data-title="INSERT 시 sparse index가 만들어지는 과정" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <defs>
+        <marker id="arr7a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- step1: sort -->
+      <g data-show="1">
+        <rect x="30" y="40" width="200" height="70" rx="9" class="sv-box"/>
+        <text x="130" y="30" text-anchor="middle" class="sv-label-sm">INSERT된 행들 (무작위 순서)</text>
+        <text x="130" y="66" text-anchor="middle" class="sv-label-sm sv-mono">LONDON, ABERDARE,</text>
+        <text x="130" y="86" text-anchor="middle" class="sv-label-sm sv-mono">BATH, ABINGDON ...</text>
+        <path d="M 230 75 L 285 75" class="sv-arrow flow-line" marker-end="url(#arr7a)"/>
+        <rect x="290" y="40" width="200" height="70" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="390" y="66" text-anchor="middle" class="sv-label" font-size="12.5">① (town, street)로 정렬</text>
+        <text x="390" y="88" text-anchor="middle" class="sv-label-sm sv-mono">ABBOTS → ABERDARE → ...</text>
+      </g>
+
+      <!-- step2: granule split -->
+      <g data-show="2">
+        <text x="130" y="150" class="sv-label-sm">② 8,192행 단위 granule로 논리 분할</text>
+        <rect x="30" y="162" width="170" height="42" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="115" y="188" text-anchor="middle" class="sv-label-sm sv-mono">granule 0 · 행 0~8191</text>
+        <rect x="212" y="162" width="170" height="42" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="297" y="188" text-anchor="middle" class="sv-label-sm sv-mono">granule 1 · 8192~16383</text>
+        <rect x="394" y="162" width="170" height="42" rx="7" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="479" y="188" text-anchor="middle" class="sv-label-sm sv-mono">granule 2 · 16384~...</text>
+        <text x="600" y="188" class="sv-label-sm sv-mono">...</text>
+      </g>
+
+      <!-- step3: first row keys -->
+      <g data-show="3">
+        <circle cx="45" cy="171" r="6" fill="var(--warn)" class="pulse"/>
+        <circle cx="227" cy="171" r="6" fill="var(--warn)" class="pulse"/>
+        <circle cx="409" cy="171" r="6" fill="var(--warn)" class="pulse"/>
+        <text x="620" y="150" class="sv-label-sm" fill="var(--warn)">③ 각 granule의 첫 행 키만 기록</text>
+        <path d="M 45 204 Q 60 235 110 250" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 227 204 Q 230 230 250 248" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 409 204 Q 400 232 380 250" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- step4: primary.idx -->
+      <g data-show="4" class="rise">
+        <rect x="90" y="252" width="600" height="58" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.8"/>
+        <text x="390" y="275" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">primary.idx — [0]:(ABBOTS LANGLEY, ABBEY DRIVE)  [1]:(ABERDARE, ...)  [2]:(ABERGELE, ...)</text>
+        <text x="390" y="297" text-anchor="middle" class="sv-label-sm">엔트리 수 = 전체 행 ÷ 8,192 → 항상 메모리에 상주 🧠</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>INSERT된 행들은 먼저 <b>sorting key <code>(town, street)</code> 순서로 정렬</b>됩니다. 그 후 컬럼별 파일로 분리·압축되어 디스크에 저장됩니다.</p>
+    <p>정렬된 데이터를 논리적으로 <b>8,192행 단위의 granule</b>로 분할합니다. granule은 ClickHouse가 처리하는 가장 작은 데이터 단위입니다.</p>
+    <p>각 granule의 <b style="color:var(--warn)">첫 번째 행의 키 값</b>만 뽑아냅니다. 중간 행들은 인덱싱하지 않습니다 — 그래서 "sparse(희소)"입니다.</p>
+    <p>이 값들이 <code>primary.idx</code> 파일이 됩니다. 엔트리 수가 행 수의 1/8192이므로 <b style="color:var(--purple)">수조 행도 인덱스가 통째로 메모리에 상주</b>할 수 있습니다. 참고: 각 파트는 자신만의 독립적인 primary.idx를 가집니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">각 파트가 독립적인 인덱스를 가진다</div>
+    <p>4장에서 배운 대로 테이블은 여러 파트로 구성되며, <strong>파트마다 별도의 primary index</strong>가 있습니다. 쿼리 시 모든 파트의 인덱스가 각각 사용되므로, 파트가 많을수록(예: 과도한 파티셔닝) 인덱스 효율도 분산됩니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">7.3 쿼리 실행 — granule을 건너뛰며 스캔 범위를 좁힌다</h2>
+
+<p>이제 핵심입니다. 인덱스는 "어느 행에 데이터가 있다"고 알려주는 게 아니라, <strong>"이 granule에는 절대 없다"를 증명해서 건너뛰게</strong> 해줍니다. B-Tree가 목적지를 찍어주는 내비게이션이라면, sparse index는 <em>"이 구역은 볼 필요 없음" 딱지를 붙이는 검문소</em>에 가깝습니다.</p>
+
+<div class="anim" data-steps="5" data-title="Granule Skip — 인덱스가 스캔 범위를 좁히는 과정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 360">
+      <defs>
+        <marker id="arr7b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- query -->
+      <g data-show="1">
+        <rect x="150" y="16" width="500" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="400" y="41" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE status = 'ok' AND date BETWEEN '04-03' AND '04-07'</text>
+      </g>
+
+      <!-- primary.idx entries -->
+      <text x="20" y="92" class="sv-label-sm">primary.idx (메모리)</text>
+      <g data-active="2-5">
+        <rect x="20" y="100" width="180" height="130" rx="9" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.4"/>
+        <text x="34" y="122" class="sv-label-sm sv-mono">[0] (fail, 04-01)</text>
+        <text x="34" y="144" class="sv-label-sm sv-mono">[1] (fail, 04-04)</text>
+        <text x="34" y="166" class="sv-label-sm sv-mono">[2] (ok, 04-01)</text>
+        <text x="34" y="188" class="sv-label-sm sv-mono">[3] (ok, 04-03)</text>
+        <text x="34" y="210" class="sv-label-sm sv-mono">[4] (ok, 04-06)</text>
+      </g>
+
+      <!-- step2: binary search -->
+      <g data-show="2">
+        <path d="M 400 56 Q 300 70 180 96" class="sv-arrow flow-line" stroke="var(--purple)"/>
+        <text x="220" y="92" class="sv-label-sm" fill="var(--purple)">🔍 이진 탐색으로 인덱스 스캔</text>
+      </g>
+
+      <!-- granules on disk -->
+      <text x="260" y="92" class="sv-label-sm" transform="translate(0,18)">💾 디스크의 granule들</text>
+      <g>
+        <rect x="260" y="120" width="98" height="52" rx="7" class="sv-box"/>
+        <text x="309" y="141" text-anchor="middle" class="sv-label-sm sv-mono">g0: fail</text>
+        <text x="309" y="158" text-anchor="middle" class="sv-label-sm sv-mono">04-01~03</text>
+        <rect x="366" y="120" width="98" height="52" rx="7" class="sv-box"/>
+        <text x="415" y="141" text-anchor="middle" class="sv-label-sm sv-mono">g1: fail</text>
+        <text x="415" y="158" text-anchor="middle" class="sv-label-sm sv-mono">04-04~08</text>
+        <rect x="472" y="120" width="98" height="52" rx="7" class="sv-box"/>
+        <text x="521" y="141" text-anchor="middle" class="sv-label-sm sv-mono">g2: ok</text>
+        <text x="521" y="158" text-anchor="middle" class="sv-label-sm sv-mono">04-01~02</text>
+        <rect x="578" y="120" width="98" height="52" rx="7" class="sv-box"/>
+        <text x="627" y="141" text-anchor="middle" class="sv-label-sm sv-mono">g3: ok</text>
+        <text x="627" y="158" text-anchor="middle" class="sv-label-sm sv-mono">04-03~05</text>
+        <rect x="684" y="120" width="98" height="52" rx="7" class="sv-box"/>
+        <text x="733" y="141" text-anchor="middle" class="sv-label-sm sv-mono">g4: ok</text>
+        <text x="733" y="158" text-anchor="middle" class="sv-label-sm sv-mono">04-06~09</text>
+      </g>
+
+      <!-- step3: skip -->
+      <g data-show="3">
+        <rect x="260" y="120" width="98" height="52" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-dasharray="4 4"/>
+        <text x="309" y="192" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">❌ status 불일치</text>
+        <rect x="366" y="120" width="98" height="52" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-dasharray="4 4"/>
+        <text x="415" y="210" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">❌ skip</text>
+        <rect x="472" y="120" width="98" height="52" rx="7" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-dasharray="4 4"/>
+        <text x="521" y="192" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">❌ date 범위 밖</text>
+      </g>
+
+      <!-- step4: load selected -->
+      <g data-show="4">
+        <rect x="578" y="120" width="98" height="52" rx="7" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <rect x="684" y="120" width="98" height="52" rx="7" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <path d="M 627 172 Q 600 220 520 250" class="sv-arrow flow-line" marker-end="url(#arr7b)" stroke="var(--ok)"/>
+        <path d="M 733 172 Q 700 225 560 258" class="sv-arrow flow-line" marker-end="url(#arr7b)" stroke="var(--ok)"/>
+        <rect x="330" y="245" width="190" height="46" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="425" y="264" text-anchor="middle" class="sv-label" font-size="12.5">겹치는 g3, g4만 로드</text>
+        <text x="425" y="282" text-anchor="middle" class="sv-label-sm">압축 해제 → 필터·집계</text>
+      </g>
+
+      <!-- step5: result -->
+      <g data-show="5" class="rise">
+        <rect x="60" y="308" width="680" height="42" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="400" y="334" text-anchor="middle" class="sv-label" font-size="13">실제 사례: Granules 3/3609 — 2,955만 행 중 2.5만 행만 처리, 99.9% skip ⚡ (0.010초)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>쿼리가 도착합니다. WHERE 조건이 sorting key <code>(status, date)</code>의 컬럼을 사용하고 있습니다.</p>
+    <p>메모리에 상주한 <code>primary.idx</code>를 <b style="color:var(--purple)">이진 탐색</b>합니다. 각 엔트리는 "granule N은 이 키 값부터 시작한다"는 정보이므로, 각 granule의 키 범위를 추론할 수 있습니다.</p>
+    <p>조건에 <b style="color:var(--danger)">매칭될 수 없는 granule을 제외</b>합니다. g0·g1은 status가 fail, g2는 date 범위 밖 → 디스크에서 읽지도 않고 skip!</p>
+    <p>살아남은 <b style="color:var(--ok)">g3, g4만 디스크에서 읽어</b> 압축을 풀고, 실제 필터링과 집계를 수행합니다. I/O가 조건과 겹치는 granule로만 한정됩니다.</p>
+    <p>실측 예: 3,609개 granule 중 <b>3개만 선택</b> — 2,955만 행 테이블에서 2.5만 행만 처리하고 0.010초에 응답. 이것이 sparse index의 위력입니다.</p>
+  </div>
+</div>
+
+<p>이 과정은 <code>EXPLAIN indexes = 1</code>로 직접 관찰할 수 있습니다. <code>Granules: X/Y</code>에서 X가 충분히 작은지가 인덱스 효율의 핵심 지표입니다.</p>
+
+<pre><code><span class="k">EXPLAIN</span> indexes = <span class="n">1</span>
+<span class="k">SELECT</span> <span class="f">max</span>(price)
+<span class="k">FROM</span> uk.uk_price_paid_simple
+<span class="k">WHERE</span> town = <span class="s">'LONDON'</span> <span class="k">AND</span> street = <span class="s">'OXFORD STREET'</span>;
+
+         PrimaryKey
+           Keys: town, street
+           Condition: <span class="f">and</span>((street <span class="k">in</span> [<span class="s">'OXFORD STREET'</span>, ...]), (town <span class="k">in</span> [<span class="s">'LONDON'</span>, ...]))
+           Parts: <span class="n">3</span>/<span class="n">3</span>
+           Granules: <span class="n">3</span>/<span class="n">3609</span>     <span class="c">← 3,609개 중 3개만 읽는다!</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">Point Query에는 불리하다</div>
+    <p>단일 행을 찾더라도 <strong>최소 1 granule(8,192행)</strong>을 읽고, 그 granule이 속한 <strong>압축 블록 전체를 해제</strong>해야 합니다. 공식 문서도 "ClickHouse는 단순 point query의 고부하에는 적합하지 않다"고 명시합니다. 또한 모든 행을 인덱싱하지 않으므로 <strong>유니크 제약도 불가능</strong>합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">7.4 ORDER BY 키 설계 — 순서만 바꿔도 850배</h2>
+
+<p>sparse index의 효율은 전적으로 <strong>ORDER BY 키 설계</strong>에 달려 있습니다. 공식 best-practices의 제1원칙은 이것입니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">키 선택 제1원칙</div>
+    <p>"쿼리 필터(WHERE 절)에 자주 사용되는 컬럼, 특히 <strong>대량의 행을 배제하는 컬럼</strong>을 우선하라."</p>
+  </div>
+</div>
+
+<p>로그인 이벤트 테이블로 나쁜 설계와 좋은 설계를 비교해 봅시다. 저카디널리티 컬럼은 <code>status</code>(약 4개 값), 고카디널리티 컬럼은 <code>user_id</code>(수백만 값)이고, 주요 쿼리는 <code>WHERE status = 'failed' AND event_time &gt;= ...</code>입니다.</p>
+
+<div class="anim" data-steps="4" data-title="키 순서 Before/After — 고카디널리티 먼저 vs 저카디널리티 먼저" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <line x1="400" y1="16" x2="400" y2="300" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="195" y="28" text-anchor="middle" class="sv-label" font-size="14">😰 설계 A: (user_id, time, status)</text>
+      <text x="600" y="28" text-anchor="middle" class="sv-label" font-size="14">😎 설계 B: (status, toDate(time), user_id)</text>
+
+      <!-- Design A layout -->
+      <g data-show="1">
+        <rect x="30" y="44" width="330" height="120" rx="9" class="sv-box"/>
+        <text x="46" y="68" class="sv-label-sm sv-mono">user_1&nbsp;&nbsp;&nbsp;09:00 ok&nbsp;&nbsp; KR</text>
+        <text x="46" y="90" class="sv-label-sm sv-mono">user_2&nbsp;&nbsp;&nbsp;09:00 fail US</text>
+        <text x="46" y="112" class="sv-label-sm sv-mono">user_3&nbsp;&nbsp;&nbsp;09:02 ok&nbsp;&nbsp; JP</text>
+        <text x="46" y="134" class="sv-label-sm sv-mono">user_4&nbsp;&nbsp;&nbsp;09:03 fail KR</text>
+        <text x="46" y="156" class="sv-label-sm sv-mono">... (ok/fail이 뒤섞여 배치됨)</text>
+      </g>
+
+      <!-- step2: design A full scan -->
+      <g data-show="2">
+        <rect x="30" y="44" width="330" height="120" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="195" y="192" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">WHERE status='failed' → user_id 필터가 없으면</text>
+        <text x="195" y="212" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--danger)">이진 탐색 불가 → 전체 3,609 granule 풀 스캔</text>
+      </g>
+
+      <!-- step3: design B layout -->
+      <g data-show="3">
+        <rect x="440" y="44" width="330" height="56" rx="9" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="456" y="68" class="sv-label-sm sv-mono">fail 04-01 ... / fail 04-02 ...</text>
+        <text x="456" y="88" class="sv-label-sm">fail 행들이 한 구간에 모임 (수만 건)</text>
+        <rect x="440" y="108" width="330" height="56" rx="9" class="sv-box"/>
+        <text x="456" y="132" class="sv-label-sm sv-mono">ok&nbsp;&nbsp; 04-01 ... / ok&nbsp;&nbsp; 04-30 ...</text>
+        <text x="456" y="152" class="sv-label-sm">ok 행들 (수억 건) — 통째로 skip 가능</text>
+      </g>
+
+      <!-- step4: design B result -->
+      <g data-show="4">
+        <path d="M 605 100 Q 620 104 605 108" fill="none" stroke="var(--ok)"/>
+        <text x="605" y="192" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--ok)">인덱스 이진 탐색으로 fail 구간에 점프</text>
+        <text x="605" y="212" text-anchor="middle" class="sv-label" font-size="12.5" fill="var(--ok)">→ 3 / 3,609 granule만 읽음 (0.08%)</text>
+      </g>
+      <g data-show="4" class="rise">
+        <rect x="80" y="240" width="640" height="60" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="400" y="265" text-anchor="middle" class="sv-label" font-size="13.5">설계 A: 2,950만 행 · 8,500ms&nbsp;&nbsp;→&nbsp;&nbsp;설계 B: 24,580행 · 10ms</text>
+        <text x="400" y="288" text-anchor="middle" class="sv-label" font-size="13" fill="var(--warn)">키 순서만 바꿨을 뿐인데 850배 차이 ⚡</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>설계 A</b>는 고카디널리티인 <code>user_id</code>가 첫 번째 키입니다. 데이터가 user_id 순으로 배치되니, ok/fail이 <b>모든 granule에 골고루 뒤섞입니다</b>.</p>
+    <p><code>WHERE status='failed'</code> 쿼리가 오면? 첫 키(user_id) 필터가 없어 이진 탐색을 쓸 수 없고, status는 어디에나 섞여 있어 어떤 granule도 배제하지 못합니다 → <b style="color:var(--danger)">풀 스캔</b>.</p>
+    <p><b>설계 B</b>는 저카디널리티인 <code>status</code>가 첫 번째 키입니다. fail 행들이 물리적으로 <b style="color:var(--ok)">한 구간에 모이고</b>, 수억 건의 ok 행들은 통째로 건너뛸 수 있는 형태가 됩니다.</p>
+    <p>인덱스 이진 탐색으로 fail 구간에 바로 점프하고 날짜 조건으로 더 좁힙니다. 결과: <b>3/3,609 granule</b>, 8,500ms → 10ms. <b style="color:var(--warn)">850배</b> 차이입니다.</p>
+  </div>
+</div>
+
+<h3>키 설계 5원칙 정리</h3>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>1️⃣ WHERE 절 빈도 우선</h4>
+    <p>실제 쿼리의 필터 조건에 맞춰라. INSERT 순서나 데이터 모델의 논리적 순서가 아니라 <strong>쿼리 패턴</strong>이 기준입니다.</p>
+  </div>
+  <div class="card">
+    <h4>2️⃣ 저카디널리티를 앞에</h4>
+    <p><code>ORDER BY (PostTypeId, toDate(CreationDate))</code>처럼 고유값이 적은 컬럼을 먼저. 첫 키만으로 대량 granule을 skip할 수 있습니다.</p>
+  </div>
+  <div class="card">
+    <h4>3️⃣ 상관관계 높은 컬럼 포함 = 압축률↑</h4>
+    <p>ordering key로 정렬하면 <strong>모든 컬럼</strong>이 그 순서로 배치됩니다. 유사한 값이 연속되면 압축이 잘 됩니다.</p>
+  </div>
+  <div class="card">
+    <h4>4️⃣ 키는 4~5개면 충분</h4>
+    <p>너무 많으면 인덱스가 커지고 정렬 비용만 늘어납니다.</p>
+  </div>
+  <div class="card">
+    <h4>5️⃣ 날짜는 정밀도를 낮춰라</h4>
+    <p><code>toDate(CreationDate)</code>를 쓰면 엔트리가 8바이트 → 2바이트. 일 단위 필터링으로 충분한 경우가 대부분입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🚫 생성 후 변경 불가</h4>
+    <p>ORDER BY 키는 테이블 생성 시에만 정의됩니다. 대안인 Projection은 데이터 복제를 발생시킵니다. <strong>처음부터 신중하게!</strong></p>
+  </div>
+</div>
+
+<h3>인덱스가 안 먹히는 필터 패턴</h3>
+
+<pre><code><span class="c">-- 나쁨: 키의 앞부분(status)을 건너뛰고 date만 필터 → skip 불가</span>
+<span class="k">WHERE</span> date = <span class="s">'2024-04-05'</span>
+
+<span class="c">-- 나쁨: 복잡한 함수 래핑 → 최적화기가 인덱스를 우회할 수 있음</span>
+<span class="k">WHERE</span> <span class="f">transform</span>(status) = <span class="s">'failed'</span>
+
+<span class="c">-- 나쁨: 부정 조건 → 대부분의 granule이 매칭되어 skip 효과 없음</span>
+<span class="k">WHERE</span> status != <span class="s">'ok'</span>
+
+<span class="c">-- 좋음: 키 순서대로 필터</span>
+<span class="k">WHERE</span> status = <span class="s">'failed'</span> <span class="k">AND</span> date &gt;= <span class="s">'2024-04-01'</span>
+
+<span class="c">-- 좋음: IN 절 — 여러 범위를 각각 이진 탐색</span>
+<span class="k">WHERE</span> status <span class="k">IN</span> (<span class="s">'failed'</span>, <span class="s">'timeout'</span>)</code></pre>
+
+<h2 id="s5">7.5 Ordering Key vs Primary Key, 그리고 튜닝 포인트</h2>
+
+<p>공식 문서에서 두 용어를 혼용하지만 엄밀하게는 다릅니다.</p>
+
+<ul>
+  <li><strong>Ordering Key</strong> (<code>ORDER BY</code>): 디스크 상 데이터의 <strong>물리적 정렬 순서</strong>를 정의</li>
+  <li><strong>Primary Key</strong> (<code>PRIMARY KEY</code>): <strong>sparse index에 저장되는 컬럼</strong>을 정의</li>
+</ul>
+
+<p>보통은 동일하며, <code>PRIMARY KEY</code>를 지정하지 않으면 <code>ORDER BY</code> 키가 자동으로 primary key가 됩니다. 별도 지정은 "정렬은 3개 키로, 인덱스는 앞 2개만"처럼 인덱스 크기를 줄이고 싶을 때 사용합니다.</p>
+
+<pre><code><span class="c">-- 데이터는 (a, b, c)로 정렬, sparse index는 (a, b)만 저장</span>
+<span class="k">CREATE TABLE</span> t (...)
+<span class="k">ENGINE</span> = MergeTree
+<span class="k">ORDER BY</span> (a, b, c)
+<span class="k">PRIMARY KEY</span> (a, b);
+
+<span class="c">-- 인덱스 내용을 직접 들여다보기</span>
+<span class="k">SELECT</span> mark_number + <span class="n">1</span> <span class="k">AS</span> entry, town, street
+<span class="k">FROM</span> <span class="f">mergeTreeIndex</span>(<span class="s">'uk'</span>, <span class="s">'uk_price_paid_simple'</span>)
+<span class="k">ORDER BY</span> mark_number <span class="k">ASC</span>
+<span class="k">LIMIT</span> <span class="n">10</span>;</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th><code>index_granularity</code> 조정</th><th>효과</th><th>트레이드오프</th></tr></thead>
+  <tbody>
+    <tr><td><strong>줄이기</strong> (예: 1024)</td><td>granule이 작아져 skip 정밀도 향상</td><td>인덱스 엔트리 8배 증가 → 메모리·mark 파일 증가</td></tr>
+    <tr><td><strong>늘리기</strong> (예: 65536)</td><td>인덱스·mark 파일 축소</td><td>skip 정밀도 하락, point query 최소 읽기량 증가</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">보조 수단: Data Skipping Index</div>
+    <p>프라이머리 인덱스로 커버하지 못하는 컬럼에는 <code>ALTER TABLE mytable ADD INDEX idx_name col_name TYPE minmax GRANULARITY 4;</code>처럼 skipping index를 추가할 수 있습니다. 단, 프라이머리 인덱스의 <strong>대체가 아닌 보조 수단</strong>이며 효과는 데이터 분포에 크게 의존합니다. 기본값 8,192는 대부분의 워크로드에 적합하니 <code>index_granularity</code>도 특수한 경우에만 조정하세요.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">ClickHouse의 sparse primary index가 <code>primary.idx</code>에 저장하는 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">테이블의 모든 행의 키 값과 물리 주소</button>
+    <button type="button" data-correct>각 granule(기본 8,192행)의 첫 번째 행의 키 값</button>
+    <button type="button">각 파트의 min/max 키 값 2개만</button>
+    <button type="button">중복이 제거된 유니크 키 목록</button>
+  </div>
+  <div class="quiz-expl">✅ granule마다 첫 행의 키 값 하나만 기록하므로 엔트리 수 = 행 수 ÷ 8,192. 덕분에 수조 행 테이블의 인덱스도 메모리에 통째로 상주할 수 있습니다. 대신 모든 행을 인덱싱하지 않으므로 유니크 제약이 불가능하고, 단일 행 조회도 최소 1 granule을 읽어야 합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q"><code>ORDER BY (status, date, user_id)</code> 테이블에서 <code>WHERE date = '2024-04-05'</code>만 필터하면 인덱스 효과가 미미한 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">date 컬럼은 인덱스에 포함되지 않기 때문</button>
+    <button type="button">부정 조건이라 granule을 배제할 수 없기 때문</button>
+    <button type="button" data-correct>첫 번째 키(status) 필터가 없으면 date 값이 여러 status 구간에 흩어져 있어 granule을 배제하기 어렵기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 데이터는 status → date 순으로 정렬되므로, 같은 날짜의 행이 status=fail 구간과 status=ok 구간 등 여러 곳에 나뉘어 존재합니다. 키의 앞부분을 건너뛴 필터는 이진 탐색을 활용하지 못해 대부분의 granule을 읽게 됩니다. 인덱스는 키 순서대로(prefix부터) 필터할 때 가장 효과적입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch07_primary_index.md" target="_blank" rel="noopener">chapters/ch07_primary_index.md</a> — mergeTreeIndex 실습, 쿼리 패턴 분석 쿼리, index_granularity 튜닝 상세가 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06.html"><span class="dir">← 이전</span><br><span class="title">6장. Part Merges</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch08.html"><span class="dir">다음 →</span><br><span class="title">8장. Shards &amp; Replicas</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11장. 모니터링과 트러블슈팅 — ClickHouse 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="ch/ch11">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a class="on-ch" href="index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">⚡ ClickHouse 가이드</div>
+  <a class="chap" href="index.html" data-page="ch/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">기초</div>
+  <a class="chap" href="ch01.html" data-page="ch/ch01"><span class="num">01</span> ClickHouse 개요 — 왜 빠른가</a>
+  <a class="chap" href="ch02.html" data-page="ch/ch02"><span class="num">02</span> 내부 컴포넌트와 쿼리 처리</a>
+  <a class="chap" href="ch03.html" data-page="ch/ch03"><span class="num">03</span> Context · 스레드 · 동시성</a>
+  <div class="group-title">MergeTree 핵심</div>
+  <a class="chap" href="ch04.html" data-page="ch/ch04"><span class="num">04</span> Table Parts — 파트 구조</a>
+  <a class="chap" href="ch05.html" data-page="ch/ch05"><span class="num">05</span> Table Partitions — 파티션</a>
+  <a class="chap" href="ch06.html" data-page="ch/ch06"><span class="num">06</span> Part Merges — 백그라운드 머지</a>
+  <a class="chap" href="ch07.html" data-page="ch/ch07"><span class="num">07</span> Primary Index — 희소 인덱스</a>
+  <div class="group-title">분산과 운영</div>
+  <a class="chap" href="ch08.html" data-page="ch/ch08"><span class="num">08</span> Shards &amp; Replicas</a>
+  <a class="chap" href="ch09.html" data-page="ch/ch09"><span class="num">09</span> INSERT 전략</a>
+  <a class="chap" href="ch10.html" data-page="ch/ch10"><span class="num">10</span> 안티패턴 모음</a>
+  <a class="chap" href="ch11.html" data-page="ch/ch11"><span class="num">11</span> 모니터링과 트러블슈팅</a>
+</aside>
+
+<main class="content">
+
+<h1>11장. 모니터링과 트러블슈팅</h1>
+<p class="lead">ClickHouse는 자기 내부 상태를 전부 SQL로 보여줍니다 — system 테이블이라는 창을 통해서. 앞 10개 장의 아키텍처 지식을 "증상 → 진단 → 원인 격리 → 대응"의 운영 무기로 바꿔봅시다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 28분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 4~10장 전체</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 핵심 system 테이블 10개와 각각이 보여주는 것 ② "Too many parts"를 system 테이블로 단계 진단하는 플로우 ③ 쿼리 느림·레플리카 지연·mutation 멈춤·디스크 부족의 문제별 진단 가이드 ④ 상시 모니터링 쿼리와 24.10+ 내장 대시보드</p>
+  </div>
+</div>
+
+<h2 id="s1">11.1 System 테이블 맵 — 무엇을 어디서 보는가</h2>
+
+<p>대부분의 ClickHouse 문제는 <strong>system 테이블 쿼리만으로 진단</strong>할 수 있습니다. 각 테이블이 앞 장들의 개념과 어떻게 연결되는지 봅시다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>System 테이블</th><th>관찰 대상</th><th>관련 장</th></tr></thead>
+  <tbody>
+    <tr><td><code>system.parts</code></td><td>파트 현황: 활성 파트 수, 크기, 레벨, 파티션 분포</td><td>4, 5장</td></tr>
+    <tr><td><code>system.merges</code></td><td>진행 중인 머지: 진행률, 소요 시간, 파트 수</td><td>6장</td></tr>
+    <tr><td><code>system.mutations</code></td><td>진행 중인 mutation: 상태, 에러, 대기열</td><td>10장</td></tr>
+    <tr><td><code>system.replicas</code></td><td>레플리카 상태: lag, 큐 크기, 리더 여부</td><td>8장</td></tr>
+    <tr><td><code>system.query_log</code></td><td>쿼리 이력: 성능, 메모리, 읽기량, 에러</td><td>2, 3장</td></tr>
+    <tr><td><code>system.part_log</code></td><td>파트 생명주기: INSERT, 머지, 삭제 이벤트</td><td>4, 6장</td></tr>
+    <tr><td><code>system.metrics</code></td><td>실시간 메트릭: 스레드, 커넥션, 메모리</td><td>3장</td></tr>
+    <tr><td><code>system.asynchronous_metrics</code></td><td>주기적 메트릭: 디스크, OS 수준 통계</td><td>—</td></tr>
+    <tr><td><code>system.events</code></td><td>누적 카운터: 읽기/쓰기 바이트, 쿼리 수</td><td>—</td></tr>
+    <tr><td><code>system.zookeeper</code></td><td>Keeper 상태: 노드, 자식 수, 경로 탐색</td><td>8장</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="s2">11.2 케이스 스터디 — "Too many parts"를 단계별로 격리하기</h2>
+
+<p>가장 흔한 운영 사고인 INSERT 거부를 예로, <strong>증상 → system 테이블 진단 → 원인 격리 → 대응</strong>의 사고 흐름을 따라가 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="진단 플로우 — 증상에서 원인 격리까지" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 370">
+      <defs>
+        <marker id="arr11a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- step1: symptom -->
+      <g data-show="1">
+        <rect x="230" y="16" width="340" height="46" rx="10" fill="color-mix(in srgb, var(--danger) 14%, transparent)" stroke="var(--danger)" stroke-width="2" class="blink"/>
+        <text x="400" y="36" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">🚨 증상: INSERT 거부</text>
+        <text x="400" y="54" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">DB::Exception: Too many parts (3000)</text>
+      </g>
+
+      <!-- step2: system.parts -->
+      <g data-show="2">
+        <path d="M 400 62 L 400 88" class="sv-arrow flow-line" marker-end="url(#arr11a)"/>
+        <rect x="180" y="92" width="440" height="56" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="400" y="114" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">① system.parts — 어느 테이블? level 0 비율은?</text>
+        <text x="400" y="136" text-anchor="middle" class="sv-label-sm sv-mono">active_parts=3200, unmerged(level=0)=2900 → events 테이블</text>
+      </g>
+
+      <!-- step3: branch: partitions -->
+      <g data-show="3">
+        <path d="M 300 148 Q 240 165 210 182" class="sv-arrow flow-line" marker-end="url(#arr11a)"/>
+        <path d="M 500 148 Q 560 165 590 182" class="sv-arrow flow-line" marker-end="url(#arr11a)"/>
+        <rect x="60" y="186" width="300" height="56" rx="9" class="sv-box"/>
+        <text x="210" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">② 파티션 분포 — uniq(partition)?</text>
+        <text x="210" y="230" text-anchor="middle" class="sv-label-sm">1,000 초과? → 과도한 파티셔닝 (5장)</text>
+        <rect x="440" y="186" width="300" height="56" rx="9" class="sv-box"/>
+        <text x="590" y="208" text-anchor="middle" class="sv-label sv-mono" font-size="12">③ system.merges / mutations</text>
+        <text x="590" y="230" text-anchor="middle" class="sv-label-sm">머지 항상 바쁨? mutation is_done=0?</text>
+      </g>
+
+      <!-- step4: isolate cause -->
+      <g data-show="4">
+        <rect x="60" y="186" width="300" height="56" rx="9" fill="none" stroke="var(--text-faint)" stroke-dasharray="4 4"/>
+        <text x="210" y="260" text-anchor="middle" class="sv-label-sm">파티션 12개 — 정상 ✓ (용의선상 제외)</text>
+        <rect x="440" y="186" width="300" height="56" rx="9" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="2"/>
+        <text x="590" y="262" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">level 0가 대부분 + 머지는 한가 → 소량 빈번 INSERT!</text>
+      </g>
+
+      <!-- step5: response map -->
+      <g data-show="5" class="rise">
+        <rect x="60" y="286" width="680" height="70" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="310" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">④ 원인별 대응</text>
+        <text x="400" y="330" text-anchor="middle" class="sv-label-sm">소량 INSERT → 배칭·async insert (9장) · 머지 부족 → background_pool_size ↑ (6장)</text>
+        <text x="400" y="348" text-anchor="middle" class="sv-label-sm">파티셔닝 과다 → 키 재설계 (5장) · mutation 점유 → KILL MUTATION (10장)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>증상 발생: <b style="color:var(--danger)">"Too many parts"</b> — 활성 파트가 <code>parts_to_throw_insert</code>(기본 3000)를 넘어 INSERT가 거부됐습니다. 당황하지 말고 system 테이블로 갑니다.</p>
+    <p><b>①</b> <code>system.parts</code>에서 문제 테이블을 식별합니다. active_parts 수와 함께 <b>level=0 파트 비율</b>을 확인하세요 — 이것이 다음 분기의 핵심 단서입니다.</p>
+    <p><b>②③</b> 두 갈래로 진단합니다: 파티션 분포(<code>uniq(partition)</code>이 1,000을 훌쩍 넘으면 과도한 파티셔닝)와 머지·mutation 상태(<code>system.merges</code>가 항상 바쁜지, <code>system.mutations</code>에 <code>is_done=0</code>이 쌓였는지).</p>
+    <p>이 사례에서는 파티션은 12개로 정상, 대신 <b style="color:var(--warn)">level 0 파트가 2,900개인데 머지는 한가</b> — 머지가 밀린 게 아니라 파트 생성 자체가 폭주하는 <b>소량 빈번 INSERT</b>가 원인으로 격리됩니다.</p>
+    <p><b>④</b> 원인별 대응 매핑: 소량 INSERT → 배칭/async insert, 머지 처리량 부족 → <code>background_pool_size</code> 증가, 파티셔닝 과다 → 키 재설계(새 테이블 필요), mutation 점유 → <code>KILL MUTATION</code> 후 대안 사용. 디스크 I/O 병목이면 스토리지 업그레이드.</p>
+  </div>
+</div>
+
+<p>이 플로우의 각 단계에 해당하는 실제 쿼리입니다.</p>
+
+<pre><code><span class="c">-- 1단계: 어느 테이블이 문제인지 확인</span>
+<span class="k">SELECT</span> database, `table`,
+    <span class="f">count</span>() <span class="k">AS</span> active_parts,
+    <span class="f">uniq</span>(partition) <span class="k">AS</span> partitions,
+    <span class="f">countIf</span>(level = <span class="n">0</span>) <span class="k">AS</span> unmerged_parts
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> active
+<span class="k">GROUP BY</span> database, `table`
+<span class="k">HAVING</span> active_parts &gt; <span class="n">300</span>
+<span class="k">ORDER BY</span> active_parts <span class="k">DESC</span>;
+
+<span class="c">-- 2단계: 파티션별 분포 (과도한 파티셔닝 여부)</span>
+<span class="k">SELECT</span> partition, <span class="f">count</span>() <span class="k">AS</span> parts, <span class="f">min</span>(level) <span class="k">AS</span> min_level
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> database = <span class="s">'mydb'</span> <span class="k">AND</span> `table` = <span class="s">'mytable'</span> <span class="k">AND</span> active
+<span class="k">GROUP BY</span> partition <span class="k">ORDER BY</span> parts <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">20</span>;
+
+<span class="c">-- 3단계: 머지가 밀리고 있는지 확인</span>
+<span class="k">SELECT</span> <span class="f">count</span>() <span class="k">AS</span> running_merges,
+       <span class="f">sum</span>(num_parts) <span class="k">AS</span> merging_parts,
+       <span class="f">formatReadableSize</span>(<span class="f">sum</span>(total_size_bytes_compressed)) <span class="k">AS</span> total_size
+<span class="k">FROM</span> system.merges;</code></pre>
+
+<h2 id="s3">11.3 문제별 진단 가이드</h2>
+
+<h3>문제: 쿼리 성능 저하</h3>
+
+<pre><code><span class="c">-- 느린 쿼리 Top 10</span>
+<span class="k">SELECT</span> query_id, query_duration_ms, read_rows,
+    <span class="f">formatReadableSize</span>(read_bytes) <span class="k">AS</span> read_size,
+    <span class="f">formatReadableSize</span>(peak_memory_usage) <span class="k">AS</span> peak_mem,
+    query
+<span class="k">FROM</span> system.query_log
+<span class="k">WHERE</span> type = <span class="s">'QueryFinish'</span> <span class="k">AND</span> query_kind = <span class="s">'Select'</span>
+  <span class="k">AND</span> event_date &gt;= <span class="f">today</span>() - <span class="n">1</span>
+<span class="k">ORDER BY</span> query_duration_ms <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">10</span>;
+
+<span class="c">-- 인덱스 skip 효과 확인: Granules X/Y 비율이 핵심</span>
+<span class="k">EXPLAIN</span> indexes = <span class="n">1</span> <span class="k">SELECT</span> ... <span class="k">FROM</span> mytable <span class="k">WHERE</span> ...;</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>증상</th><th>진단</th><th>대응</th></tr></thead>
+  <tbody>
+    <tr><td>전체 스캔 (Granules: Y/Y)</td><td>EXPLAIN에서 PrimaryKey 활용 없음</td><td>ORDER BY 키 재설계 (7장)</td></tr>
+    <tr><td>파트가 너무 많음</td><td>Parts: 수백</td><td>파티셔닝 재검토, 머지 대기</td></tr>
+    <tr><td>메모리 부족</td><td>peak_memory_usage 과다</td><td><code>max_memory_usage</code> 조정, 쿼리 최적화</td></tr>
+    <tr><td>대량 데이터 읽기</td><td>read_bytes 과다</td><td>필요 컬럼만 SELECT, PREWHERE 활용</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>문제: 레플리카 지연 (Replication Lag)</h3>
+
+<p>8장에서 배운 복제 구조를 떠올리면 진단이 자연스럽습니다 — 레플리카는 복제 로그의 큐를 처리하는 소비자이므로, <strong>큐에 무엇이 쌓였는지</strong>가 병목의 정체를 알려줍니다.</p>
+
+<div class="anim" data-steps="4" data-title="레플리카 지연 진단 — 큐를 열어보면 병목이 보인다" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 780 320">
+      <defs>
+        <marker id="arr11b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- step1: lag detected -->
+      <g data-show="1">
+        <rect x="40" y="24" width="330" height="70" rx="10" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.8"/>
+        <text x="205" y="50" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">🚨 system.replicas</text>
+        <text x="205" y="72" text-anchor="middle" class="sv-label-sm sv-mono" fill="var(--danger)">absolute_delay = 340s (증가 추세!)</text>
+        <rect x="430" y="24" width="310" height="70" rx="10" class="sv-box"/>
+        <text x="585" y="50" text-anchor="middle" class="sv-label-sm">레플리카 = 복제 로그 큐의 소비자</text>
+        <text x="585" y="72" text-anchor="middle" class="sv-label-sm">지연 = 큐 처리가 못 따라감</text>
+      </g>
+
+      <!-- step2: open the queue -->
+      <g data-show="2">
+        <path d="M 205 94 L 205 122" class="sv-arrow flow-line" marker-end="url(#arr11b)" stroke="var(--warn)"/>
+        <rect x="60" y="126" width="290" height="80" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="205" y="150" text-anchor="middle" class="sv-label" font-size="12.5">큐 분해 — 무엇이 쌓였나?</text>
+        <text x="205" y="172" text-anchor="middle" class="sv-label-sm sv-mono">inserts_in_queue = 1,840 📦</text>
+        <text x="205" y="192" text-anchor="middle" class="sv-label-sm sv-mono">merges_in_queue = 12</text>
+      </g>
+
+      <!-- step3: branch diagnosis -->
+      <g data-show="3">
+        <path d="M 350 150 Q 400 140 440 138" class="sv-arrow flow-line" marker-end="url(#arr11b)" stroke="var(--warn)"/>
+        <rect x="450" y="118" width="290" height="56" rx="9" class="sv-box"/>
+        <text x="595" y="140" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">inserts_in_queue 높음 → 파트 다운로드 병목</text>
+        <text x="595" y="160" text-anchor="middle" class="sv-label-sm">네트워크 대역폭 / 디스크 I/O / Keeper 상태 확인</text>
+        <rect x="450" y="184" width="290" height="56" rx="9" class="sv-box"/>
+        <text x="595" y="206" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">merges_in_queue 높음 → 머지 스레드 부족</text>
+        <text x="595" y="226" text-anchor="middle" class="sv-label-sm sv-mono">background_pool_size 증가 검토</text>
+      </g>
+
+      <!-- step4: recovery -->
+      <g data-show="4" class="rise">
+        <rect x="60" y="260" width="680" height="46" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="400" y="280" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">✅ 네트워크 병목 해소 후 absolute_delay 340s → 2s로 수렴</text>
+        <text x="400" y="299" text-anchor="middle" class="sv-label-sm">교훈: lag 수치만 보지 말고 큐의 "구성"으로 원인을 갈라라</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>system.replicas</code>에서 <code>absolute_delay</code>(최신 레플리카 대비 지연 초)가 <b style="color:var(--danger)">증가 추세</b>로 감지됩니다. 레플리카가 쓰기를 따라잡지 못하고 있다는 뜻입니다.</p>
+    <p>같은 테이블의 <b style="color:var(--warn)">큐 컬럼을 분해</b>합니다: <code>queue_size</code>가 <code>inserts_in_queue</code>(다운로드해야 할 파트)와 <code>merges_in_queue</code>(수행해야 할 머지)로 나뉩니다.</p>
+    <p>구성에 따라 원인이 갈립니다 — <b>inserts</b>가 높으면 다른 레플리카에서 파트를 받아오는 <b style="color:var(--danger)">네트워크/다운로드 병목</b>, <b>merges</b>가 높으면 <b style="color:var(--warn)">머지 스레드 부족</b>(<code>background_pool_size</code> 증가 검토). Keeper 연결 문제라면 <code>system.zookeeper</code>도 확인합니다.</p>
+    <p>병목을 해소하면 delay가 수렴합니다. 핵심 교훈: <b>lag 수치 자체가 아니라 큐의 구성이 원인을 말해준다</b>는 것.</p>
+  </div>
+</div>
+
+<h3>문제: Mutation이 끝나지 않음 / 디스크 공간 부족</h3>
+
+<pre><code><span class="c">-- 멈춘 mutation 확인: parts_to_do가 줄지 않으면 진행 정지</span>
+<span class="k">SELECT</span> database, `table`, mutation_id, command,
+       is_done, parts_to_do, latest_fail_reason
+<span class="k">FROM</span> system.mutations
+<span class="k">WHERE</span> is_done = <span class="n">0</span>
+<span class="k">ORDER BY</span> create_time <span class="k">ASC</span>;
+
+<span class="c">-- 문제 mutation 강제 취소</span>
+<span class="k">KILL MUTATION WHERE</span> mutation_id = <span class="s">'mutation_0000000001'</span>;
+
+<span class="c">-- 테이블별 디스크 사용량 (inactive 파트 포함)</span>
+<span class="k">SELECT</span> database, `table`,
+    <span class="f">formatReadableSize</span>(<span class="f">sum</span>(bytes_on_disk)) <span class="k">AS</span> total_size,
+    <span class="f">countIf</span>(active = <span class="n">0</span>) <span class="k">AS</span> inactive_parts,
+    <span class="f">formatReadableSize</span>(<span class="f">sumIf</span>(bytes_on_disk, active = <span class="n">0</span>)) <span class="k">AS</span> inactive_size
+<span class="k">FROM</span> system.parts
+<span class="k">GROUP BY</span> database, `table`
+<span class="k">ORDER BY</span> <span class="f">sum</span>(bytes_on_disk) <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">20</span>;</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">디스크가 갑자기 부족해졌다면</div>
+    <p>inactive 파트가 과도하면 <code>old_parts_lifetime</code>(기본 8분)이 아직 안 지났거나 머지가 진행 중인 것입니다. 머지 중에는 원본 + 결과 파트가 동시에 존재하므로 <strong>일시적으로 2배 공간</strong>이 필요합니다(6장). 조금 기다리면 회수되는 공간인지 먼저 확인하세요.</p>
+  </div>
+</div>
+
+<h2 id="s4">11.4 상시 모니터링 — 사고가 나기 전에 보는 지표</h2>
+
+<pre><code><span class="c">-- 파트 건강 상태: level0_pct가 높으면 머지가 밀리고 있다는 신호</span>
+<span class="k">SELECT</span> database, `table`,
+    <span class="f">count</span>() <span class="k">AS</span> active_parts,
+    <span class="f">countIf</span>(level = <span class="n">0</span>) <span class="k">AS</span> level0_parts,
+    <span class="f">round</span>(<span class="f">countIf</span>(level = <span class="n">0</span>) / <span class="f">count</span>() * <span class="n">100</span>, <span class="n">1</span>) <span class="k">AS</span> level0_pct,
+    <span class="f">max</span>(modification_time) <span class="k">AS</span> last_insert
+<span class="k">FROM</span> system.parts
+<span class="k">WHERE</span> active
+<span class="k">GROUP BY</span> database, `table`
+<span class="k">HAVING</span> active_parts &gt; <span class="n">10</span>
+<span class="k">ORDER BY</span> level0_pct <span class="k">DESC</span>;
+
+<span class="c">-- 시간대별 쿼리 성능 추이 (p95 추적)</span>
+<span class="k">SELECT</span>
+    <span class="f">toStartOfHour</span>(event_time) <span class="k">AS</span> hour,
+    <span class="f">count</span>() <span class="k">AS</span> queries,
+    <span class="f">round</span>(<span class="f">avg</span>(query_duration_ms)) <span class="k">AS</span> avg_ms,
+    <span class="f">round</span>(<span class="f">quantile</span>(<span class="n">0.95</span>)(query_duration_ms)) <span class="k">AS</span> p95_ms
+<span class="k">FROM</span> system.query_log
+<span class="k">WHERE</span> type = <span class="s">'QueryFinish'</span> <span class="k">AND</span> query_kind = <span class="s">'Select'</span>
+  <span class="k">AND</span> event_date &gt;= <span class="f">today</span>() - <span class="n">1</span>
+<span class="k">GROUP BY</span> hour <span class="k">ORDER BY</span> hour;</code></pre>
+
+<p>실시간 스레드·머지·복제 활동은 <code>system.metrics</code>에서 <code>Query</code>, <code>Merge</code>, <code>PartMutation</code>, <code>GlobalThreadActive</code>, <code>ReplicatedSend/Fetch</code> 같은 메트릭으로 확인합니다.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">설정 변경은 반드시 적용 여부를 확인하라</div>
+    <p>2장에서 배운 특성: 설정 파일에 오류가 있으면 서버는 <strong>이전 설정을 유지</strong>하고 경고만 남깁니다. 변경 후에는 <code>SELECT name, value, changed FROM system.settings WHERE name IN ('max_threads', 'async_insert', ...)</code>와 <code>system.merge_tree_settings</code>(<code>parts_to_throw_insert</code>, <code>old_parts_lifetime</code> 등)로 실제 적용값을 확인하세요.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">📊</span>
+  <div>
+    <div class="callout-title">ClickHouse 24.10+ 내장 대시보드</div>
+    <p>브라우저에서 <code>http://clickhouse-server:8123/dashboard</code>로 내장 모니터링 대시보드에 접근할 수 있습니다. <code>/merges</code> 핸들러는 파트 머지와 write amplification을 시각적으로 보여줍니다(6장 참조).</p>
+  </div>
+</div>
+
+<h2 id="s5">11.5 트러블슈팅 플로우차트 — 전체 지도</h2>
+
+<pre><code>문제 발생
+  │
+  ├── INSERT 실패?
+  │     ├── "Too many parts" → §11.2 진단 플로우
+  │     └── 타임아웃 → 배치 크기·네트워크 확인
+  │
+  ├── 쿼리가 느리다?
+  │     ├── EXPLAIN indexes=1 → Granule skip 확인 (7장)
+  │     ├── system.query_log → read_bytes, peak_memory 확인
+  │     └── 파트 수 확인 → 머지 밀림 여부 (6장)
+  │
+  ├── 레플리카 지연? → system.replicas 큐 분해 (8장)
+  │
+  ├── 디스크 부족? → inactive 파트 + 머지 중 임시 공간 (6장)
+  │
+  └── Mutation 멈춤? → system.mutations → KILL MUTATION (10장)</code></pre>
+
+<div class="callout info">
+  <span class="ico">🎓</span>
+  <div>
+    <div class="callout-title">11개 장의 마무리</div>
+    <p>축하합니다! 파트(4장) → 파티션(5장) → 머지(6장) → 인덱스(7장) → 분산(8장) → INSERT(9장) → 안티패턴(10장)의 아키텍처 지식이 있으면, 이 장의 모든 진단 쿼리가 "외울 것"이 아니라 "당연한 것"이 됩니다. 트러블슈팅의 절반은 아키텍처 이해입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q"><code>system.parts</code>에서 특정 테이블의 <code>level = 0</code> 파트 비율이 매우 높게 나타났습니다. 이것이 의미하는 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">테이블이 최근에 생성되어 데이터가 거의 없다</button>
+    <button type="button" data-correct>INSERT로 생성된 파트를 백그라운드 머지가 따라잡지 못하고 있다</button>
+    <button type="button">파티션 키가 잘못 설계되어 인덱스가 동작하지 않는다</button>
+    <button type="button">레플리카 복제가 중단된 상태다</button>
+  </div>
+  <div class="quiz-expl">✅ level 0은 INSERT 직후 한 번도 머지되지 않은 파트입니다(6장). 이 비율이 높다는 것은 파트 생성 속도가 머지 속도를 초과한다는 신호로, 방치하면 "Too many parts"로 이어집니다. 원인은 소량 빈번 INSERT, 머지 스레드 부족, 디스크 I/O 병목, mutation 점유 순으로 확인하세요.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">레플리카 지연 진단 시 <code>system.replicas</code>의 <code>inserts_in_queue</code>가 높을 때 우선 확인해야 할 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">ORDER BY 키 설계와 granule skip 비율</button>
+    <button type="button" data-correct>네트워크 대역폭 — 다른 레플리카로부터의 파트 다운로드 병목</button>
+    <button type="button">Nullable 컬럼 사용 여부</button>
+  </div>
+  <div class="quiz-expl">✅ 복제는 압축된 파트 자체를 전송하는 물리적 복제입니다(8장). inserts_in_queue가 쌓인다는 것은 받아와야 할 파트가 밀렸다는 뜻이므로 네트워크/다운로드 병목을 먼저 봅니다. 반대로 merges_in_queue가 높으면 머지 스레드 부족이므로 background_pool_size 증가를 검토합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>이 장의 원문 문서: <a href="https://github.com/jaero0725/clickhouse-guide/blob/main/chapters/ch11_monitoring_troubleshooting.md" target="_blank" rel="noopener">chapters/ch11_monitoring_troubleshooting.md</a> — 문제별 전체 쿼리 모음, VLDB 2024 논문 등 참고 자료 목록이 담겨 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch10.html"><span class="dir">← 이전</span><br><span class="title">10장. 안티패턴 모음</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="index.html"><span class="dir">다음 →</span><br><span class="title">학습 홈으로</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

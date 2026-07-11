@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9장. 인덱스 구조와 활용 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch09">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>9장. 인덱스 구조와 활용</h1>
+<p class="lead">1억 건에서 한 건을 3~4번의 블록 읽기로 찾아내는 B*Tree. 그 구조를 이해하면 "왜 인덱스가 있는데 안 타지?"라는 질문에 스스로 답할 수 있게 됩니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 저장 구조</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① B*Tree의 루트·브랜치·리프 구조와 탐색 원리 ② 인덱스 access path 5종(UNIQUE/RANGE/FULL/FAST FULL/SKIP SCAN) ③ ROWID로 테이블에 접근하는 비용과 Clustering Factor ④ 비트맵·함수기반·리버스 키·IOT 같은 특수 인덱스의 쓰임새</p>
+  </div>
+</div>
+
+<h2 id="s1">9.1 B*Tree — 루트, 브랜치, 리프</h2>
+
+<p>Oracle의 기본 인덱스는 <strong>B*Tree(Balanced Tree)</strong>입니다. 이름 그대로 <strong>균형 잡힌 트리</strong>라서, 어떤 키를 찾든 루트에서 리프까지 내려가는 깊이(height)가 항상 같습니다. 구성 요소는 세 층입니다.</p>
+
+<ul>
+  <li><strong>루트(root) 블록</strong> — 트리의 꼭대기. 어느 브랜치로 내려갈지 알려주는 이정표.</li>
+  <li><strong>브랜치(branch) 블록</strong> — 중간 안내판. "이 범위의 키는 이쪽 아래로"라는 정보만 담습니다.</li>
+  <li><strong>리프(leaf) 블록</strong> — 실제 <strong>인덱스 키 값 + ROWID</strong>가 정렬된 채로 저장되는 곳. 그리고 리프끼리는 <strong>양방향 링크(doubly linked list)</strong>로 연결되어 있어, 범위 검색 시 트리를 다시 오르지 않고 옆으로 쭉 읽어나갈 수 있습니다.</li>
+</ul>
+
+<p>ROWID는 "이 행이 어느 데이터파일, 어느 블록, 몇 번째 슬롯에 있는가"를 담은 <strong>물리 주소</strong>입니다. 인덱스에서 키를 찾으면 ROWID를 얻고, 그 주소로 테이블 블록을 <em>단 한 번에</em> 찍어서 갑니다. 전체 과정을 애니메이션으로 봅시다.</p>
+
+<div class="anim" data-steps="5" data-title="B*Tree 탐색 — root → branch → leaf → ROWID → 테이블" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 350">
+      <defs>
+        <marker id="arr9a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr9b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+
+      <text x="20" y="24" class="sv-label sv-mono" font-size="13">WHERE empno = 7788</text>
+
+      <!-- root -->
+      <g data-active="1-1">
+        <rect x="200" y="40" width="200" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="300" y="65" text-anchor="middle" class="sv-label sv-mono" font-size="12">root: &lt;5000 | 5000~9000 | ≥9000</text>
+      </g>
+      <text x="430" y="65" class="sv-label-sm">← height 1</text>
+
+      <!-- branches -->
+      <rect x="40" y="120" width="130" height="38" rx="8" class="sv-box"/>
+      <text x="105" y="144" text-anchor="middle" class="sv-label-sm sv-mono">branch &lt;5000</text>
+      <rect x="235" y="120" width="130" height="38" rx="8" class="sv-box"/>
+      <text x="300" y="144" text-anchor="middle" class="sv-label-sm sv-mono">branch 5000~9000</text>
+      <rect x="430" y="120" width="130" height="38" rx="8" class="sv-box"/>
+      <text x="495" y="144" text-anchor="middle" class="sv-label-sm sv-mono">branch ≥9000</text>
+
+      <!-- leaves -->
+      <rect x="30" y="210" width="120" height="46" rx="8" class="sv-box"/>
+      <text x="90" y="230" text-anchor="middle" class="sv-label-sm sv-mono">1001..2999</text>
+      <text x="90" y="247" text-anchor="middle" class="sv-label-sm sv-mono">키+ROWID</text>
+      <rect x="170" y="210" width="120" height="46" rx="8" class="sv-box"/>
+      <text x="230" y="230" text-anchor="middle" class="sv-label-sm sv-mono">3000..4999</text>
+      <text x="230" y="247" text-anchor="middle" class="sv-label-sm sv-mono">키+ROWID</text>
+      <g data-active="3-5">
+        <rect x="310" y="210" width="120" height="46" rx="8" class="sv-box"/>
+        <text x="370" y="230" text-anchor="middle" class="sv-label-sm sv-mono">5000..7999</text>
+        <text x="370" y="247" text-anchor="middle" class="sv-label sv-mono" font-size="11">7788 → ROWID</text>
+      </g>
+      <rect x="450" y="210" width="120" height="46" rx="8" class="sv-box"/>
+      <text x="510" y="230" text-anchor="middle" class="sv-label-sm sv-mono">8000..8999</text>
+      <text x="510" y="247" text-anchor="middle" class="sv-label-sm sv-mono">키+ROWID</text>
+
+      <!-- leaf bidirectional links -->
+      <g data-show="5">
+        <path d="M 152 233 L 168 233" stroke="var(--purple)" stroke-width="2" class="flow-line"/>
+        <path d="M 292 233 L 308 233" stroke="var(--purple)" stroke-width="2" class="flow-line"/>
+        <path d="M 432 233 L 448 233" stroke="var(--purple)" stroke-width="2" class="flow-line"/>
+        <text x="300" y="285" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">리프끼리 양방향 링크 → 범위 스캔은 옆으로만 이동</text>
+      </g>
+
+      <!-- table -->
+      <rect x="620" y="170" width="180" height="110" rx="10" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="710" y="160" text-anchor="middle" class="sv-label-sm">테이블 (heap)</text>
+      <rect x="632" y="182" width="156" height="24" rx="5" class="sv-box"/>
+      <text x="710" y="199" text-anchor="middle" class="sv-label-sm sv-mono">7566 JONES</text>
+      <g data-active="4-5">
+        <rect x="632" y="212" width="156" height="24" rx="5" fill="color-mix(in srgb, var(--ok) 15%, transparent)" stroke="var(--ok)"/>
+        <text x="710" y="229" text-anchor="middle" class="sv-label-sm sv-mono">7788 SCOTT ✔</text>
+      </g>
+      <rect x="632" y="242" width="156" height="24" rx="5" class="sv-box"/>
+      <text x="710" y="259" text-anchor="middle" class="sv-label-sm sv-mono">7934 MILLER</text>
+
+      <!-- step arrows -->
+      <g data-show="2">
+        <path d="M 300 82 L 300 116" class="sv-arrow flow-line" marker-end="url(#arr9a)"/>
+        <text x="315" y="102" class="sv-label-sm" fill="var(--accent)">5000≤7788&lt;9000</text>
+      </g>
+      <g data-show="3">
+        <path d="M 310 160 Q 340 180 365 206" class="sv-arrow flow-line" marker-end="url(#arr9a)"/>
+      </g>
+      <g data-show="4">
+        <path d="M 434 240 Q 530 250 626 226" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr9b)"/>
+        <text x="520" y="205" class="sv-label-sm" fill="var(--ok)">ROWID = 파일#·블록#·슬롯#</text>
+      </g>
+      <g data-show="5">
+        <text x="410" y="330" text-anchor="middle" class="sv-label" font-size="14">✨ 블록 I/O 총 4번(root+branch+leaf+table)으로 1억 건 중 1건 완료</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>empno = 7788</code>을 찾습니다. 탐색은 언제나 <b>루트 블록</b>에서 시작합니다. 루트에는 "어느 브랜치로 갈지" 범위 이정표만 있습니다.</p>
+    <p>7788은 5000~9000 구간이므로 <b>가운데 브랜치</b>로 내려갑니다. 블록 1번 읽기 추가.</p>
+    <p>브랜치가 가리키는 <b>리프 블록</b>에 도착. 리프에는 정렬된 <code>키 + ROWID</code> 쌍이 있고, 여기서 7788의 ROWID를 얻습니다.</p>
+    <p>ROWID는 물리 주소(파일#·블록#·슬롯#)이므로 <b style="color:var(--ok)">테이블 블록을 정확히 한 번에</b> 찍어갑니다. 이것이 실행계획의 <code>TABLE ACCESS BY INDEX ROWID</code>입니다.</p>
+    <p>총 4번의 블록 읽기로 끝. 그리고 리프끼리는 <b style="color:var(--purple)">양방향 링크</b>로 연결되어 있어 <code>BETWEEN</code> 같은 범위 검색은 리프를 옆으로 죽 따라가기만 하면 됩니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">트리 깊이는 놀랄 만큼 얕다</div>
+    <p>B*Tree는 블록 하나에 수백 개의 키를 담기 때문에, 수억 건짜리 테이블도 height 3~4 수준인 경우가 대부분입니다. <strong>인덱스 탐색 비용은 데이터가 늘어도 거의 늘지 않는다</strong>는 것이 B*Tree의 힘입니다. 반대로 말하면, 인덱스 스캔이 느린 원인은 트리 탐색이 아니라 대부분 그 다음 단계 — 테이블 접근(9.3절)에 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">9.2 인덱스 access path 5종 — 실행계획에서 만나는 이름들</h2>
+
+<p>같은 인덱스라도 옵티마이저가 사용하는 방식은 다양합니다. 실행계획에 등장하는 대표적인 5가지를 정리합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Access Path</th><th>동작</th><th>언제 선택되나</th></tr></thead>
+  <tbody>
+    <tr><td><code>INDEX UNIQUE SCAN</code></td><td>루트→리프로 내려가 <strong>정확히 1건</strong>을 찾고 멈춤</td><td>UNIQUE/PK 인덱스에 등호(=) 조건</td></tr>
+    <tr><td><code>INDEX RANGE SCAN</code></td><td>시작 지점을 찾은 뒤 리프 링크를 따라 <strong>범위만큼 옆으로</strong> 스캔</td><td>일반 인덱스의 =, BETWEEN, &lt;, &gt;, LIKE 'AB%'</td></tr>
+    <tr><td><code>INDEX FULL SCAN</code></td><td>리프 전체를 <strong>키 정렬 순서대로</strong> 처음부터 끝까지 읽음(싱글 블록 I/O)</td><td>정렬 순서가 필요할 때(ORDER BY 생략 등)</td></tr>
+    <tr><td><code>INDEX FAST FULL SCAN</code></td><td>인덱스 세그먼트 전체를 <strong>멀티블록 I/O</strong>로 순서 무관하게 읽음</td><td>쿼리에 필요한 컬럼이 전부 인덱스에 있을 때 — 테이블 대신 인덱스를 "얇은 테이블"처럼 풀스캔</td></tr>
+    <tr><td><code>INDEX SKIP SCAN</code></td><td>결합 인덱스의 <strong>선두 컬럼이 조건에 없어도</strong>, 선두 컬럼의 값 종류별로 논리적 서브 인덱스를 건너뛰며 탐색</td><td>선두 컬럼의 distinct 값이 아주 적을 때(예: 성별)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- FAST FULL SCAN이 뜨는 전형적 상황: 인덱스만으로 답이 되는 쿼리</span>
+<span class="k">CREATE INDEX</span> emp_dept_sal_idx <span class="k">ON</span> emp(deptno, sal);
+
+<span class="k">SELECT</span> deptno, <span class="f">AVG</span>(sal) <span class="k">FROM</span> emp <span class="k">GROUP BY</span> deptno;
+<span class="c">-- 필요한 컬럼(deptno, sal)이 모두 인덱스 안에 있으므로
+-- 테이블은 아예 안 읽고 INDEX FAST FULL SCAN 가능</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">SKIP SCAN은 구조 신호</div>
+    <p>SKIP SCAN이 자주 보인다면 "선두 컬럼 없이 인덱스를 억지로 쓰고 있다"는 뜻입니다. 선두 컬럼의 값 종류가 적을 때만 그럭저럭 동작하며, 대개는 <strong>컬럼 순서를 바꾼 인덱스나 별도 인덱스를 만드는 편</strong>이 낫습니다. 결합 인덱스는 "등호 조건으로 자주 쓰는 컬럼을 앞에" 두는 것이 기본입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">9.3 Clustering Factor — 인덱스 성능의 숨은 지배자</h2>
+
+<p>인덱스 탐색 자체는 늘 빠릅니다. 문제는 리프에서 얻은 ROWID로 <strong>테이블 블록을 방문하는 횟수</strong>입니다. Oracle은 이를 <strong>Clustering Factor(CF)</strong>라는 통계로 측정합니다. 계산 방법은 단순합니다 — 리프의 키를 순서대로 따라가며 ROWID가 가리키는 테이블 블록이 <em>직전과 달라질 때마다</em> 카운트를 1 올립니다.</p>
+
+<ul>
+  <li><strong>CF ≈ 테이블 블록 수</strong> → 이웃한 키들이 같은 블록에 모여 있음. <strong>좋음</strong>.</li>
+  <li><strong>CF ≈ 테이블 행 수</strong> → 키마다 매번 다른 블록으로 점프. <strong>나쁨</strong>.</li>
+</ul>
+
+<div class="anim" data-steps="4" data-title="Clustering Factor — 정렬된 테이블 vs 흩어진 테이블" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 340">
+      <line x1="410" y1="16" x2="410" y2="300" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="200" y="26" text-anchor="middle" class="sv-label" font-size="14">😊 좋은 CF (키 순서 ≈ 저장 순서)</text>
+      <text x="620" y="26" text-anchor="middle" class="sv-label" font-size="14">😱 나쁜 CF (무작위 저장)</text>
+
+      <!-- 좋은 쪽: 인덱스 리프 -->
+      <rect x="60" y="46" width="280" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="200" y="68" text-anchor="middle" class="sv-label-sm sv-mono">리프: 날짜 01 02 03 04 05 06 07 08</text>
+      <!-- 좋은 쪽: 테이블 블록 3개 -->
+      <g data-active="2-4">
+        <rect x="60" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="100" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 A</text>
+        <text x="100" y="175" text-anchor="middle" class="sv-label-sm sv-mono">01 02 03</text>
+        <rect x="160" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="200" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 B</text>
+        <text x="200" y="175" text-anchor="middle" class="sv-label-sm sv-mono">04 05 06</text>
+        <rect x="260" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="300" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 C</text>
+        <text x="300" y="175" text-anchor="middle" class="sv-label-sm sv-mono">07 08</text>
+      </g>
+      <g data-show="2">
+        <path d="M 100 84 L 100 126" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <path d="M 200 84 L 200 126" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <path d="M 300 84 L 300 126" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <text x="200" y="225" text-anchor="middle" class="sv-label" fill="var(--ok)" font-size="13">8개 키 → 블록 방문 3번</text>
+      </g>
+
+      <!-- 나쁜 쪽 -->
+      <rect x="480" y="46" width="280" height="34" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="620" y="68" text-anchor="middle" class="sv-label-sm sv-mono">리프: 날짜 01 02 03 04 05 06 07 08</text>
+      <g data-active="3-4">
+        <rect x="480" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="520" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 A</text>
+        <text x="520" y="175" text-anchor="middle" class="sv-label-sm sv-mono">03 07 01</text>
+        <rect x="580" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="620" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 B</text>
+        <text x="620" y="175" text-anchor="middle" class="sv-label-sm sv-mono">05 02 08</text>
+        <rect x="680" y="130" width="80" height="60" rx="8" class="sv-box"/>
+        <text x="720" y="155" text-anchor="middle" class="sv-label-sm sv-mono">블록 C</text>
+        <text x="720" y="175" text-anchor="middle" class="sv-label-sm sv-mono">04 06</text>
+      </g>
+      <g data-show="3">
+        <path d="M 500 84 Q 480 105 505 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 540 84 Q 600 100 615 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 580 84 Q 520 110 528 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 620 84 Q 700 100 715 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 660 84 Q 610 110 618 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <path d="M 700 84 Q 740 105 728 128" stroke="var(--danger)" stroke-width="1.8" fill="none" class="flow-line"/>
+        <text x="620" y="225" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13">8개 키 → 블록 방문 8번 (매번 점프!)</text>
+      </g>
+
+      <g data-show="4">
+        <rect x="120" y="255" width="580" height="52" rx="10" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)"/>
+        <text x="410" y="277" text-anchor="middle" class="sv-label" font-size="13">CF ≈ 블록 수 → 인덱스 유리 / CF ≈ 행 수 → 옵티마이저는 인덱스 비용을 높게 계산</text>
+        <text x="410" y="297" text-anchor="middle" class="sv-label-sm">같은 인덱스라도 CF가 나쁘면 Full Table Scan이 선택될 수 있다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>양쪽 모두 <b>같은 인덱스</b>입니다. 리프에는 날짜 키가 01~08 순서로 정렬되어 있습니다. 차이는 테이블 쪽 저장 순서뿐입니다.</p>
+    <p>왼쪽 테이블은 입력 순서가 키 순서와 비슷합니다(예: 날짜순으로 쌓이는 로그). 리프를 따라가면 <b style="color:var(--ok)">같은 블록을 연달아</b> 방문 — 8건을 읽는데 블록 3개면 충분합니다.</p>
+    <p>오른쪽은 행이 무작위로 흩어져 있습니다. 키를 하나 읽을 때마다 <b style="color:var(--danger)">다른 블록으로 점프</b> — 8건에 블록 8번. 범위가 커질수록 이 차이는 수백 배로 벌어집니다.</p>
+    <p>옵티마이저는 CF를 <b>인덱스 비용 계산에 직접 반영</b>합니다. "인덱스가 있는데 풀스캔을 하네?"의 흔한 범인이 바로 나쁜 CF입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">CF는 어디서 확인하나</div>
+    <p><code>SELECT index_name, clustering_factor FROM user_indexes;</code>로 확인하고, <code>user_tables</code>의 <code>blocks</code>·<code>num_rows</code>와 비교해 보세요. 블록 수에 가까우면 건강, 행 수에 가까우면 그 인덱스의 넓은 범위 스캔은 비쌉니다. CF는 인덱스가 아니라 <strong>테이블의 저장 순서</strong>가 결정하므로, 인덱스를 재생성해도 좋아지지 않습니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">9.4 Bitmap Index — 저(低)카디널리티의 무기</h2>
+
+<p>성별, 지역, 상태 코드처럼 <strong>값의 종류(카디널리티)가 적은 컬럼</strong>은 B*Tree로 만들면 효율이 떨어집니다. 이때 Oracle(Enterprise Edition)의 <strong>비트맵 인덱스</strong>가 등장합니다. 값 하나마다 "각 행이 이 값인가?"를 0/1 비트열로 저장하고, 여러 조건은 <strong>비트 연산(AND/OR)</strong>으로 순식간에 결합합니다.</p>
+
+<div class="anim" data-steps="4" data-title="비트맵 인덱스 — AND 연산으로 조건 결합" data-interval="2600">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 300">
+      <text x="20" y="26" class="sv-label sv-mono" font-size="13">WHERE gender = 'F' AND region = '서울'</text>
+
+      <!-- bitmap 1 -->
+      <g data-show="1">
+        <text x="30" y="72" class="sv-label sv-mono" font-size="12">gender='F'</text>
+        <g class="sv-mono" font-size="14">
+          <rect x="160" y="52" width="360" height="30" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+          <text x="340" y="73" text-anchor="middle" class="sv-label sv-mono" font-size="14" letter-spacing="10">1 0 1 1 0 1 0 1</text>
+        </g>
+      </g>
+      <!-- bitmap 2 -->
+      <g data-show="2">
+        <text x="30" y="122" class="sv-label sv-mono" font-size="12">region='서울'</text>
+        <rect x="160" y="102" width="360" height="30" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="340" y="123" text-anchor="middle" class="sv-label sv-mono" font-size="14" letter-spacing="10">1 0 0 1 1 0 0 1</text>
+        <text x="560" y="100" class="sv-label" font-size="16">AND ⚡</text>
+      </g>
+      <!-- result -->
+      <g data-show="3">
+        <line x1="160" y1="146" x2="520" y2="146" class="sv-line"/>
+        <rect x="160" y="158" width="360" height="30" rx="6" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)"/>
+        <text x="340" y="179" text-anchor="middle" class="sv-label sv-mono" font-size="14" letter-spacing="10" fill="var(--ok)">1 0 0 1 0 0 0 1</text>
+        <text x="30" y="178" class="sv-label sv-mono" font-size="12" fill="var(--ok)">결과 비트맵</text>
+      </g>
+      <!-- to rowid -->
+      <g data-show="4">
+        <path d="M 200 192 L 200 232" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <path d="M 355 192 L 355 232" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <path d="M 505 192 L 505 232" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <rect x="120" y="238" width="480" height="40" rx="8" class="sv-box"/>
+        <text x="360" y="263" text-anchor="middle" class="sv-label sv-mono" font-size="12">비트 위치 → ROWID 변환 → 1·4·8번째 행만 테이블 접근</text>
+        <text x="660" y="263" class="sv-label-sm" fill="var(--ok)">3건만 읽음 ✔</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>gender='F'</code>의 비트맵. 8개 행 각각에 대해 "여성이면 1"인 비트열이 인덱스에 압축 저장되어 있습니다.</p>
+    <p><code>region='서울'</code>의 비트맵도 같은 방식으로 존재합니다. 두 조건의 결합은 트리 탐색 두 번이 아니라, CPU가 가장 잘하는 <b>비트 AND 연산</b>입니다.</p>
+    <p>AND 결과: 두 비트가 모두 1인 위치만 남습니다. 수백만 행이라도 비트 연산은 순식간입니다.</p>
+    <p>남은 비트 위치를 <b style="color:var(--ok)">ROWID로 변환</b>해 그 행들만 테이블에서 읽습니다. 이런 다중 조건 조합 검색(DW의 별표 스키마 등)이 비트맵 인덱스의 주 무대입니다.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">DML이 잦은 테이블에 비트맵 인덱스 금지</div>
+    <p>비트맵 인덱스의 엔트리 하나는 <strong>수많은 행의 범위</strong>를 커버합니다. 한 행만 UPDATE해도 그 비트맵 조각 전체에 락이 걸려, 동시 DML이 서로를 광범위하게 블로킹하고 데드락까지 유발합니다. <strong>OLTP 테이블에는 절대 금물</strong> — 야간 배치로 적재하는 DW/읽기 전용 성격의 테이블에서만 쓰세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">9.5 특수 인덱스 3종 — 함수기반, 리버스 키, IOT</h2>
+
+<h3>함수기반 인덱스 (Function-Based Index)</h3>
+<p>WHERE 절에서 컬럼을 가공하면(<code>UPPER(name)</code> 등) 일반 인덱스는 사용할 수 없습니다. 가공을 없애는 것이 최선이지만, 불가피하다면 <strong>가공된 결과 자체를 인덱싱</strong>할 수 있습니다.</p>
+
+<pre><code><span class="c">-- UPPER(ename) 조건은 ename 인덱스를 못 쓴다 → 함수 결과를 인덱싱</span>
+<span class="k">CREATE INDEX</span> emp_upper_ename_idx <span class="k">ON</span> emp (<span class="f">UPPER</span>(ename));
+
+<span class="k">SELECT</span> * <span class="k">FROM</span> emp <span class="k">WHERE</span> <span class="f">UPPER</span>(ename) = <span class="s">'SCOTT'</span>;  <span class="c">-- 이제 인덱스 사용 가능</span></code></pre>
+
+<h3>리버스 키 인덱스 (Reverse Key Index)</h3>
+<p>시퀀스로 증가하는 PK는 항상 <strong>가장 오른쪽 리프 블록</strong>에만 INSERT가 몰립니다. 동시 INSERT가 많으면(특히 RAC 환경) 그 블록을 두고 경합이 발생하죠. 리버스 키 인덱스는 키의 바이트를 뒤집어 저장해(1234→4321) INSERT를 <strong>여러 리프로 분산</strong>시킵니다. 단, 키 순서가 파괴되므로 <strong>범위 스캔(BETWEEN, &lt;, &gt;)은 불가능</strong>해집니다. 등호 검색만 하는 컬럼에만 고려하세요.</p>
+
+<h3>IOT (Index-Organized Table)</h3>
+<p>보통은 "테이블 따로, 인덱스 따로"지만, IOT는 <strong>테이블 자체를 PK 순서의 B*Tree로 저장</strong>합니다. 리프 블록에 ROWID 대신 <strong>행 데이터 전체</strong>가 들어 있어, PK로 조회하면 테이블 접근 단계가 아예 없습니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> code_master (
+  code_id   <span class="k">NUMBER</span> <span class="k">PRIMARY KEY</span>,
+  code_name <span class="k">VARCHAR2</span>(100)
+) <span class="k">ORGANIZATION INDEX</span>;   <span class="c">-- 테이블이 곧 인덱스</span></code></pre>
+
+<p>PK 중심으로만 접근하는 코드성 테이블, 좁은 테이블에 적합합니다. 반대로 PK 외 컬럼 검색이 많거나 행이 큰 테이블에는 부적합합니다(보조 인덱스가 물리 ROWID를 쓸 수 없어 접근이 한 단계 더 복잡해집니다).</p>
+
+<div class="callout info">
+  <span class="ico">🐘</span>
+  <div>
+    <div class="callout-title">PostgreSQL과 비교하며 읽기</div>
+    <p>PostgreSQL의 B-Tree도 구조는 거의 같습니다(<a href="../pg/ch05.html">PG 5장 인덱스</a>). Oracle의 Clustering Factor에 해당하는 것이 PG의 <code>pg_stats.correlation</code>입니다. 반면 비트맵 "인덱스"는 Oracle 고유이고, PG는 실행 시점에 임시 비트맵을 만드는 Bitmap Index Scan으로 비슷한 효과를 냅니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">어떤 인덱스의 Clustering Factor가 테이블의 행 수에 가깝게 나왔습니다. 이것이 의미하는 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">인덱스가 손상되어 재생성(REBUILD)이 필요하다</button>
+    <button type="button" data-correct>키 순서상 이웃한 행들이 테이블에서 서로 다른 블록에 흩어져 있어, 넓은 범위 스캔 시 테이블 블록 I/O가 매우 많아진다</button>
+    <button type="button">트리 height가 너무 깊어져 루트 탐색이 느려진다</button>
+    <button type="button">리프 블록의 양방향 링크가 끊어져 범위 스캔이 불가능하다</button>
+  </div>
+  <div class="quiz-expl">✅ CF ≈ 행 수 = 리프의 키를 하나 따라갈 때마다 매번 다른 테이블 블록으로 점프한다는 뜻입니다. 옵티마이저는 이 값을 비용에 반영해 인덱스 대신 Full Table Scan을 선택하기도 합니다. CF는 테이블의 저장 순서가 결정하므로 인덱스 REBUILD로는 개선되지 않습니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">주문 상태(status) 컬럼은 값이 5종류뿐입니다. 초당 수백 건씩 INSERT/UPDATE가 일어나는 주문 테이블에 비트맵 인덱스를 만들면?</div>
+  <div class="quiz-opts">
+    <button type="button">카디널리티가 낮으므로 최적의 선택이다</button>
+    <button type="button">조회는 빨라지고 DML에는 아무 영향이 없다</button>
+    <button type="button" data-correct>비트맵 조각 단위의 광범위한 락 때문에 동시 DML이 서로 블로킹되어 큰 장애로 이어질 수 있다</button>
+  </div>
+  <div class="quiz-expl">✅ 비트맵 엔트리 하나가 많은 행의 범위를 커버하므로, 한 행의 변경이 그 범위 전체를 잠급니다. 동시 DML이 많은 OLTP 테이블에서는 블로킹·데드락의 원인이 됩니다. 비트맵 인덱스는 DML이 뜸한 DW성 테이블 전용입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c 공식 문서: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/indexes-and-index-organized-tables.html" target="_blank" rel="noopener">Database Concepts — Indexes and Index-Organized Tables</a>, <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/optimizer-access-paths.html" target="_blank" rel="noopener">SQL Tuning Guide — Optimizer Access Paths</a></p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch08.html"><span class="dir">← 이전</span><br><span class="title">8장. 트랜잭션과 락</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch10.html"><span class="dir">다음 →</span><br><span class="title">10장. 옵티마이저와 실행계획</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

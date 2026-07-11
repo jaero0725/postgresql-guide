@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4장. 백그라운드 프로세스 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch04">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>4장. 백그라운드 프로세스</h1>
+<p class="lead">여러분이 COMMIT을 누르는 순간, 디스크에 쓰이는 것은 데이터가 아니라 redo입니다 — 이 한 문장을 이해하면 Oracle의 쓰기 성능과 장애 복구가 한 줄로 꿰어집니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2장 SGA</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 백그라운드 프로세스 전체 지도 — 누가 어디서 일하나 ② DBWn(게으른 기록)과 LGWR(커밋 시 동기 기록)의 역할 분담 ③ CKPT·SMON·PMON·ARCn·MMON의 임무 ④ 인스턴스 크래시에서 SMON이 데이터를 살려내는 과정</p>
+  </div>
+</div>
+
+<h2 id="s1">4.1 전체 지도 — 인스턴스를 움직이는 상근 직원들</h2>
+
+<p>서버 프로세스(3장)가 "손님(세션)을 응대하는 직원"이라면, <strong>백그라운드 프로세스</strong>는 인스턴스가 기동될 때부터 종료될 때까지 각자 맡은 일만 반복하는 <strong>상근 직원들</strong>입니다. 서버 프로세스가 무거운 일(디스크 쓰기, 로그 관리, 청소)을 직접 하지 않고 이들에게 위임하기 때문에, 개별 쿼리가 빨라집니다.</p>
+
+<p>먼저 전체 지도에서 일곱 주인공의 위치를 눈에 익히세요. 각 프로세스가 <em>SGA의 어느 부분</em>과 <em>디스크의 어느 파일</em> 사이에서 일하는지가 포인트입니다.</p>
+
+<div class="anim" data-steps="6" data-title="백그라운드 프로세스 전체 지도 — 일곱 직원의 근무 위치" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 390">
+      <!-- SGA -->
+      <rect x="250" y="36" width="370" height="120" rx="12" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+      <text x="435" y="60" text-anchor="middle" class="sv-label">🧠 SGA</text>
+      <rect x="268" y="74" width="160" height="64" rx="8" class="sv-box"/>
+      <text x="348" y="100" text-anchor="middle" class="sv-label-sm">Buffer Cache</text>
+      <text x="348" y="118" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">dirty 🔥</text>
+      <rect x="444" y="74" width="160" height="64" rx="8" class="sv-box"/>
+      <text x="524" y="100" text-anchor="middle" class="sv-label-sm">Redo Log Buffer</text>
+      <text x="524" y="118" text-anchor="middle" class="sv-label-sm sv-mono">redo entries</text>
+
+      <!-- 디스크 파일들 -->
+      <rect x="90" y="310" width="150" height="60" rx="9" class="sv-box"/>
+      <text x="165" y="336" text-anchor="middle" class="sv-label-sm">💾 데이터파일</text>
+      <text x="165" y="354" text-anchor="middle" class="sv-label-sm sv-mono">data blocks</text>
+      <rect x="370" y="310" width="170" height="60" rx="9" class="sv-box"/>
+      <text x="455" y="336" text-anchor="middle" class="sv-label-sm">📜 온라인 리두 로그</text>
+      <text x="455" y="354" text-anchor="middle" class="sv-label-sm sv-mono">redo log files</text>
+      <rect x="670" y="310" width="160" height="60" rx="9" class="sv-box"/>
+      <text x="750" y="336" text-anchor="middle" class="sv-label-sm">🗃 아카이브 로그</text>
+      <text x="750" y="354" text-anchor="middle" class="sv-label-sm sv-mono">archived logs</text>
+      <rect x="670" y="180" width="160" height="50" rx="9" class="sv-box"/>
+      <text x="750" y="202" text-anchor="middle" class="sv-label-sm">🪪 컨트롤파일</text>
+      <text x="750" y="219" text-anchor="middle" class="sv-label-sm sv-mono">checkpoint 정보</text>
+
+      <!-- 프로세스 박스들 (항상 표시) -->
+      <rect x="120" y="210" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+      <text x="165" y="236" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">DBWn</text>
+      <rect x="410" y="210" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+      <text x="455" y="236" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">LGWR</text>
+      <rect x="560" y="210" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="605" y="236" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">CKPT</text>
+      <rect x="40" y="50" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="85" y="76" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">SMON</text>
+      <rect x="40" y="110" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="85" y="136" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">PMON</text>
+      <rect x="670" y="50" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="715" y="76" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">MMON</text>
+      <rect x="670" y="248" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="715" y="274" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">ARCn</text>
+
+      <!-- step1: DBWn -->
+      <g data-show="1-1">
+        <rect x="114" y="204" width="102" height="54" rx="11" fill="none" stroke="var(--ok)" stroke-width="2.5" class="pulse"/>
+        <path d="M 300 140 Q 240 190 190 208" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 165 254 L 165 306" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="30" y="290" class="sv-label-sm" fill="var(--ok)">dirty buffer → 데이터파일</text>
+      </g>
+      <!-- step2: LGWR -->
+      <g data-show="2-2">
+        <rect x="404" y="204" width="102" height="54" rx="11" fill="none" stroke="var(--danger)" stroke-width="2.5" class="pulse"/>
+        <path d="M 510 142 Q 480 180 465 206" stroke="var(--danger)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 455 254 L 455 306" stroke="var(--danger)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="240" y="290" class="sv-label-sm" fill="var(--danger)">커밋 시 redo → 리두 로그 (동기!)</text>
+      </g>
+      <!-- step3: CKPT -->
+      <g data-show="3-3">
+        <rect x="554" y="204" width="102" height="54" rx="11" fill="none" stroke="var(--accent)" stroke-width="2.5" class="pulse"/>
+        <path d="M 652 226 L 666 212" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 580 258 Q 400 290 244 330" stroke="var(--accent)" stroke-width="1.8" fill="none" stroke-dasharray="5 4"/>
+        <text x="500" y="290" class="sv-label-sm" fill="var(--accent)">체크포인트 정보를 컨트롤파일·데이터파일 헤더에</text>
+      </g>
+      <!-- step4: SMON -->
+      <g data-show="4-4">
+        <rect x="34" y="44" width="102" height="54" rx="11" fill="none" stroke="var(--warn)" stroke-width="2.5" class="pulse"/>
+        <text x="140" y="46" class="sv-label-sm" fill="var(--warn)">인스턴스 복구 · temp 정리</text>
+      </g>
+      <!-- step5: PMON -->
+      <g data-show="5-5">
+        <rect x="34" y="104" width="102" height="54" rx="11" fill="none" stroke="var(--warn)" stroke-width="2.5" class="pulse"/>
+        <text x="140" y="170" class="sv-label-sm" fill="var(--warn)">죽은 프로세스 뒷정리 (락 해제)</text>
+      </g>
+      <!-- step6: ARCn + MMON -->
+      <g data-show="6-6">
+        <rect x="664" y="242" width="102" height="54" rx="11" fill="none" stroke="var(--purple)" stroke-width="2.5" class="pulse"/>
+        <rect x="664" y="44" width="102" height="54" rx="11" fill="none" stroke="var(--purple)" stroke-width="2.5" class="pulse"/>
+        <path d="M 545 336 Q 610 336 666 336" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="548" y="300" class="sv-label-sm" fill="var(--purple)">가득 찬 로그 → 아카이브</text>
+        <text x="580" y="66" class="sv-label-sm" fill="var(--purple)">AWR 스냅샷 ←</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b style="color:var(--ok)">DBWn</b>(Database Writer): 버퍼 캐시의 dirty buffer를 <b>데이터파일</b>에 기록합니다. 서두르지 않고 모아서 쓰는 "게으른 기록자"입니다.</p>
+    <p><b style="color:var(--danger)">LGWR</b>(Log Writer): Redo Log Buffer의 redo entry를 <b>온라인 리두 로그 파일</b>에 씁니다. 커밋 순간만큼은 <b>동기(synchronous)</b>로 — 이 장의 주인공입니다.</p>
+    <p><b style="color:var(--accent)">CKPT</b>(Checkpoint): 체크포인트 정보를 <b>컨트롤파일과 데이터파일 헤더</b>에 기록하고 DBWn에게 쓰기를 지시합니다. "여기까지는 디스크에 반영됨"이라는 책갈피 관리자입니다.</p>
+    <p><b style="color:var(--warn)">SMON</b>(System Monitor): 크래시 후 재기동 시 <b>인스턴스 복구</b>를 수행하고, 쓰다 버려진 임시 세그먼트를 청소합니다.</p>
+    <p><b style="color:var(--warn)">PMON</b>(Process Monitor): 비정상 종료된 프로세스의 뒷정리 — 잡고 있던 락을 풀고 세션 자원을 회수합니다.</p>
+    <p><b style="color:var(--purple)">ARCn</b>(Archiver): 가득 찬 리두 로그를 <b>아카이브 로그</b>로 복사해 보존합니다(ARCHIVELOG 모드). <b style="color:var(--purple)">MMON</b>: AWR 성능 스냅샷을 주기적으로 저장합니다(12장). — 일곱 직원의 지도 완성!</p>
+  </div>
+</div>
+
+<p>현재 인스턴스에서 실제로 돌고 있는 백그라운드 프로세스는 이렇게 확인합니다.</p>
+
+<pre><code><span class="c">-- 지금 떠 있는 백그라운드 프로세스 목록</span>
+<span class="k">SELECT</span> name, description
+<span class="k">FROM</span>   v$bgprocess
+<span class="k">WHERE</span>  paddr <> <span class="s">'00'</span>   <span class="c">-- 실행 중인 것만</span>
+<span class="k">ORDER BY</span> name;
+
+NAME  DESCRIPTION
+----  ----------------------------------
+CKPT  checkpoint
+DBW0  db writer process 0
+LGWR  Redo etc.
+PMON  process cleanup
+SMON  System Monitor Process
+...</code></pre>
+
+<h2 id="s2">4.2 DBWn — 서두르지 않는 기록자</h2>
+
+<p>2장에서 봤듯 UPDATE는 버퍼 캐시만 고치고 끝납니다. dirty buffer를 데이터파일에 실제로 쓰는 것은 <strong>DBWn</strong>입니다(쓰기 부하가 크면 DBW0, DBW1…처럼 여러 개를 둘 수 있어 n이 붙습니다). DBWn이 움직이는 대표적인 계기는:</p>
+
+<ul>
+  <li>서버 프로세스가 빈 버퍼를 못 찾을 때 (자리를 만들어야 함)</li>
+  <li>체크포인트가 발생했을 때 (CKPT의 지시)</li>
+  <li>주기적인 한가한 시점의 정리</li>
+</ul>
+
+<p>중요한 것은 <strong>DBWn은 커밋과 무관하게 움직인다</strong>는 사실입니다. 커밋 안 된 변경도 자리가 필요하면 디스크에 쓰고, 커밋된 변경도 한참 뒤에 쓸 수 있습니다. "그래도 괜찮은" 이유가 다음 절의 LGWR입니다.</p>
+
+<h2 id="s3">4.3 LGWR — 커밋의 실체</h2>
+
+<p>커밋의 내구성(durability)을 책임지는 것은 <strong>LGWR</strong>입니다. 세션이 <code>COMMIT</code>을 실행하면, LGWR이 그 트랜잭션의 redo entry를 온라인 리두 로그 파일에 <strong>물리적으로 쓸 때까지</strong> 세션은 기다립니다(이 대기가 그 유명한 <code>log file sync</code> 대기 이벤트입니다). 기록이 끝나야 "커밋 완료" 응답이 나갑니다.</p>
+
+<p>왜 데이터 블록 대신 redo를 쓸까요? <strong>redo는 로그 파일 끝에 이어 쓰는 순차 쓰기</strong>라서 작고 빠릅니다. 반면 데이터 블록은 파일 여기저기에 흩어진 랜덤 쓰기죠. "빠른 순차 쓰기로 안전을 확보하고, 느린 랜덤 쓰기는 나중에 몰아서" — 이것이 Oracle 쓰기 성능의 비밀이며, PostgreSQL의 WAL(<a href="../pg/ch09.html">pg 9장</a>)과 동일한 설계입니다.</p>
+
+<div class="anim" data-steps="5" data-title="COMMIT의 순간 — LGWR만 동기로 뛰고, DBWn은 나중에 걷는다" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 840 360">
+      <!-- 세션 -->
+      <rect x="24" y="120" width="140" height="60" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="94" y="146" text-anchor="middle" class="sv-label">💻 세션</text>
+      <text x="94" y="164" text-anchor="middle" class="sv-label-sm sv-mono">UPDATE → COMMIT</text>
+
+      <!-- SGA -->
+      <rect x="230" y="40" width="380" height="150" rx="12" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="420" y="64" text-anchor="middle" class="sv-label">🧠 SGA</text>
+      <rect x="250" y="80" width="160" height="90" rx="8" class="sv-box"/>
+      <text x="330" y="104" text-anchor="middle" class="sv-label-sm">Buffer Cache</text>
+      <g data-show="1">
+        <rect x="266" y="116" width="128" height="40" rx="6" fill="color-mix(in srgb, var(--warn) 20%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="330" y="136" text-anchor="middle" class="sv-label-sm sv-mono">블록 P′ (dirty)</text>
+        <text x="330" y="150" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">새 잔액 반영됨 🔥</text>
+      </g>
+      <rect x="430" y="80" width="160" height="90" rx="8" class="sv-box"/>
+      <text x="510" y="104" text-anchor="middle" class="sv-label-sm">Redo Log Buffer</text>
+      <g data-show="1">
+        <rect x="446" y="116" width="128" height="40" rx="6" fill="color-mix(in srgb, var(--danger) 14%, transparent)" stroke="var(--danger)" stroke-width="1.4"/>
+        <text x="510" y="136" text-anchor="middle" class="sv-label-sm sv-mono">redo entry</text>
+        <text x="510" y="150" text-anchor="middle" class="sv-label-sm">"P를 이렇게 바꿈"</text>
+      </g>
+
+      <!-- LGWR / 리두 로그 -->
+      <rect x="450" y="220" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.5"/>
+      <text x="495" y="246" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">LGWR</text>
+      <rect x="620" y="220" width="190" height="56" rx="9" class="sv-box"/>
+      <text x="715" y="244" text-anchor="middle" class="sv-label-sm">📜 온라인 리두 로그</text>
+      <g data-show="3">
+        <rect x="636" y="252" width="110" height="16" rx="4" fill="color-mix(in srgb, var(--danger) 22%, transparent)" stroke="var(--danger)" stroke-width="1"/>
+        <text x="691" y="264" text-anchor="middle" class="sv-label-sm" font-size="9.5">redo 기록됨 ✓</text>
+      </g>
+
+      <!-- DBWn / 데이터파일 -->
+      <rect x="120" y="220" width="90" height="42" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+      <text x="165" y="246" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">DBWn</text>
+      <rect x="120" y="292" width="190" height="56" rx="9" class="sv-box"/>
+      <text x="215" y="316" text-anchor="middle" class="sv-label-sm">💾 데이터파일</text>
+      <text x="215" y="334" text-anchor="middle" class="sv-label-sm" data-show="1-4">블록 P는 아직 옛 잔액!</text>
+      <g data-show="5">
+        <text x="215" y="334" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">이제야 새 잔액 반영 ✓</text>
+      </g>
+
+      <!-- step2: commit 요청 -->
+      <g data-show="2">
+        <path d="M 168 140 Q 240 180 320 200 Q 400 220 446 238" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="180" y="204" class="sv-label-sm" fill="var(--accent)">COMMIT! ⏳ 세션은 대기…</text>
+      </g>
+
+      <!-- step3: LGWR 동기 기록 -->
+      <g data-show="3">
+        <path d="M 510 174 L 500 216" stroke="var(--danger)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 544 241 L 616 241" stroke="var(--danger)" stroke-width="2.4" fill="none" class="flow-line"/>
+        <text x="540" y="300" class="sv-label-sm" fill="var(--danger)">redo를 디스크에 동기 기록 (log file sync)</text>
+      </g>
+
+      <!-- step4: 커밋 완료 -->
+      <g data-show="4">
+        <path d="M 446 260 Q 300 300 168 172" stroke="var(--ok)" stroke-width="2.2" fill="none" stroke-dasharray="5 4"/>
+        <text x="250" y="284" class="sv-label" fill="var(--ok)">커밋 완료 응답! 🎉</text>
+      </g>
+
+      <!-- step5: DBWn lazy -->
+      <g data-show="5">
+        <path d="M 310 160 Q 240 190 185 216" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <path d="M 165 264 L 165 288" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="330" y="220" class="sv-label-sm" fill="var(--ok)">한참 뒤, 여유 있을 때 기록</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>UPDATE 실행 직후의 상태입니다. 버퍼 캐시의 블록은 <b style="color:var(--warn)">dirty</b>(새 잔액), Redo Log Buffer에는 "무엇을 어떻게 바꿨는지"의 <b>redo entry</b>가 쌓였습니다. 디스크의 데이터파일은 아직 옛 잔액 그대로입니다.</p>
+    <p>세션이 <code>COMMIT</code>을 실행합니다. 이제 세션은 <b>기다립니다</b> — 무엇을? 데이터파일 기록이 아니라 redo 기록을!</p>
+    <p><b style="color:var(--danger)">LGWR</b>이 redo entry를 온라인 리두 로그 파일에 <b>동기적으로</b> 씁니다. 로그 끝에 이어 쓰는 순차 I/O라 매우 빠릅니다. 이 대기가 <code>log file sync</code> 이벤트입니다.</p>
+    <p>redo가 디스크에 안착하는 순간 <b style="color:var(--ok)">커밋 완료</b>! 주목 — <b>데이터파일에는 아직 새 값이 없습니다.</b> 그래도 안전합니다. 지금 서버가 죽어도 redo만 있으면 변경을 재현할 수 있으니까요.</p>
+    <p>dirty 블록은 <b style="color:var(--ok)">DBWn</b>이 나중에 여유 있을 때 데이터파일에 씁니다. 정리: <b>커밋 시 디스크에 쓰는 것은 데이터가 아니라 redo다.</b> LGWR은 단거리 주자, DBWn은 마라토너입니다.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">이 장에서 단 하나만 기억한다면</div>
+    <p><strong>"커밋 시 디스크에 쓰는 것은 데이터가 아니라 redo다."</strong> 커밋이 느리면 범인은 대부분 LGWR의 쓰기 경로(<code>log file sync</code>)이고, 데이터파일 I/O가 느린 것은 커밋 지연과 직접 관계가 없습니다. 루프 안에서 건건이 커밋하는 코드가 왜 느린지도 이 문장으로 설명됩니다 — 커밋마다 LGWR 동기 기록을 기다리기 때문입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 커밋 대기(log file sync)가 얼마나 발생했는지</span>
+<span class="k">SELECT</span> event, total_waits, time_waited_micro/<span class="n">1000000</span> <span class="k">AS</span> sec
+<span class="k">FROM</span>   v$system_event
+<span class="k">WHERE</span>  event = <span class="s">'log file sync'</span>;
+
+EVENT           TOTAL_WAITS  SEC
+--------------  -----------  ------
+log file sync       9214432  518.3</code></pre>
+
+<h2 id="s4">4.4 CKPT — "여기까지는 반영됨" 책갈피</h2>
+
+<p><strong>CKPT(Checkpoint Process)</strong>는 체크포인트 시점마다 <strong>컨트롤파일과 데이터파일 헤더에 체크포인트 위치를 기록</strong>하고, DBWn에게 dirty buffer 기록을 지시합니다. 체크포인트 위치는 "redo 스트림의 이 지점까지는 데이터파일에 반영 완료"라는 책갈피입니다.</p>
+
+<p>이 책갈피의 존재 이유는 <strong>복구 시간 단축</strong>입니다. 크래시 후 복구할 때 redo 전체가 아니라 <em>마지막 체크포인트 이후</em>의 redo만 재생하면 되기 때문입니다. 책갈피가 자주 갱신될수록(체크포인트가 잦을수록) 복구는 빨라지지만 평상시 I/O 부담이 늘어나는 트레이드오프가 있습니다 — 7장에서 자세히 다룹니다.</p>
+
+<h2 id="s5">4.5 SMON — 크래시에서 살려내는 복구 반장</h2>
+
+<p><strong>SMON(System Monitor)</strong>의 대표 임무는 <strong>인스턴스 복구(instance recovery)</strong>입니다. 정전 등으로 인스턴스가 갑자기 죽으면 메모리(SGA)의 내용은 모두 증발합니다. 커밋됐지만 데이터파일에 아직 안 쓰인 변경(dirty buffer였던 것들)도 함께요. 재기동 시 SMON이 redo와 undo를 이용해 데이터베이스를 일관된 상태로 되돌립니다. 그 밖에 쓰다 버려진 임시 세그먼트 정리 같은 청소 업무도 SMON 담당입니다.</p>
+
+<div class="anim" data-steps="5" data-title="인스턴스 크래시와 SMON의 복구 — roll forward, then rollback" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 840 340">
+      <!-- 인스턴스 -->
+      <g data-show="1-1">
+        <rect x="60" y="40" width="300" height="110" rx="12" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="210" y="66" text-anchor="middle" class="sv-label">🧠 인스턴스 (SGA)</text>
+        <text x="210" y="94" text-anchor="middle" class="sv-label-sm">TX1: 커밋됨 — 데이터파일 미반영 (dirty였음)</text>
+        <text x="210" y="116" text-anchor="middle" class="sv-label-sm">TX2: 커밋 안 됨 — 일부는 디스크에 이미 기록</text>
+      </g>
+      <g data-show="2-2">
+        <rect x="60" y="40" width="300" height="110" rx="12" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="2" stroke-dasharray="6 5"/>
+        <text x="210" y="90" text-anchor="middle" class="sv-label" font-size="18" fill="var(--danger)">💥 크래시!</text>
+        <text x="210" y="118" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">메모리 내용 전부 증발</text>
+      </g>
+      <g data-show="3">
+        <rect x="60" y="40" width="300" height="110" rx="12" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="210" y="70" text-anchor="middle" class="sv-label">🔄 재기동 — SMON 출동</text>
+        <text x="210" y="96" text-anchor="middle" class="sv-label-sm" data-show="3-3">"마지막 체크포인트 이후 redo를 다오"</text>
+        <g data-show="4-5">
+          <text x="210" y="96" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">① roll forward: redo 재생 완료</text>
+        </g>
+        <g data-show="5-5">
+          <text x="210" y="120" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">② rollback: TX2를 undo로 원상 복구</text>
+        </g>
+      </g>
+
+      <!-- 디스크 -->
+      <rect x="480" y="40" width="150" height="70" rx="9" class="sv-box"/>
+      <text x="555" y="68" text-anchor="middle" class="sv-label-sm">📜 리두 로그</text>
+      <text x="555" y="88" text-anchor="middle" class="sv-label-sm sv-mono">TX1·TX2의 redo</text>
+      <rect x="660" y="40" width="150" height="70" rx="9" class="sv-box"/>
+      <text x="735" y="68" text-anchor="middle" class="sv-label-sm">💾 데이터파일</text>
+      <text x="735" y="88" text-anchor="middle" class="sv-label-sm">불완전한 상태</text>
+
+      <!-- undo -->
+  <g data-show="5">
+        <rect x="480" y="140" width="150" height="60" rx="9" fill="color-mix(in srgb, var(--accent) 10%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="555" y="164" text-anchor="middle" class="sv-label-sm">↩️ Undo</text>
+        <text x="555" y="184" text-anchor="middle" class="sv-label-sm">"바꾸기 전 값" 보관소</text>
+      </g>
+
+      <!-- 화살표 -->
+      <g data-show="4-5">
+        <path d="M 476 80 Q 420 80 364 90" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="380" y="60" class="sv-label-sm" fill="var(--ok)">redo 재생 →</text>
+      </g>
+      <g data-show="5-5">
+        <path d="M 476 166 Q 420 160 364 130" stroke="var(--accent)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+
+      <!-- 하단 타임라인 설명 -->
+      <g data-show="1-1"><text x="70" y="250" class="sv-label-sm">평상시: 커밋 여부와 디스크 반영 여부는 별개로 움직입니다 (LGWR vs DBWn)</text></g>
+      <g data-show="2-2"><text x="70" y="250" class="sv-label-sm" fill="var(--danger)">크래시 순간: "커밋됐는데 데이터파일에 없는 것" + "커밋 안 됐는데 데이터파일에 있는 것"이 뒤섞임</text></g>
+      <g data-show="3-3"><text x="70" y="250" class="sv-label-sm" fill="var(--warn)">SMON은 컨트롤파일의 체크포인트 위치를 보고 어디서부터 redo를 재생할지 결정합니다</text></g>
+      <g data-show="4-4"><text x="70" y="250" class="sv-label-sm" fill="var(--ok)">roll forward: 커밋 여부를 따지지 않고 redo를 전부 재생 → 크래시 직전 상태 재현. 이후 DB open!</text></g>
+      <g data-show="5-5">
+        <text x="70" y="250" class="sv-label-sm" fill="var(--accent)">rollback: 커밋 안 된 TX2의 변경을 undo로 되돌림 → 커밋된 것만 남은 일관된 DB 완성 ✓</text>
+        <text x="70" y="290" class="sv-label" fill="var(--ok)">잃어버린 커밋: 0건 — 이것이 redo(7장)와 undo(6장)의 합동 작전입니다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>평상시 상태. TX1은 커밋됐지만 데이터파일엔 미반영(redo만 디스크에), TX2는 커밋 전인데 일부 블록이 DBWn에 의해 이미 디스크에 쓰였을 수 있습니다.</p>
+    <p><b style="color:var(--danger)">크래시!</b> SGA가 증발하면서 디스크에는 "커밋됐는데 없는 변경"과 "커밋 안 됐는데 있는 변경"이 뒤섞인 불완전한 상태가 남습니다.</p>
+    <p>재기동하면 <b style="color:var(--warn)">SMON</b>이 자동으로 인스턴스 복구를 시작합니다. 컨트롤파일의 체크포인트 위치를 확인하고, 그 이후의 redo를 재생할 준비를 합니다.</p>
+    <p><b style="color:var(--ok)">Roll forward(전진 복구)</b>: redo를 순서대로 재생해 크래시 직전의 상태를 통째로 재현합니다. 커밋 여부는 아직 안 따집니다. 이 단계가 끝나면 DB를 열 수 있습니다.</p>
+    <p><b style="color:var(--accent)">Rollback(후진 복구)</b>: 커밋되지 않은 TX2의 변경을 <b>undo</b>(변경 전 값 보관소, 6장)로 되돌립니다. 결과: 커밋된 변경은 하나도 잃지 않고, 커밋 안 된 변경은 하나도 남지 않은 일관된 데이터베이스!</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">PostgreSQL에도 같은 드라마가 있다</div>
+    <p>WAL 재생으로 크래시 복구를 하는 PostgreSQL의 리커버리(<a href="../pg/ch09.html">pg 9장</a>)와 원리가 같습니다. 차이는 undo의 유무 — PG는 옛 버전이 테이블 안에 그대로 있어서(dead tuple) 별도 rollback 단계가 필요 없는 대신, Oracle은 undo를 적용하는 단계가 하나 더 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">4.6 나머지 상근 직원들 — PMON · ARCn · MMON</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>프로세스</th><th>이름</th><th>하는 일</th><th>없으면 생기는 일</th></tr></thead>
+  <tbody>
+    <tr><td><code>PMON</code></td><td>Process Monitor</td><td>비정상 종료된 프로세스의 뒷정리 — 잡고 있던 락 해제, 트랜잭션 정리, 세션 자원 회수 (19c에서는 CLMN 등 보조 프로세스와 분업)</td><td>죽은 세션이 잡은 락에 다른 세션들이 영원히 대기</td></tr>
+    <tr><td><code>ARCn</code></td><td>Archiver</td><td>가득 차서 교체된 온라인 리두 로그를 아카이브 위치로 복사 (ARCHIVELOG 모드)</td><td>과거 redo 유실 → 시점 복구(PITR)·백업 복구 불가</td></tr>
+    <tr><td><code>MMON</code></td><td>Manageability Monitor</td><td>AWR 성능 스냅샷을 주기적으로(기본 1시간) SYSAUX에 저장, 메트릭 계산</td><td>성능 이력 없음 → "어제 왜 느렸지?"에 답 못 함 (12장)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">ARCn과 "아카이브 꽉 참" 장애</div>
+    <p>아카이브 저장 공간이 가득 차면 ARCn이 로그를 복사하지 못하고, 리두 로그를 재사용할 수 없게 된 LGWR이 멈추면서 <strong>DB 전체의 쓰기가 정지</strong>합니다. Oracle 운영의 고전적인 장애 시나리오이니, ARCHIVELOG 모드에서는 아카이브 공간 모니터링이 필수입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">COMMIT이 "완료" 응답을 반환하기 위해 반드시 끝나야 하는 작업은?</div>
+  <div class="quiz-opts">
+    <button type="button">DBWn이 dirty buffer를 데이터파일에 기록</button>
+    <button type="button" data-correct>LGWR이 redo entry를 온라인 리두 로그 파일에 기록</button>
+    <button type="button">CKPT가 컨트롤파일에 체크포인트를 기록</button>
+    <button type="button">ARCn이 리두 로그를 아카이브로 복사</button>
+  </div>
+  <div class="quiz-expl">✅ 커밋의 내구성은 redo의 디스크 기록(LGWR, log file sync 대기)으로 보장됩니다. 데이터 블록은 DBWn이 나중에 씁니다 — "커밋 시 디스크에 쓰는 것은 데이터가 아니라 redo다"를 그대로 묻는 문제였습니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">인스턴스 크래시 후 재기동 시 SMON이 수행하는 복구의 올바른 순서는?</div>
+  <div class="quiz-opts">
+    <button type="button">undo로 미커밋 변경을 먼저 지우고, redo로 커밋 변경을 재생한다</button>
+    <button type="button" data-correct>redo로 크래시 직전 상태를 재현(roll forward)한 뒤, undo로 미커밋 트랜잭션을 되돌린다(rollback)</button>
+    <button type="button">데이터파일을 백업에서 통째로 복원한 뒤 아카이브 로그를 적용한다</button>
+    <button type="button">컨트롤파일을 재생성하고 리두 로그를 초기화한다</button>
+  </div>
+  <div class="quiz-expl">✅ 순서가 핵심입니다: ① roll forward — 커밋 여부와 무관하게 redo를 재생해 크래시 직전 상태 재현 → ② rollback — undo로 미커밋 트랜잭션 제거. 백업 복원이 필요한 것은 미디어(디스크) 장애이며, 인스턴스 크래시는 redo+undo만으로 자동 복구됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide — <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/process-architecture.html" target="_blank" rel="noopener">Process Architecture</a> 장에서 각 백그라운드 프로세스의 공식 정의와 전체 목록(LREG, MMNL 등 조연들까지)을 확인할 수 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch03.html"><span class="dir">← 이전</span><br><span class="title">3장. PGA와 서버 프로세스</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch05.html"><span class="dir">다음 →</span><br><span class="title">5장. 저장 구조 — 테이블스페이스와 블록</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

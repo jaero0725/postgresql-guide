@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3장. PGA와 서버 프로세스 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch03">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>3장. PGA와 서버 프로세스</h1>
+<p class="lead">SGA가 모두의 작업대라면, PGA는 각 프로세스의 개인 책상입니다. 정렬과 해시가 벌어지는 이 사적 공간이 부족해지는 순간 — 쿼리는 소리 없이 디스크로 미끄러집니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 25분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 1~2장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① PGA — 프로세스마다 갖는 사적 메모리 ② 구성 요소: SQL work area(정렬·해시)와 세션 메모리 ③ 정렬이 메모리를 초과하면 벌어지는 temp spill(one-pass/multi-pass) ④ PGA_AGGREGATE_TARGET과 dedicated/shared server의 PGA 위치 차이</p>
+  </div>
+</div>
+
+<h2 id="s1">3.1 PGA — 나눠 쓰지 않는 메모리</h2>
+
+<p><strong>PGA(Program Global Area)</strong>는 서버 프로세스(그리고 백그라운드 프로세스)가 <strong>각자 하나씩</strong> 갖는 사적 메모리입니다. SGA와 달리 다른 프로세스는 이 공간을 들여다볼 수 없습니다. 세션이 100개면(dedicated 기준) PGA도 100개 — 그래서 인스턴스 전체 메모리를 계산할 때는 <em>SGA + 모든 PGA의 합</em>을 봐야 합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>SGA</th><th>PGA</th></tr></thead>
+  <tbody>
+    <tr><td><strong>소유</strong></td><td>인스턴스에 하나 — 모든 프로세스가 공유</td><td>프로세스마다 하나 — 사적 공간</td></tr>
+    <tr><td><strong>할당 시점</strong></td><td>인스턴스 기동 시</td><td>프로세스 생성 시 (세션 접속 시)</td></tr>
+    <tr><td><strong>담는 것</strong></td><td>버퍼 캐시, Shared Pool, redo 버퍼 …</td><td>정렬·해시 작업 공간, 세션 상태, 커서 실행 상태</td></tr>
+    <tr><td><strong>관리 파라미터</strong></td><td><code>SGA_TARGET</code></td><td><code>PGA_AGGREGATE_TARGET</code></td></tr>
+    <tr><td><strong>비유</strong></td><td>사무실 공용 작업대·자료실</td><td>직원 개인 책상</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">왜 정렬을 SGA에서 안 할까?</div>
+    <p>정렬 중간 결과는 <strong>그 쿼리에게만</strong> 의미 있는 일회용 데이터입니다. 공유해 봐야 이득이 없고, 공유 메모리는 접근할 때마다 동시성 제어(래치) 비용이 듭니다. "공유하면 이득인 것(데이터 블록, 실행계획)은 SGA에, 나만 쓰는 것은 PGA에" — Oracle 메모리 설계의 대원칙입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">3.2 PGA 안에는 무엇이 있나</h2>
+
+<p>PGA는 크게 두 부류로 나뉩니다.</p>
+
+<ul>
+  <li><strong>SQL Work Area(작업 공간)</strong> — 연산자들이 실제 일을 벌이는 공간입니다.
+    <ul>
+      <li><em>Sort Area</em>: <code>ORDER BY</code>, <code>GROUP BY</code>, 인덱스 생성 등의 정렬</li>
+      <li><em>Hash Area</em>: 해시 조인의 해시 테이블 구축</li>
+      <li><em>Bitmap Merge Area</em>: 비트맵 인덱스 병합</li>
+    </ul>
+  </li>
+  <li><strong>세션 메모리 & Private SQL Area</strong> — 로그인 정보 등 세션 상태(<strong>UGA</strong>, User Global Area), 열려 있는 커서의 바인드 값과 실행 상태. Library Cache의 공유 커서가 "레시피"라면, 여기는 각 세션이 그 레시피로 요리하는 "개인 조리대"입니다.</li>
+</ul>
+
+<p>성능 관점의 주인공은 단연 <strong>work area</strong>입니다. 크기가 충분하면 정렬이 메모리에서 끝나고, 부족하면 디스크로 넘칩니다. 그 드라마를 애니메이션으로 봅시다.</p>
+
+<h2 id="s3">3.3 정렬의 세 가지 운명 — optimal, one-pass, multi-pass</h2>
+
+<p>Oracle은 work area 크기에 따라 정렬 실행을 세 등급으로 부릅니다. <strong>optimal</strong>(전부 메모리에서), <strong>one-pass</strong>(디스크에 한 번 내렸다가 한 번의 병합으로 완료), <strong>multi-pass</strong>(병합을 여러 번 반복 — 가장 느림). 디스크로 내려간 중간 결과는 <strong>temp 테이블스페이스</strong>에 기록됩니다.</p>
+
+<div class="anim" data-steps="6" data-title="ORDER BY의 두 갈래 — 메모리 정렬 vs temp spill" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <!-- PGA -->
+      <rect x="290" y="40" width="240" height="140" rx="12" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+      <text x="410" y="66" text-anchor="middle" class="sv-label">🪑 PGA — Sort Work Area</text>
+      <rect x="312" y="82" width="196" height="76" rx="8" fill="none" stroke="var(--border)" stroke-width="1.4" stroke-dasharray="5 4"/>
+
+      <!-- 테이블 -->
+      <rect x="30" y="80" width="180" height="64" rx="9" class="sv-box"/>
+      <text x="120" y="106" text-anchor="middle" class="sv-label">📋 테이블 스캔</text>
+      <text x="120" y="126" text-anchor="middle" class="sv-label-sm sv-mono">ORDER BY name</text>
+
+      <!-- step1-2: 작은 정렬 -->
+      <g data-show="1-3">
+        <path d="M 214 112 L 286 112" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+      </g>
+      <g data-show="2-3">
+        <rect x="326" y="96" width="50" height="22" rx="5" fill="color-mix(in srgb, var(--accent) 20%, transparent)" stroke="var(--accent)"/>
+        <rect x="384" y="96" width="50" height="22" rx="5" fill="color-mix(in srgb, var(--accent) 20%, transparent)" stroke="var(--accent)"/>
+        <rect x="442" y="96" width="50" height="22" rx="5" fill="color-mix(in srgb, var(--accent) 20%, transparent)" stroke="var(--accent)"/>
+        <text x="410" y="146" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">데이터 전부가 work area 안에 쏙!</text>
+      </g>
+      <g data-show="3-3">
+        <path d="M 534 112 Q 600 112 650 112" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="660" y="100" class="sv-label" fill="var(--ok)">✅ optimal</text>
+        <text x="660" y="120" class="sv-label-sm">메모리에서 정렬 완료</text>
+      </g>
+
+      <!-- step4: 큰 테이블 -->
+      <g data-show="4">
+        <rect x="30" y="196" width="180" height="64" rx="9" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="120" y="222" text-anchor="middle" class="sv-label">📚 대용량 테이블</text>
+        <text x="120" y="242" text-anchor="middle" class="sv-label-sm sv-mono">ORDER BY … (수 GB)</text>
+        <path d="M 214 224 Q 260 200 288 150" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="540" y="66" class="sv-label-sm" fill="var(--warn)">work area 초과! 🫗</text>
+      </g>
+
+      <!-- temp tablespace -->
+      <g data-show="5">
+        <rect x="290" y="240" width="240" height="90" rx="10" class="sv-box"/>
+        <text x="410" y="266" text-anchor="middle" class="sv-label">💾 Temp 테이블스페이스</text>
+        <rect x="310" y="280" width="60" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="340" y="300" text-anchor="middle" class="sv-label-sm sv-mono">run 1</text>
+        <rect x="380" y="280" width="60" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="410" y="300" text-anchor="middle" class="sv-label-sm sv-mono">run 2</text>
+        <rect x="450" y="280" width="60" height="30" rx="6" fill="color-mix(in srgb, var(--warn) 18%, transparent)" stroke="var(--warn)"/>
+        <text x="480" y="300" text-anchor="middle" class="sv-label-sm sv-mono">run 3</text>
+        <path d="M 410 184 L 410 236" stroke="var(--warn)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="424" y="214" class="sv-label-sm" fill="var(--warn)">정렬된 조각(run)을 디스크로 spill</text>
+      </g>
+
+      <!-- step6: merge -->
+      <g data-show="6">
+        <path d="M 534 286 Q 620 270 660 230" stroke="var(--accent)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="600" y="332" class="sv-label" fill="var(--accent)">🔁 병합(merge)</text>
+        <text x="560" y="352" class="sv-label-sm">한 번에 끝나면 one-pass, 여러 번이면 multi-pass(최악)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>ORDER BY</code> 쿼리가 시작되면 PGA 안에 <b>sort work area</b>가 할당되고, 테이블에서 읽은 행들이 그 안에서 정렬됩니다.</p>
+    <p>데이터가 work area 안에 전부 들어갑니다. 정렬은 순수하게 메모리 연산으로 진행됩니다.</p>
+    <p><b style="color:var(--ok)">optimal 실행</b> — 디스크를 전혀 건드리지 않고 정렬 완료. 가장 빠른 시나리오입니다.</p>
+    <p>이번엔 수 GB짜리 대용량 정렬입니다. 행이 쏟아져 들어오다가 <b style="color:var(--warn)">work area 용량을 초과</b>합니다.</p>
+    <p>Oracle은 지금까지 정렬한 조각(<b>sorted run</b>)을 <b>temp 테이블스페이스</b>에 내려쓰고(spill), 비운 공간에서 다음 조각을 정렬합니다. 이 과정이 반복되며 run이 쌓입니다.</p>
+    <p>마지막으로 run들을 <b>병합(merge)</b>해 최종 순서를 만듭니다. 병합이 한 번이면 <b>one-pass</b>, 메모리가 너무 작아 병합을 거듭하면 <b style="color:var(--danger)">multi-pass</b> — 같은 데이터를 디스크에서 여러 번 오가는 최악의 경우입니다.</p>
+  </div>
+</div>
+
+<p>실행 등급별 통계는 인스턴스 누적 뷰에서 바로 확인할 수 있습니다. multi-pass가 눈에 띄게 잡히면 PGA 부족 신호입니다.</p>
+
+<pre><code><span class="c">-- work area 실행이 어느 등급으로 끝났는지 (인스턴스 누적)</span>
+<span class="k">SELECT</span> name, value
+<span class="k">FROM</span>   v$sysstat
+<span class="k">WHERE</span>  name <span class="k">LIKE</span> <span class="s">'workarea executions%'</span>;
+
+NAME                              VALUE
+--------------------------------  --------
+workarea executions - optimal     1284933   <span class="c">← 대부분 여기여야 정상</span>
+workarea executions - onepass          214
+workarea executions - multipass          3  <span class="c">← 0이 이상적</span></code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">temp spill은 조용히 일어난다</div>
+    <p>spill이 발생해도 쿼리는 에러 없이 <em>그냥 느려질 뿐</em>입니다. "어제는 빨랐는데 오늘은 느려요"의 흔한 범인 — 데이터가 늘어 optimal에서 one-pass로 넘어간 경우입니다. 실행계획의 <code>TempSpc</code> 컬럼, <code>v$sql_workarea</code>로 추적할 수 있습니다. PostgreSQL에서 <code>work_mem</code>을 넘겨 temp 파일로 spill되는 것과 완전히 같은 구도입니다(<a href="../pg/ch02.html">pg 2장</a>).</p>
+  </div>
+</div>
+
+<h2 id="s4">3.4 PGA_AGGREGATE_TARGET — 개인 책상의 총예산</h2>
+
+<p>work area 크기를 쿼리마다 수동으로 정하는 건 불가능하니, Oracle은 <strong>자동 PGA 관리</strong>를 제공합니다. <code>PGA_AGGREGATE_TARGET</code>으로 <strong>인스턴스 전체 PGA 합계의 목표치</strong>를 정해주면, Oracle이 동시 실행 중인 쿼리들에게 work area를 알아서 배분합니다. 동시 세션이 적을 때는 한 쿼리가 큰 work area를 받고, 몰릴 때는 각자 조금씩 받는 식입니다.</p>
+
+<pre><code><span class="c">-- PGA 목표치와 실제 사용 현황</span>
+<span class="k">SHOW PARAMETER</span> pga_aggregate_target;
+
+NAME                  TYPE         VALUE
+--------------------- ------------ ------
+pga_aggregate_target  big integer  4G
+
+<span class="k">SELECT</span> name, value/<span class="n">1024</span>/<span class="n">1024</span> <span class="k">AS</span> mb
+<span class="k">FROM</span>   v$pgastat
+<span class="k">WHERE</span>  name <span class="k">IN</span> (<span class="s">'aggregate PGA target parameter'</span>,
+                <span class="s">'total PGA allocated'</span>,
+                <span class="s">'maximum PGA allocated'</span>);</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">target은 "목표"지 "상한"이 아니다</div>
+    <p>세션 수가 폭증하면 실제 PGA 합계가 target을 넘을 수 있습니다. 진짜 상한은 별도 파라미터 <code>PGA_AGGREGATE_LIMIT</code>이 담당하며, 이를 초과하면 Oracle이 가장 많이 쓰는 세션의 호출을 중단시킵니다. "target = 노력 목표, limit = 안전 차단기"로 기억하세요.</p>
+  </div>
+</div>
+
+<h2 id="s5">3.5 Dedicated vs Shared Server — 내 세션 메모리는 어디에</h2>
+
+<p>1장에서 예고한 퍼즐을 풀 차례입니다. 세션 상태(UGA)는 dedicated server에서는 PGA 안에 있지만, <strong>shared server에서는 SGA로 이사</strong>합니다. 이유는 단순합니다 — shared server에서는 내 요청을 <em>매번 다른 공유 프로세스</em>가 처리할 수 있는데, PGA는 사적 공간이라 다른 프로세스가 볼 수 없기 때문입니다.</p>
+
+<div class="anim" data-steps="5" data-title="세션 메모리(UGA)의 위치 — dedicated는 PGA에, shared는 SGA에" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 350">
+      <!-- 왼쪽: dedicated -->
+      <text x="200" y="28" text-anchor="middle" class="sv-label" font-size="15">Dedicated Server</text>
+      <g data-active="1-2">
+        <rect x="40" y="46" width="100" height="86" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="90" y="70" text-anchor="middle" class="sv-label-sm">프로세스 1</text>
+        <rect x="150" y="46" width="100" height="86" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="200" y="70" text-anchor="middle" class="sv-label-sm">프로세스 2</text>
+        <rect x="260" y="46" width="100" height="86" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="310" y="70" text-anchor="middle" class="sv-label-sm">프로세스 3</text>
+      </g>
+      <g data-show="2">
+        <rect x="52" y="84" width="76" height="36" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="90" y="106" text-anchor="middle" class="sv-label-sm sv-mono">PGA+UGA</text>
+        <rect x="162" y="84" width="76" height="36" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="200" y="106" text-anchor="middle" class="sv-label-sm sv-mono">PGA+UGA</text>
+        <rect x="272" y="84" width="76" height="36" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="310" y="106" text-anchor="middle" class="sv-label-sm sv-mono">PGA+UGA</text>
+      </g>
+      <text x="200" y="160" text-anchor="middle" class="sv-label-sm" data-show="1-2">세션 1개 = 전담 프로세스 1개</text>
+
+      <!-- 구분선 -->
+      <line x1="410" y1="20" x2="410" y2="330" class="sv-line" stroke-dasharray="4 6"/>
+
+      <!-- 오른쪽: shared -->
+      <text x="620" y="28" text-anchor="middle" class="sv-label" font-size="15">Shared Server</text>
+      <g data-show="3">
+        <rect x="450" y="46" width="140" height="50" rx="9" class="sv-box"/>
+        <text x="520" y="68" text-anchor="middle" class="sv-label-sm">📮 Dispatcher</text>
+        <text x="520" y="85" text-anchor="middle" class="sv-label-sm">요청을 큐에 분배</text>
+        <rect x="620" y="40" width="82" height="42" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="661" y="66" text-anchor="middle" class="sv-label-sm">공유 P1</text>
+        <rect x="712" y="40" width="82" height="42" rx="8" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="753" y="66" text-anchor="middle" class="sv-label-sm">공유 P2</text>
+        <text x="620" y="118" text-anchor="middle" class="sv-label-sm">세션 100개도 프로세스는 몇 개뿐</text>
+      </g>
+
+      <!-- SGA (shared 쪽) -->
+      <g data-show="4">
+        <rect x="450" y="140" width="344" height="110" rx="10" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="622" y="164" text-anchor="middle" class="sv-label">🧠 SGA (Large Pool)</text>
+        <rect x="470" y="180" width="90" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="515" y="202" text-anchor="middle" class="sv-label-sm sv-mono">UGA 세션1</text>
+        <rect x="575" y="180" width="90" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="620" y="202" text-anchor="middle" class="sv-label-sm sv-mono">UGA 세션2</text>
+        <rect x="680" y="180" width="90" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 16%, transparent)" stroke="var(--purple)"/>
+        <text x="725" y="202" text-anchor="middle" class="sv-label-sm sv-mono">UGA 세션3</text>
+        <text x="622" y="238" text-anchor="middle" class="sv-label-sm">세션 상태를 공용 공간에 → 누구든 이어받기 가능</text>
+      </g>
+      <g data-show="4-4">
+        <path d="M 661 86 Q 640 130 620 176" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <path d="M 753 86 Q 740 130 725 176" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+      </g>
+
+      <!-- step5: 결론 -->
+      <g data-show="5">
+        <rect x="60" y="230" width="300" height="88" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="210" y="258" text-anchor="middle" class="sv-label">📌 정리</text>
+        <text x="210" y="282" text-anchor="middle" class="sv-label-sm">dedicated: UGA는 각자의 PGA 안에</text>
+        <text x="210" y="302" text-anchor="middle" class="sv-label-sm">shared: UGA는 SGA(Large Pool)로 이사</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><b>Dedicated server</b>: 세션 3개면 서버 프로세스도 3개. 각 프로세스가 자기 세션만 평생 전담합니다.</p>
+    <p>각 프로세스의 <b style="color:var(--purple)">PGA 안에 UGA(세션 상태)</b>가 함께 삽니다. 전담이니 남이 볼 필요가 없죠.</p>
+    <p><b>Shared server</b>: dispatcher가 여러 세션의 요청을 큐에 넣고, 소수의 <b>공유 서버 프로세스</b>가 아무 요청이나 꺼내 처리합니다. 이번 요청은 P1이, 다음 요청은 P2가 처리할 수 있습니다.</p>
+    <p>그래서 세션 상태(UGA)는 특정 프로세스의 PGA에 둘 수 없고, <b style="color:var(--purple)">모두가 접근 가능한 SGA(주로 Large Pool)</b>로 이사합니다. 어느 프로세스가 이어받아도 세션 상태를 읽을 수 있게요.</p>
+    <p>정리: <b>UGA 위치가 접속 모드를 따라간다</b> — dedicated면 PGA 안, shared면 SGA 안. 이 논리를 이해했다면 shared server의 구조를 다 이해한 것입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">대용량 ORDER BY 정렬 중 PGA work area가 부족해지면 Oracle이 하는 일은?</div>
+  <div class="quiz-opts">
+    <button type="button">ORA 에러를 내며 쿼리를 중단한다</button>
+    <button type="button">SGA 버퍼 캐시를 빌려 정렬을 계속한다</button>
+    <button type="button" data-correct>정렬된 조각(run)을 temp 테이블스페이스에 내려쓰고 나중에 병합한다</button>
+    <button type="button">정렬을 생략하고 순서 없이 결과를 반환한다</button>
+  </div>
+  <div class="quiz-expl">✅ work area를 초과하면 정렬된 run을 temp 테이블스페이스로 spill하고 마지막에 병합합니다(one-pass/multi-pass). 에러 없이 조용히 느려지는 것이 함정 — v$sysstat의 workarea executions 통계나 실행계획의 TempSpc로 감지해야 합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">shared server 구성에서 세션 메모리(UGA)가 SGA에 놓이는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">SGA가 PGA보다 접근 속도가 빠르기 때문</button>
+    <button type="button" data-correct>요청마다 다른 공유 프로세스가 처리할 수 있어, 모두가 접근 가능한 공간에 세션 상태를 둬야 하기 때문</button>
+    <button type="button">PGA_AGGREGATE_TARGET이 shared server에는 적용되지 않기 때문</button>
+    <button type="button">UGA는 원래 어떤 구성에서든 SGA에만 존재하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ shared server에서는 내 세션의 이번 요청은 프로세스 P1이, 다음 요청은 P2가 처리할 수 있습니다. PGA는 프로세스 사적 공간이므로, 세션 상태(UGA)는 어느 프로세스든 읽을 수 있는 SGA(주로 Large Pool)에 두어야 합니다. dedicated에서는 전담 프로세스의 PGA 안에 있습니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide — <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/memory-architecture.html" target="_blank" rel="noopener">Memory Architecture</a>의 PGA 절과 <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/process-architecture.html" target="_blank" rel="noopener">Process Architecture</a> 장에서 work area 관리와 shared server 구조의 공식 설명을 볼 수 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch02.html"><span class="dir">← 이전</span><br><span class="title">2장. SGA</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch04.html"><span class="dir">다음 →</span><br><span class="title">4장. 백그라운드 프로세스</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

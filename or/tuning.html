@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>쿼리 튜닝 팁 모음 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/tuning">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>⚡ 쿼리 튜닝 팁 모음</h1>
+<p class="lead">현장에서 겪는 느린 쿼리의 8할은 몇 가지 패턴의 반복입니다. before/after 코드 쌍으로 정리한 Oracle 튜닝 실전 치트시트 — 필요할 때 바로 찾아 쓰는 빠른 참조 페이지입니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 40분 (참조용)</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 9~12장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 페이지의 구성</div>
+    <p>① 실행계획으로 문제 찾기(E-Rows vs A-Rows) ② 인덱스를 못 타는 6대 원인과 수정법 ③ 바인드 변수 ④ 조인 튜닝 ⑤ 페이지네이션 ⑥ 대량 작업 ⑦ 통계 관리 ⑧ 자주 쓰는 진단 쿼리 — 각 팁은 <strong>before(느림) → after(빠름)</strong> 코드 쌍으로 되어 있습니다.</p>
+  </div>
+</div>
+
+<div class="grid g3">
+  <div class="card"><h4>🥇 제1원칙</h4><p>추측하지 말고 <strong>실행계획과 대기 이벤트</strong>로 측정한다. 느낌으로 인덱스부터 만들지 않는다.</p></div>
+  <div class="card"><h4>🥈 제2원칙</h4><p>인덱스 컬럼은 <strong>가공하지 않는다</strong>. 형변환·함수·연산이 붙는 순간 인덱스는 무용지물.</p></div>
+  <div class="card"><h4>🥉 제3원칙</h4><p>통계가 곧 플랜이다. <strong>E-Rows와 A-Rows가 다르면</strong> SQL보다 통계를 먼저 의심한다.</p></div>
+</div>
+
+<h2 id="t1">팁 1. 튜닝의 시작은 실행계획 — E-Rows vs A-Rows</h2>
+
+<p>느린 SQL을 받았을 때 첫 동작은 언제나 같습니다: <strong>실제 실행 통계가 붙은 실행계획</strong>을 봅니다. 예상 계획(EXPLAIN PLAN)이 아니라 실제입니다.</p>
+
+<pre><code><span class="c">-- ① 문제 SQL에 힌트를 붙여 실행 (또는 ALTER SESSION SET statistics_level=ALL)</span>
+<span class="k">SELECT</span> <span class="c">/*+ GATHER_PLAN_STATISTICS */</span> o.order_no, c.cust_name
+<span class="k">FROM</span>   orders o <span class="k">JOIN</span> customers c <span class="k">ON</span> o.cust_id = c.cust_id
+<span class="k">WHERE</span>  o.order_status = <span class="s">'SHIPPED'</span>;
+
+<span class="c">-- ② 방금 실행한 커서의 "실제" 계획 조회</span>
+<span class="k">SELECT</span> * <span class="k">FROM TABLE</span>(
+  DBMS_XPLAN.<span class="f">display_cursor</span>(<span class="k">NULL</span>, <span class="k">NULL</span>, <span class="s">'ALLSTATS LAST'</span>)
+);
+
+<span class="c">-- ③ 출력에서 볼 것: E-Rows(예측) vs A-Rows(실제)
+--------------------------------------------------------------------
+| Id | Operation                    | Name   | E-Rows | A-Rows |
+--------------------------------------------------------------------
+|  1 |  NESTED LOOPS                |        |     12 |   985K | ← 격차!
+|* 2 |   TABLE ACCESS FULL          | ORDERS |     12 |   985K | ← 원흉
+|  3 |   TABLE ACCESS BY INDEX ROWID| CUSTO..|      1 |   985K |
+--------------------------------------------------------------------</span></code></pre>
+
+<p>읽는 법은 세 줄로 요약됩니다.</p>
+<ul>
+  <li><strong>E-Rows ≈ A-Rows</strong> — 옵티마이저는 정확히 알고 결정했습니다. 그런데도 느리다면 SQL 구조나 인덱스 설계 자체의 문제입니다.</li>
+  <li><strong>E-Rows ≪ A-Rows (수십 배 이상)</strong> — 옵티마이저가 속았습니다. 낡은 통계, 히스토그램 부재, 컬럼 가공에 의한 추정 실패를 의심하세요. 위 예시처럼 12건 예상이 98만 건이면, 그 판단으로 고른 NL 조인이 98만 번 반복된 것입니다.</li>
+  <li><strong>격차가 시작되는 가장 안쪽 단계</strong>를 찾으세요. 아래(자식)에서 생긴 오차는 위(부모)로 전파·증폭됩니다.</li>
+</ul>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">Buffers 컬럼도 함께</div>
+    <p><code>ALLSTATS LAST</code> 출력의 <code>Buffers</code>는 단계별 논리 읽기(블록 수)입니다. "어느 단계가 I/O를 다 먹었나"를 A-Rows와 함께 보면 병목 단계가 한눈에 드러납니다. 실행 순서 읽는 법은 <a href="ch10.html">10장</a> 참고.</p>
+  </div>
+</div>
+
+<h2 id="t2">팁 2. 인덱스를 못 타는 6대 원인 — before / after</h2>
+
+<p>"인덱스가 있는데 풀스캔이에요"의 원인은 놀랄 만큼 정형화되어 있습니다. 아래 6개 패턴이 대부분을 커버합니다.</p>
+
+<h3>2-1. 암시적 형변환 — 조용한 인덱스 킬러 1위</h3>
+
+<p>문자 컬럼을 숫자와 비교하면 Oracle은 <strong>컬럼 쪽에</strong> <code>TO_NUMBER()</code>를 씌워 비교합니다. 컬럼이 가공되는 순간 그 컬럼의 인덱스는 쓸 수 없습니다. 눈에 안 보이게 일어나므로 가장 위험합니다.</p>
+
+<div class="anim" data-steps="5" data-title="암시적 형변환 — 인덱스를 버리고 풀스캔으로 가는 과정" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 340">
+      <defs>
+        <marker id="arrT1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--danger)"/>
+        </marker>
+        <marker id="arrT2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+
+      <!-- BEFORE zone -->
+      <text x="200" y="26" text-anchor="middle" class="sv-label" font-size="14">❌ before</text>
+      <g data-active="1-1">
+        <rect x="40" y="40" width="330" height="40" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="205" y="65" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE cust_no = 100  <tspan fill="var(--text-dim)">(cust_no는 VARCHAR2)</tspan></text>
+      </g>
+      <g data-show="2">
+        <path d="M 205 84 L 205 108" stroke="var(--danger)" stroke-width="2" class="flow-line" marker-end="url(#arrT1)"/>
+        <rect x="40" y="114" width="330" height="42" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="205" y="134" text-anchor="middle" class="sv-label sv-mono" font-size="12.5" fill="var(--danger)">WHERE TO_NUMBER(cust_no) = 100</text>
+        <text x="205" y="150" text-anchor="middle" class="sv-label-sm">Oracle이 몰래 컬럼을 가공한다</text>
+      </g>
+      <g data-show="3">
+        <path d="M 205 160 L 205 184" stroke="var(--danger)" stroke-width="2" class="flow-line" marker-end="url(#arrT1)"/>
+        <rect x="40" y="190" width="150" height="54" rx="9" class="sv-box"/>
+        <text x="115" y="212" text-anchor="middle" class="sv-label-sm">🌲 cust_no 인덱스</text>
+        <text x="115" y="231" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">사용 불가 🚫</text>
+        <rect x="220" y="190" width="150" height="54" rx="9" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8" class="blink"/>
+        <text x="295" y="212" text-anchor="middle" class="sv-label-sm sv-mono">TABLE ACCESS FULL</text>
+        <text x="295" y="231" text-anchor="middle" class="sv-label-sm">1000만 행 전부 변환·비교</text>
+      </g>
+      <g data-show="3-5">
+        <text x="205" y="280" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">응답 8초 · CPU 급증</text>
+      </g>
+
+      <!-- divider -->
+      <line x1="410" y1="20" x2="410" y2="300" class="sv-line" stroke-dasharray="4 6"/>
+
+      <!-- AFTER zone -->
+      <text x="620" y="26" text-anchor="middle" class="sv-label" font-size="14">✅ after</text>
+      <g data-show="4">
+        <rect x="450" y="40" width="330" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="615" y="65" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE cust_no = '100'  <tspan fill="var(--ok)">← 타입 일치</tspan></text>
+        <text x="615" y="100" text-anchor="middle" class="sv-label-sm">컬럼이 가공되지 않음 = 인덱스 사용 가능</text>
+      </g>
+      <g data-show="5">
+        <path d="M 615 110 L 615 134" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arrT2)"/>
+        <rect x="450" y="140" width="150" height="54" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="525" y="162" text-anchor="middle" class="sv-label-sm">🌲 INDEX RANGE SCAN</text>
+        <text x="525" y="181" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">블록 3~4개만 읽음</text>
+        <rect x="630" y="140" width="150" height="54" rx="9" class="sv-box"/>
+        <text x="705" y="162" text-anchor="middle" class="sv-label-sm sv-mono">BY INDEX ROWID</text>
+        <text x="705" y="181" text-anchor="middle" class="sv-label-sm">해당 행만 접근</text>
+        <path d="M 604 167 L 626 167" stroke="var(--ok)" stroke-width="2" class="flow-line"/>
+        <text x="615" y="280" text-anchor="middle" class="sv-label" font-size="14" fill="var(--ok)">응답 0.01초 — SQL 한 글자('')가 만든 800배 차이</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p><code>cust_no</code>는 <b>VARCHAR2</b> 컬럼인데 숫자 <code>100</code>과 비교했습니다. 애플리케이션에선 흔한 실수이고, 에러도 나지 않습니다.</p>
+    <p>Oracle의 형변환 규칙: 문자 vs 숫자 비교에서는 <b style="color:var(--danger)">문자 쪽이 숫자로 변환</b>됩니다. 즉 조건이 몰래 <code>TO_NUMBER(cust_no) = 100</code>으로 바뀝니다.</p>
+    <p>컬럼이 함수로 가공됐으니 cust_no 인덱스는 사용 불가 — <b>1000만 행 전체를 풀스캔</b>하며 행마다 TO_NUMBER를 수행합니다. 변환 불가능한 값이 섞여 있으면 ORA-01722 에러까지 덤으로 터집니다.</p>
+    <p>수정은 한 글자: 값을 컬럼 타입에 맞춰 <code>'100'</code>으로. 바인드 변수라면 변수 타입을 문자로 선언합니다.</p>
+    <p>인덱스가 살아나 <b style="color:var(--ok)">INDEX RANGE SCAN + 단건 테이블 접근</b> — 블록 몇 개 읽고 끝납니다. 실행계획의 Predicate 섹션에 <code>TO_NUMBER(...)</code>가 보이면 100% 이 패턴입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- ❌ before: cust_no VARCHAR2(10) — 숫자와 비교</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> customers <span class="k">WHERE</span> cust_no = <span class="n">100</span>;
+<span class="c">--   → filter(TO_NUMBER("CUST_NO")=100) : TABLE ACCESS FULL</span>
+
+<span class="c">-- ✅ after: 타입을 맞춘다</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> customers <span class="k">WHERE</span> cust_no = <span class="s">'100'</span>;
+<span class="c">--   → access("CUST_NO"='100') : INDEX RANGE SCAN</span></code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">Predicate Information을 반드시 본다</div>
+    <p>DBMS_XPLAN 출력 하단의 Predicate Information에서 <code>filter(TO_NUMBER(...))</code>, <code>INTERNAL_FUNCTION(...)</code>이 보이면 암시적 형변환이 일어난 것입니다. 실행계획 본문만 보고 지나치기 쉬운, 그러나 가장 확실한 물증입니다.</p>
+  </div>
+</div>
+
+<h3>2-2. 컬럼 가공 — 함수는 컬럼이 아니라 상수 쪽에</h3>
+
+<pre><code><span class="c">-- ❌ before: 인덱스 컬럼을 SUBSTR로 가공</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> <span class="f">SUBSTR</span>(order_no, <span class="n">1</span>, <span class="n">4</span>) = <span class="s">'2026'</span>;
+<span class="c">-- ✅ after: 컬럼은 그대로 두고 LIKE 범위 조건으로</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> order_no <span class="k">LIKE</span> <span class="s">'2026%'</span>;
+
+<span class="c">-- ❌ before: 날짜 컬럼을 TRUNC로 가공 (당일 주문 조회)</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> <span class="f">TRUNC</span>(order_dt) = <span class="k">DATE</span> <span class="s">'2026-07-11'</span>;
+<span class="c">-- ✅ after: 컬럼은 그대로, 조건을 범위로 변형</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders
+<span class="k">WHERE</span>  order_dt >= <span class="k">DATE</span> <span class="s">'2026-07-11'</span>
+<span class="k">AND</span>    order_dt <  <span class="k">DATE</span> <span class="s">'2026-07-11'</span> + <span class="n">1</span>;</code></pre>
+
+<p>원칙은 하나입니다: <strong>가공은 상수/변수 쪽에서 하고, 컬럼은 날것으로 남긴다.</strong> 도저히 컬럼 가공을 피할 수 없는 요건(대소문자 무시 검색 등)이라면 <a href="ch09.html">함수기반 인덱스</a>가 차선책입니다. 참고로 파티션 키 가공이 pruning을 깨는 것(<a href="ch11.html">11장</a>)도 정확히 같은 원리입니다.</p>
+
+<h3>2-3. 선행 와일드카드 LIKE '%…'</h3>
+
+<pre><code><span class="c">-- ❌ before: 시작점이 없어 B*Tree 탐색 불가 → FULL SCAN</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> customers <span class="k">WHERE</span> cust_name <span class="k">LIKE</span> <span class="s">'%길동'</span>;
+
+<span class="c">-- ✅ after 1: 가능하다면 전방 일치로 요건 변경</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> customers <span class="k">WHERE</span> cust_name <span class="k">LIKE</span> <span class="s">'홍길%'</span>;
+<span class="c">-- ✅ after 2: 부분 일치 검색이 핵심 요건이면 Oracle Text 인덱스 등 전문 검색 도구를 검토</span></code></pre>
+
+<p>B*Tree는 "왼쪽부터 정렬"된 자료구조입니다. 첫 글자를 모르면 탐색 시작점을 정할 수 없습니다. 중간/후방 일치가 진짜 요건이라면 B*Tree로 해결하려 하지 말고 전문 검색(Oracle Text, 또는 Elasticsearch 같은 별도 엔진)을 검토하세요.</p>
+
+<h3>2-4. NOT / != — 부정형은 범위를 못 좁힌다</h3>
+
+<pre><code><span class="c">-- ❌ before: "SHIPPED가 아닌 것" = 나머지 전부 → 인덱스로 좁힐 수 없음</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> order_status != <span class="s">'SHIPPED'</span>;
+
+<span class="c">-- ✅ after: 실제로 원하는 값을 긍정형으로 나열</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> order_status <span class="k">IN</span> (<span class="s">'NEW'</span>, <span class="s">'PAYING'</span>, <span class="s">'PACKING'</span>);</code></pre>
+
+<p>부정형 자체가 문법 위반은 아닙니다 — 문제는 "제외한 나머지 전부"가 대개 <strong>대부분의 행</strong>이라서 인덱스가 의미를 잃는다는 점입니다. 반대로 원하는 값 목록이 소수이고 선택도가 높다면 IN으로 뒤집는 순간 인덱스가 살아납니다.</p>
+
+<h3>2-5. OR 조건 — UNION ALL로 분리하거나 IN으로</h3>
+
+<pre><code><span class="c">-- ❌ before: 서로 다른 컬럼의 OR — 옵티마이저가 풀스캔을 택하기 쉬움</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders
+<span class="k">WHERE</span>  cust_id = :cid <span class="k">OR</span> order_no = :ono;
+
+<span class="c">-- ✅ after: 각각 자기 인덱스를 타도록 UNION ALL로 분리</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> cust_id = :cid
+<span class="k">UNION ALL</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> order_no = :ono <span class="k">AND</span> (cust_id != :cid <span class="k">OR</span> cust_id <span class="k">IS NULL</span>);
+
+<span class="c">-- 같은 컬럼의 OR라면 그냥 IN으로 (인덱스 정상 사용)</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> order_status <span class="k">IN</span> (<span class="s">'NEW'</span>, <span class="s">'PAYING'</span>);</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">UNION ALL 분리 시 중복 주의</div>
+    <p>두 조건을 모두 만족하는 행이 두 번 나오지 않도록, 위 예시처럼 두 번째 블록에서 첫 조건을 배제하는 술어를 넣어야 합니다(결과 요건에 따라 UNION으로 중복 제거하는 방법도 있으나 정렬 비용이 추가됩니다).</p>
+  </div>
+</div>
+
+<h3>2-6. 통계 부족 — 인덱스가 아니라 지도가 문제</h3>
+
+<pre><code><span class="c">-- 증상: SQL도 인덱스도 멀쩡한데 풀스캔/이상한 조인 선택
+-- 확인: 통계 수집 시점과 실제 행 수 비교</span>
+<span class="k">SELECT</span> table_name, num_rows, last_analyzed
+<span class="k">FROM</span>   user_tables <span class="k">WHERE</span> table_name = <span class="s">'ORDERS'</span>;
+
+<span class="k">SELECT</span> <span class="f">COUNT</span>(*) <span class="k">FROM</span> orders;   <span class="c">-- num_rows와 크게 다르면 → 팁 7로</span></code></pre>
+
+<h2 id="t3">팁 3. 바인드 변수 — 하드파싱 폭탄 방지</h2>
+
+<p>Oracle은 SQL <strong>텍스트가 완전히 같아야</strong> 공유 풀의 커서(파싱 결과 + 실행계획)를 재사용합니다. 값을 문자열로 이어붙인 리터럴 SQL은 값마다 다른 SQL이 되어, 실행할 때마다 <strong>하드 파싱</strong>(최적화 전 과정)을 반복합니다.</p>
+
+<div class="anim" data-steps="4" data-title="리터럴 SQL vs 바인드 변수 — 공유 풀에서 벌어지는 일" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 310">
+      <line x1="410" y1="16" x2="410" y2="270" class="sv-line" stroke-dasharray="4 6"/>
+      <text x="205" y="28" text-anchor="middle" class="sv-label" font-size="14">❌ 리터럴 폭탄</text>
+      <text x="620" y="28" text-anchor="middle" class="sv-label" font-size="14">✅ 바인드 변수</text>
+
+      <g data-show="1">
+        <rect x="40" y="44" width="330" height="70" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="205" y="66" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE cust_id = 100</text>
+        <text x="205" y="86" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE cust_id = 101</text>
+        <text x="205" y="106" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE cust_id = 102 … ×10,000</text>
+      </g>
+      <g data-show="2">
+        <rect x="40" y="136" width="330" height="86" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="205" y="160" text-anchor="middle" class="sv-label" font-size="13" fill="var(--danger)">텍스트가 전부 다름 → 하드 파싱 ×10,000</text>
+        <text x="205" y="182" text-anchor="middle" class="sv-label-sm">공유 풀에 일회용 커서 1만 개 적체</text>
+        <text x="205" y="202" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">CPU 소모 + 라이브러리 캐시 래치 경합 📈</text>
+      </g>
+
+      <g data-show="3">
+        <rect x="450" y="44" width="330" height="70" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="615" y="72" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">WHERE cust_id = :cid</text>
+        <text x="615" y="98" text-anchor="middle" class="sv-label-sm">값이 바뀌어도 텍스트는 하나</text>
+      </g>
+      <g data-show="4">
+        <rect x="450" y="136" width="330" height="86" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="615" y="160" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">하드 파싱 1번 + 소프트 파싱 9,999번</text>
+        <text x="615" y="182" text-anchor="middle" class="sv-label-sm">커서 1개 재사용 — 공유 풀 평화</text>
+        <text x="615" y="202" text-anchor="middle" class="sv-label-sm">OLTP 다건 실행 SQL의 기본기</text>
+        <text x="410" y="292" text-anchor="middle" class="sv-label-sm">단, 분포가 심하게 치우친 컬럼은 bind peeking 부작용 주의 (아래 콜아웃)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>고객 조회 화면이 값을 이어붙인 리터럴 SQL을 날립니다. <code>=100</code>, <code>=101</code>, <code>=102</code>… Oracle 입장에서는 <b>전부 처음 보는 다른 SQL</b>입니다.</p>
+    <p>1만 번 실행 = <b style="color:var(--danger)">하드 파싱 1만 번</b>. 파싱은 CPU를 쓰고, 공유 풀을 일회용 커서로 채우고, 라이브러리 캐시 래치 경합을 일으킵니다. 사용자가 늘수록 DB 전체가 함께 느려지는 유형입니다.</p>
+    <p>바인드 변수 <code>:cid</code>를 쓰면 값이 무엇이든 <b>SQL 텍스트는 단 하나</b>입니다.</p>
+    <p>첫 실행만 하드 파싱, 이후는 커서를 찾아 쓰는 <b style="color:var(--ok)">소프트 파싱</b>. 같은 SQL을 다른 값으로 반복 실행하는 OLTP에서는 바인드 변수가 선택이 아니라 의무입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">예외: 데이터 skew + bind peeking</div>
+    <p>값 분포가 극단적으로 치우친 컬럼(예: 상태값의 99%가 '완료')은 <strong>첫 실행 값 기준으로 만든 플랜이 캐시</strong>되어(bind peeking) 다른 값에서 재앙이 될 수 있습니다. 이런 컬럼은 히스토그램을 수집해 Adaptive Cursor Sharing이 동작할 조건을 만들거나, 값 유형별로 SQL을 분리하는 것도 실무적 해법입니다. 소수의 무거운 배치/리포트 SQL은 애초에 리터럴이 나을 수 있습니다 — "다건 반복 실행 SQL에 바인드"가 정확한 원칙입니다. (<a href="ch10.html">10장 10.7절</a>)</p>
+  </div>
+</div>
+
+<h2 id="t4">팁 4. 조인 튜닝 요점 — 작은 집합을 먼저, 방법은 규모로</h2>
+
+<p>조인 튜닝의 대원칙 두 가지:</p>
+<ul>
+  <li><strong>조인 순서</strong>: 필터 조건으로 <strong>가장 작게 줄어드는 집합(driving set)</strong>부터 시작한다. 이후 모든 조인 반복 횟수가 이 크기에 비례합니다.</li>
+  <li><strong>조인 방법</strong>: 결합 규모가 <strong>소량이면 NL</strong>(inner 인덱스 필수), <strong>대량이면 Hash</strong>. 동작 원리는 <a href="ch10.html">10장</a> 애니메이션 참고.</li>
+</ul>
+
+<pre><code><span class="c">-- ❌ before: 1000만 건 orders를 driving으로 NL → 인덱스 탐색 1000만 회</span>
+<span class="k">SELECT</span> o.order_no, c.cust_name
+<span class="k">FROM</span>   orders o, customers c
+<span class="k">WHERE</span>  o.cust_id = c.cust_id
+<span class="k">AND</span>    c.vip_grade = <span class="s">'PLATINUM'</span>;   <span class="c">-- 플래티넘 고객은 단 50명!</span>
+
+<span class="c">-- ✅ after: "50명"이 driving이 되도록 힌트로 유도 (통계가 정확하면 대개 자동 선택)</span>
+<span class="k">SELECT</span> <span class="c">/*+ LEADING(c) USE_NL(o) INDEX(o orders_cust_id_ix) */</span>
+       o.order_no, c.cust_name
+<span class="k">FROM</span>   customers c, orders o
+<span class="k">WHERE</span>  o.cust_id = c.cust_id
+<span class="k">AND</span>    c.vip_grade = <span class="s">'PLATINUM'</span>;
+<span class="c">-- 고객 50명 → 각자의 주문만 인덱스로 — NL 반복이 50회로 축소
+
+-- 대량 결합(월 배치 등)이라면 반대로 Hash를 명시할 수도:
+--   /*+ LEADING(c) USE_HASH(o) FULL(o) */</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">힌트보다 먼저 물어볼 것</div>
+    <p>"왜 옵티마이저는 스스로 그 순서를 안 골랐지?" — 답은 대부분 E-Rows 오차(통계·히스토그램)입니다. 통계를 고치면 힌트 없이도 올바른 플랜이 나오고, 데이터가 변해도 스스로 적응합니다. 힌트는 원인 규명 후의 마지막 수단 + 긴급 처방용으로 아껴두세요.</p>
+  </div>
+</div>
+
+<h2 id="t5">팁 5. 페이지네이션 — 정렬을 인덱스에게 맡겨라</h2>
+
+<p>목록 화면의 "1~20번째만"을 구현하는 두 가지 방법:</p>
+
+<pre><code><span class="c">-- 전통 패턴 (11g 이하): ROWNUM 이중 래핑</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> (
+  <span class="k">SELECT</span> a.*, <span class="k">ROWNUM</span> rn <span class="k">FROM</span> (
+    <span class="k">SELECT</span> order_no, order_dt, amount
+    <span class="k">FROM</span>   orders
+    <span class="k">ORDER BY</span> order_dt <span class="k">DESC</span>          <span class="c">-- 정렬 먼저!</span>
+  ) a
+  <span class="k">WHERE ROWNUM</span> <= <span class="n">20</span>                 <span class="c">-- 상위 20건에서 컷 (COUNT STOPKEY)</span>
+)
+<span class="k">WHERE</span> rn > <span class="n">10</span>;                       <span class="c">-- 11~20건만</span>
+
+<span class="c">-- 12c+ 표준 문법: OFFSET / FETCH (내부적으로 유사하게 변환됨)</span>
+<span class="k">SELECT</span> order_no, order_dt, amount
+<span class="k">FROM</span>   orders
+<span class="k">ORDER BY</span> order_dt <span class="k">DESC</span>
+<span class="k">OFFSET</span> <span class="n">10</span> <span class="k">ROWS FETCH NEXT</span> <span class="n">10</span> <span class="k">ROWS ONLY</span>;</code></pre>
+
+<p>진짜 성능 포인트는 문법이 아니라 <strong>정렬 생략</strong>입니다. <code>ORDER BY</code> 컬럼에 인덱스가 있으면 옵티마이저는 인덱스를 <strong>정렬된 순서 그대로 읽다가 20건에서 멈춥니다</strong>(실행계획에 SORT 없이 <code>COUNT STOPKEY</code>). 인덱스가 없으면? 조건에 맞는 <strong>전체를 정렬한 뒤</strong> 20건을 버리는, 페이지가 뒤로 갈수록/데이터가 쌓일수록 느려지는 쿼리가 됩니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">ROWNUM의 함정 — 정렬 전에 자르지 마라</div>
+    <p><code>WHERE ROWNUM &lt;= 20 ORDER BY order_dt</code>처럼 한 블록에 쓰면 <strong>아무 행이나 20건을 먼저 뽑고 나서</strong> 그 20건을 정렬합니다. 결과 자체가 틀립니다. ROWNUM은 반드시 정렬이 끝난 인라인 뷰 <em>바깥</em>에서 적용해야 하며, 위의 이중 래핑이 바로 그 이유입니다. 또한 깊은 페이지(OFFSET 10000)는 어차피 1만 건을 읽고 버리므로, 무한 스크롤에는 "마지막 값 기준" 조건(<code>WHERE order_dt &lt; :last_dt</code>) 방식이 낫습니다.</p>
+  </div>
+</div>
+
+<h2 id="t6">팁 6. 대량 작업 — 건별 처리를 버려라</h2>
+
+<h3>6-1. 커밋은 모아서</h3>
+
+<pre><code><span class="c">-- ❌ before: 루프 안 건별 커밋 → log file sync 폭탄 (12장 사례 그대로)</span>
+<span class="k">FOR</span> r <span class="k">IN</span> (<span class="k">SELECT</span> ...) <span class="k">LOOP</span>
+  <span class="k">UPDATE</span> ...; <span class="k">COMMIT</span>;
+<span class="k">END LOOP</span>;
+
+<span class="c">-- ✅ after: N건 단위 배치 커밋 (또는 작업 전체에 1회)</span>
+<span class="k">FOR</span> r <span class="k">IN</span> (<span class="k">SELECT</span> ...) <span class="k">LOOP</span>
+  <span class="k">UPDATE</span> ...;
+  cnt := cnt + <span class="n">1</span>;
+  <span class="k">IF</span> <span class="f">MOD</span>(cnt, <span class="n">10000</span>) = <span class="n">0</span> <span class="k">THEN COMMIT</span>; <span class="k">END IF</span>;
+<span class="k">END LOOP</span>;
+<span class="k">COMMIT</span>;</code></pre>
+
+<h3>6-2. INSERT는 direct-path로</h3>
+
+<pre><code><span class="c">-- ✅ APPEND 힌트: 버퍼 캐시를 우회해 HWM 위에 블록을 통째로 기록</span>
+<span class="k">INSERT</span> <span class="c">/*+ APPEND */</span> <span class="k">INTO</span> sales_hist
+<span class="k">SELECT</span> * <span class="k">FROM</span> sales <span class="k">WHERE</span> sale_date < <span class="k">DATE</span> <span class="s">'2026-01-01'</span>;
+<span class="k">COMMIT</span>;   <span class="c">-- direct-path 후에는 커밋 전까지 같은 세션도 그 테이블 조회 불가</span></code></pre>
+
+<p>direct-path insert는 기존 빈 공간을 재활용하지 않고 HWM(High Water Mark) 위에 이어 쓰는 대신, 블록 단위 기록으로 대량 적재가 훨씬 빠릅니다. 대상 테이블에는 배타적 락이 걸려 동시 DML과 공존할 수 없으니 <strong>배치 전용</strong> 기법입니다.</p>
+
+<h3>6-3. PL/SQL은 BULK COLLECT / FORALL</h3>
+
+<pre><code><span class="c">-- ❌ before: 행마다 SQL엔진↔PL/SQL엔진을 오가는 컨텍스트 스위치 100만 번</span>
+<span class="k">FOR</span> r <span class="k">IN</span> (<span class="k">SELECT</span> id, amt <span class="k">FROM</span> src) <span class="k">LOOP</span>
+  <span class="k">INSERT INTO</span> dst <span class="k">VALUES</span> (r.id, r.amt);
+<span class="k">END LOOP</span>;
+
+<span class="c">-- ✅ after: 배열로 묶어서 왕복 횟수를 1만분의 1로</span>
+<span class="k">DECLARE</span>
+  <span class="k">TYPE</span> t_rows <span class="k">IS TABLE OF</span> src%<span class="k">ROWTYPE</span>;
+  v_rows t_rows;
+  <span class="k">CURSOR</span> c <span class="k">IS SELECT</span> * <span class="k">FROM</span> src;
+<span class="k">BEGIN</span>
+  <span class="k">OPEN</span> c;
+  <span class="k">LOOP</span>
+    <span class="k">FETCH</span> c <span class="k">BULK COLLECT INTO</span> v_rows <span class="k">LIMIT</span> <span class="n">10000</span>;  <span class="c">-- 1만 건씩 메모리로</span>
+    <span class="k">EXIT WHEN</span> v_rows.<span class="f">COUNT</span> = <span class="n">0</span>;
+    <span class="k">FORALL</span> i <span class="k">IN</span> <span class="n">1</span>..v_rows.<span class="f">COUNT</span>                     <span class="c">-- 1만 건을 한 번에 INSERT</span>
+      <span class="k">INSERT INTO</span> dst <span class="k">VALUES</span> v_rows(i);
+    <span class="k">COMMIT</span>;
+  <span class="k">END LOOP</span>;
+  <span class="k">CLOSE</span> c;
+<span class="k">END</span>;
+/</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">그 전에 — SQL 한 문장으로 되지 않는가?</div>
+    <p>가장 빠른 PL/SQL 루프는 루프를 없앤 것입니다. <code>INSERT ... SELECT</code>, <code>MERGE</code>, <code>UPDATE ... WHERE EXISTS</code> 한 문장으로 표현 가능한 로직이라면 그것이 항상 1등입니다. BULK COLLECT는 "행별 절차 로직이 정말 필요할 때"의 차선책입니다.</p>
+  </div>
+</div>
+
+<h2 id="t7">팁 7. 통계 관리 — DBMS_STATS 기본기와 히스토그램</h2>
+
+<pre><code><span class="c">-- 기본형: 대량 변경 배치의 마지막 단계에 넣어두면 사고가 준다</span>
+<span class="k">BEGIN</span>
+  DBMS_STATS.<span class="f">GATHER_TABLE_STATS</span>(
+    ownname          => <span class="k">USER</span>,
+    tabname          => <span class="s">'ORDERS'</span>,
+    cascade          => <span class="k">TRUE</span>,                          <span class="c">-- 인덱스 포함</span>
+    method_opt       => <span class="s">'FOR ALL COLUMNS SIZE AUTO'</span>,   <span class="c">-- 히스토그램 자동 판단</span>
+    estimate_percent => DBMS_STATS.AUTO_SAMPLE_SIZE     <span class="c">-- 샘플링도 자동</span>
+  );
+<span class="k">END</span>;
+/
+
+<span class="c">-- 특정 skew 컬럼에 히스토그램을 명시적으로 만들고 싶다면</span>
+<span class="c">--   method_opt => 'FOR COLUMNS order_status SIZE 254'</span>
+
+<span class="c">-- 히스토그램 보유 현황 확인</span>
+<span class="k">SELECT</span> column_name, num_distinct, histogram
+<span class="k">FROM</span>   user_tab_col_statistics <span class="k">WHERE</span> table_name = <span class="s">'ORDERS'</span>;</code></pre>
+
+<p><strong>히스토그램</strong>은 "값별 분포"를 담는 추가 통계입니다. 히스토그램이 없으면 옵티마이저는 균등 분포를 가정합니다 — <code>order_status</code>의 99%가 '완료'인 테이블에서 <code>= '오류'</code> 조건의 cardinality를 "행수 ÷ 값 종류수"로 계산해 크게 틀리는 식입니다. <code>SIZE AUTO</code>는 "그 컬럼이 WHERE에 쓰인 적이 있고 분포가 치우쳤을 때" 자동으로 만들어 줍니다.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">통계 수집의 타이밍</div>
+    <p>야간 자동 수집만 믿으면 "낮에 1억 건을 지운 직후"부터 밤까지는 낡은 통계로 달립니다. <strong>데이터 규모·분포를 크게 바꾸는 작업 뒤에는 즉시 수동 수집</strong>이 원칙입니다. 반대로, 잘 도는 시스템에서 이유 없이 통계를 다시 수집하면 플랜이 바뀌는 위험도 있으니(플랜 안정성), 중요 시스템은 수집 → 검증의 절차를 갖추세요.</p>
+  </div>
+</div>
+
+<h2 id="t8">팁 8. 자주 쓰는 진단 쿼리 모음</h2>
+
+<p>장애 대응 시 복사해 쓰는 세 가지입니다. 배경 개념은 <a href="ch12.html">12장</a> 참고.</p>
+
+<h3>8-1. 지금 활동 중인 세션과 대기 이벤트</h3>
+<pre><code><span class="k">SELECT</span> s.sid, s.serial#, s.username, s.sql_id,
+       s.event, s.state, s.seconds_in_wait, s.blocking_session
+<span class="k">FROM</span>   v$session s
+<span class="k">WHERE</span>  s.status = <span class="s">'ACTIVE'</span>
+<span class="k">AND</span>    s.username <span class="k">IS NOT NULL</span>
+<span class="k">ORDER BY</span> s.seconds_in_wait <span class="k">DESC</span>;</code></pre>
+
+<h3>8-2. 무거운 SQL Top-N (v$sql)</h3>
+<pre><code><span class="c">-- 누적 경과시간 기준 Top 10 — "실행당" 지표도 함께 봐야 한다</span>
+<span class="k">SELECT</span> *
+<span class="k">FROM</span> (
+  <span class="k">SELECT</span> sql_id,
+         executions,
+         <span class="f">ROUND</span>(elapsed_time/<span class="n">1e6</span>, <span class="n">1</span>)                   <span class="k">AS</span> elapsed_sec_total,
+         <span class="f">ROUND</span>(elapsed_time/<span class="f">NULLIF</span>(executions,<span class="n">0</span>)/<span class="n">1e3</span>, <span class="n">1</span>) <span class="k">AS</span> ms_per_exec,
+         buffer_gets, disk_reads,
+         <span class="f">SUBSTR</span>(sql_text, <span class="n">1</span>, <span class="n">80</span>) <span class="k">AS</span> sql_head
+  <span class="k">FROM</span>   v$sql
+  <span class="k">ORDER BY</span> elapsed_time <span class="k">DESC</span>
+)
+<span class="k">WHERE ROWNUM</span> <= <span class="n">10</span>;</code></pre>
+
+<h3>8-3. 락 대기 체인 — 누가 누구를 막고 있나</h3>
+<pre><code><span class="c">-- 블로킹 당하는 세션과 그 원인 세션을 한 줄로</span>
+<span class="k">SELECT</span> w.sid       <span class="k">AS</span> waiting_sid,
+       w.event     <span class="k">AS</span> waiting_event,
+       w.sql_id    <span class="k">AS</span> waiting_sql,
+       b.sid       <span class="k">AS</span> blocker_sid,
+       b.username  <span class="k">AS</span> blocker_user,
+       b.status    <span class="k">AS</span> blocker_status,
+       b.last_call_et <span class="k">AS</span> blocker_idle_sec
+<span class="k">FROM</span>   v$session w
+<span class="k">JOIN</span>   v$session b <span class="k">ON</span> b.sid = w.blocking_session
+<span class="k">WHERE</span>  w.blocking_session <span class="k">IS NOT NULL</span>;
+<span class="c">-- blocker가 INACTIVE + idle 수천 초 = "커밋 안 하고 퇴근" 패턴 (8장 참고)</span></code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">VARCHAR2 컬럼 cust_no에 인덱스가 있는데 <code>WHERE cust_no = 12345</code> 쿼리가 풀스캔을 합니다. 실행계획의 Predicate Information에는 <code>filter(TO_NUMBER("CUST_NO")=12345)</code>가 보입니다. 올바른 해결책은?</div>
+  <div class="quiz-opts">
+    <button type="button">TO_NUMBER(cust_no)에 대한 함수기반 인덱스를 추가한다</button>
+    <button type="button" data-correct>비교값을 컬럼 타입에 맞춰 <code>cust_no = '12345'</code>(문자)로 수정한다</button>
+    <button type="button">인덱스를 REBUILD해서 최신 상태로 만든다</button>
+    <button type="button">FULL 힌트를 제거한다</button>
+  </div>
+  <div class="quiz-expl">✅ 문자 컬럼 vs 숫자 비교에서 Oracle은 컬럼 쪽에 TO_NUMBER를 씌우므로(암시적 형변환) 인덱스를 못 씁니다. 근본 해결은 타입을 맞추는 것입니다. 함수기반 인덱스는 기술적으로 가능해도 숫자로 변환 불가한 값이 있으면 에러가 나는 등 원인을 덮는 우회일 뿐이고, REBUILD는 무관합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">ALLSTATS LAST 실행계획에서 어떤 인덱스 스캔 단계가 E-Rows=5, A-Rows=1,200,000으로 나왔고 그 위의 NESTED LOOPS가 전체 시간의 대부분을 차지합니다. 우선순위가 가장 높은 조치는?</div>
+  <div class="quiz-opts">
+    <button type="button">USE_NL 힌트를 추가해 현재 조인 방법을 명시한다</button>
+    <button type="button">NESTED LOOPS 단계 위에 PARALLEL 힌트를 붙여 속도를 보완한다</button>
+    <button type="button" data-correct>해당 테이블/컬럼의 통계(필요시 히스토그램)를 재수집해 cardinality 추정을 바로잡는다</button>
+  </div>
+  <div class="quiz-expl">✅ E-Rows 5 vs A-Rows 120만 — 옵티마이저가 24만 배 속아서 NL을 골랐습니다. 추정이 정확해지면 옵티마이저 스스로 Hash Join 등 적절한 플랜으로 바꿉니다. 병렬은 자원으로 문제를 덮는 미봉책이고, USE_NL은 오히려 잘못된 선택을 고정합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c 공식 문서: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/sql-tuning-guide.html" target="_blank" rel="noopener">SQL Tuning Guide</a>, <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/optimizer-statistics-concepts.html" target="_blank" rel="noopener">Optimizer Statistics Concepts</a>, <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/influencing-the-optimizer.html" target="_blank" rel="noopener">Influencing the Optimizer (힌트)</a></p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch12.html"><span class="dir">← 이전</span><br><span class="title">12장. AWR과 대기 이벤트</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="index.html"><span class="dir">다음 →</span><br><span class="title">학습 홈으로</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

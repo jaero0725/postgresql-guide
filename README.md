@@ -5,7 +5,7 @@
 
 모든 서비스 엔지니어·DBA·백엔드 개발자가 **운영을 효율화하기 위해** 참조할 수 있도록 구성했다. 공식 문서의 정확성을 유지하면서, 실제 장애·튜닝 경험에서 얻은 노하우를 함께 담았다.
 
-> 🎬 **시각화 학습 사이트**: [index.html](index.html)을 브라우저로 열면 PostgreSQL·ClickHouse·Elasticsearch 3개 가이드를 **단계별 애니메이션**으로 배울 수 있다 (GitHub Pages 배포 가능).
+> 🎬 **시각화 학습 사이트**: [index.html](index.html)을 브라우저로 열면 PostgreSQL·ClickHouse·Elasticsearch·Oracle 4개 가이드를 **단계별 애니메이션**으로 배울 수 있다 (GitHub Pages 배포 가능). Oracle 가이드에는 [쿼리 튜닝 팁 모음](or/tuning.html) 페이지가 포함되어 있다.
 
 ---
 

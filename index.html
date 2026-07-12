@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드</title>
-<meta name="description" content="세 가지 데이터베이스의 내부 구조를 움직이는 그림으로 배우는 학습 사이트">
+<title>DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드</title>
+<meta name="description" content="네 가지 데이터베이스의 내부 구조를 움직이는 그림으로 배우는 학습 사이트">
 <link rel="stylesheet" href="assets/style.css">
 <script defer src="assets/app.js"></script>
 </head>
@@ -16,6 +16,7 @@
     <a href="pg/index.html">🐘 PostgreSQL</a>
     <a href="ch/index.html">⚡ ClickHouse</a>
     <a href="es/index.html">🔍 Elasticsearch</a>
+    <a href="or/index.html">🔴 Oracle</a>
   </nav>
   <div class="spacer"></div>
   <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
@@ -23,11 +24,11 @@
 
 <section class="hero">
   <h1>데이터베이스 내부를<br><span style="background:linear-gradient(90deg,var(--pg-soft),var(--ch),var(--es));-webkit-background-clip:text;background-clip:text;color:transparent">움직이는 그림</span>으로 배운다</h1>
-  <p class="hero-sub">PostgreSQL · ClickHouse · Elasticsearch — 세 데이터베이스의 아키텍처와 운영 노하우를
+  <p class="hero-sub">PostgreSQL · ClickHouse · Elasticsearch · Oracle — 네 데이터베이스의 아키텍처와 운영 노하우를
   글이 아닌 <strong>단계별 애니메이션</strong>으로 이해하는 학습 사이트입니다.</p>
   <div class="hero-badges">
-    <span class="tag">🎬 스텝 애니메이션 100+</span>
-    <span class="tag">📖 36개 챕터</span>
+    <span class="tag">🎬 스텝 애니메이션 130+</span>
+    <span class="tag">📖 48개 챕터 + 튜닝 팁</span>
     <span class="tag">✍️ 이해도 퀴즈</span>
     <span class="tag">✅ 학습 진도 저장</span>
   </div>
@@ -64,6 +65,17 @@
       <span class="tag">11 챕터</span>
       <span class="tag">검색 · 로그</span>
       <span class="tag">완료 <b data-progress-of="es/">0</b>/12</span>
+    </div>
+    <div class="bar"></div>
+  </a>
+  <a class="db-card or" href="or/index.html">
+    <span class="db-ico">🔴</span>
+    <h2>Oracle</h2>
+    <p class="db-desc">엔터프라이즈 RDBMS의 표준. SGA·PGA 메모리 구조, Undo/Redo, 옵티마이저와 실행계획, AWR — 12개 챕터 + 쿼리 튜닝 팁 모음.</p>
+    <div class="db-stats">
+      <span class="tag">12 챕터 + 튜닝</span>
+      <span class="tag">OLTP · 엔터프라이즈</span>
+      <span class="tag">완료 <b data-progress-of="or/">0</b>/14</span>
     </div>
     <div class="bar"></div>
   </a>
@@ -173,14 +185,18 @@
     </div>
     <div class="card">
       <h4>🚒 운영/DBA</h4>
-      <p>각 가이드의 마지막 장(모니터링·트러블슈팅)과 <a href="pg/ch08.html">VACUUM</a>, <a href="ch/ch06.html">Merges</a>, <a href="es/ch09.html">인덱싱 전략</a>을 먼저.</p>
+      <p>각 가이드의 마지막 장(모니터링·트러블슈팅)과 <a href="pg/ch08.html">VACUUM</a>, <a href="ch/ch06.html">Merges</a>, <a href="es/ch09.html">인덱싱 전략</a>, <a href="or/ch12.html">AWR</a>을 먼저.</p>
+    </div>
+    <div class="card">
+      <h4>🏢 엔터프라이즈/Oracle</h4>
+      <p><a href="or/index.html">Oracle 1→7장</a>으로 SGA·Undo/Redo를 잡고, <a href="or/tuning.html">쿼리 튜닝 팁</a>은 즐겨찾기. <a href="pg/ch03.html">PostgreSQL MVCC</a>와 비교하며 읽으면 개념이 선명해집니다.</p>
     </div>
   </div>
 </section>
 
 <section class="home-section" id="troubleshooting">
   <h2>원문 저장소</h2>
-  <p class="sec-sub">이 사이트는 아래 세 지식 저장소의 커리큘럼을 시각화한 것입니다. 심화 내용·트러블슈팅 케이스·치트시트는 원문에서.</p>
+  <p class="sec-sub">이 사이트는 아래 세 지식 저장소의 커리큘럼을 시각화한 것입니다 (Oracle 가이드는 공식 문서 기반으로 이 사이트에서 자체 구성). 심화 내용·트러블슈팅 케이스·치트시트는 원문에서.</p>
   <div class="grid g3">
     <div class="card"><h4>🐘 postgresql-guide</h4><p>챕터 14 + 실무 예제 5 + 장애 케이스 27 + 치트시트 9 — <a href="https://github.com/jaero0725/postgresql-guide" target="_blank" rel="noopener">GitHub에서 보기</a></p></div>
     <div class="card"><h4>⚡ clickhouse-guide</h4><p>챕터 11 + 예제 + 안티패턴 + 트러블슈팅 — <a href="https://github.com/jaero0725/clickhouse-guide" target="_blank" rel="noopener">GitHub에서 보기</a></p></div>
@@ -189,7 +205,7 @@
 </section>
 
 <footer class="site-footer">
-  DB Study — PostgreSQL · ClickHouse · Elasticsearch 시각화 학습 가이드<br>
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드<br>
   공식 문서 기반 지식 저장소를 초보자 눈높이의 애니메이션으로 재구성했습니다.
 </footer>
 

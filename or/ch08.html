@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8장. 트랜잭션과 락 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch08">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>8장. 트랜잭션과 락</h1>
+<p class="lead">Oracle의 행 락은 별도의 락 매니저 메모리가 아니라 데이터 블록 안(ITL)에 삽니다. 그래서 락이 아무리 많아져도 에스컬레이션이 없습니다 — 이 설계 하나가 Oracle 동시성의 성격을 결정합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 5장 블록 구조, 6장 읽기 일관성</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Oracle 락의 특징 — 행 락은 블록 속 ITL에 기록, 락 에스컬레이션 없음 ② TX/TM 락과 SELECT FOR UPDATE ③ deadlock(ORA-00060)의 형성과 자동 감지 ④ v$session으로 락 대기 진단, 그리고 격리 수준(READ COMMITTED / SERIALIZABLE)</p>
+  </div>
+</div>
+
+<h2 id="s1">8.1 Oracle 락의 철학 — 락은 블록 안에 산다</h2>
+
+<p>많은 DBMS는 "어느 세션이 어느 행을 잠갔나"를 <strong>메모리의 락 테이블</strong>에서 중앙 관리합니다. 이 방식의 약점은 락이 많아지면 락 테이블이 메모리를 잠식한다는 것 — 그래서 일부 DBMS는 행 락 수천 개를 페이지 락·테이블 락 하나로 뭉치는 <strong>락 에스컬레이션(lock escalation)</strong>을 합니다. 동시성이 갑자기 나빠지는 원인이죠.</p>
+
+<p>Oracle의 설계는 다릅니다. <strong>행 락은 그 행이 사는 데이터 블록 안에 기록됩니다.</strong> 5장에서 본 블록 헤더의 <strong>ITL(Interested Transaction List)</strong>에 트랜잭션이 이름을 올리고, 각 행은 자신을 잠근 트랜잭션의 ITL 슬롯 번호를 가리킬 뿐입니다. 그 결과:</p>
+
+<ul>
+  <li><strong>락 개수에 비례하는 중앙 메모리가 없습니다.</strong> 1행을 잠그든 1억 행을 잠그든 별도 락 메모리 비용은 사실상 같습니다.</li>
+  <li>그래서 <strong>락 에스컬레이션이 존재하지 않습니다.</strong> 행 락이 테이블 락으로 승격되는 일은 Oracle에 없습니다.</li>
+  <li>락 정보가 블록과 함께 디스크에 쓰이고 캐시됩니다 — 커밋 후 뒷정리(block cleanout)도 블록 단위로 이뤄집니다.</li>
+</ul>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">그리고 SELECT는 락을 잡지 않는다</div>
+    <p>6장의 읽기 일관성 덕분에 <strong>일반 SELECT는 어떤 락도 잡지 않고, 어떤 락도 기다리지 않습니다.</strong> 읽기는 쓰기를 막지 않고 쓰기는 읽기를 막지 않습니다. Oracle에서 락 경합은 오직 <strong>쓰기 vs 쓰기</strong>, 그것도 <strong>같은 행</strong>을 두고서만 일어납니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">8.2 TX 락과 TM 락 — DML 한 번에 락 두 종류</h2>
+
+<p>UPDATE 한 문장을 실행하면 Oracle은 두 종류의 락을 잡습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>락</th><th>이름</th><th>역할</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TX</strong></td><td>트랜잭션 락 (row lock)</td><td>트랜잭션당 <strong>1개</strong>. 그 트랜잭션이 고친 모든 행의 "주인 표식". 다른 세션이 같은 행을 고치려 하면 <strong>주인의 TX 락이 풀리기를 대기</strong>합니다(enqueue).</td></tr>
+    <tr><td><strong>TM</strong></td><td>테이블 락 (DML lock)</td><td>DML이 건드린 테이블마다 1개(보통 Row Exclusive 모드). 행을 고치는 도중에 누가 <strong>테이블을 DROP하거나 구조를 바꾸는 것</strong>을 막습니다.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>"행 락 대기"의 실체는 이렇습니다: 세션 B가 세션 A가 잠근 행을 고치려 하면, B는 그 행이 아니라 <strong>A의 TX 락에 줄을 섭니다</strong>. A가 COMMIT/ROLLBACK으로 TX 락을 풀면 B가 깨어납니다. 대기 이벤트 이름도 <code>enq: TX - row lock contention</code>입니다.</p>
+
+<h2 id="s3">8.3 같은 행 vs 다른 행 — 대기는 언제 생기나</h2>
+
+<div class="anim" data-steps="4" data-title="두 세션의 UPDATE — 같은 행이면 대기, 다른 행이면 자유" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 330">
+      <defs>
+        <marker id="arr8a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr8b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- sessions -->
+      <rect x="40" y="30" width="200" height="52" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="140" y="52" text-anchor="middle" class="sv-label">세션 A</text>
+      <text x="140" y="72" text-anchor="middle" class="sv-label-sm sv-mono">UPDATE ... WHERE id=1</text>
+      <g data-show="2">
+        <rect x="560" y="30" width="200" height="52" rx="10" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="660" y="52" text-anchor="middle" class="sv-label">세션 B</text>
+        <text x="660" y="72" text-anchor="middle" class="sv-label-sm sv-mono">UPDATE ... WHERE id=1</text>
+      </g>
+      <!-- table rows -->
+      <rect x="240" y="130" width="320" height="150" rx="10" class="sv-box"/>
+      <text x="256" y="156" class="sv-label">ACCOUNTS 테이블</text>
+      <rect x="256" y="170" width="288" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="268" y="192" class="sv-label-sm sv-mono">id=1  bal=100  🔒 TX-A</text>
+      <rect x="256" y="212" width="288" height="34" rx="6" class="sv-box"/>
+      <g data-show="1-3">
+        <text x="268" y="234" class="sv-label-sm sv-mono">id=2  bal=500  (락 없음)</text>
+      </g>
+      <path d="M 160 82 C 200 110 240 140 268 168" class="sv-arrow flow-line" marker-end="url(#arr8a)"/>
+      <!-- B blocked -->
+      <g data-show="2-3">
+        <path d="M 640 82 C 600 110 560 140 540 168" stroke="var(--warn)" stroke-width="2.2" fill="none" stroke-dasharray="5 4"/>
+        <text x="620" y="130" class="sv-label" fill="var(--warn)">⛔ 대기!</text>
+        <text x="500" y="110" class="sv-label-sm" fill="var(--warn)">enq: TX - row lock contention</text>
+      </g>
+      <!-- different row ok -->
+      <g data-show="3-3">
+        <rect x="256" y="212" width="288" height="34" rx="6" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="268" y="234" class="sv-label-sm sv-mono" fill="var(--ok)">id=2  bal=500  🔒 TX-C (즉시 성공)</text>
+        <rect x="40" y="212" width="150" height="46" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="115" y="232" text-anchor="middle" class="sv-label">세션 C</text>
+        <text x="115" y="250" text-anchor="middle" class="sv-label-sm sv-mono">WHERE id=2 ✅</text>
+        <path d="M 194 235 L 252 233" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr8b)"/>
+      </g>
+      <!-- commit release -->
+      <g data-show="4">
+        <text x="140" y="110" class="sv-label" fill="var(--ok)">A: COMMIT → TX 락 해제 🔓</text>
+        <rect x="256" y="170" width="288" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 16%, transparent)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="268" y="192" class="sv-label-sm sv-mono" fill="var(--warn)">id=1  bal=200  🔒 TX-B 획득!</text>
+        <text x="620" y="130" class="sv-label" fill="var(--ok)">▶ B 진행 재개</text>
+        <text x="400" y="312" text-anchor="middle" class="sv-label-sm">행 락에는 타임아웃이 없다 — A가 커밋을 미루면 B는 하염없이 기다린다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>세션 A가 <code>id=1</code> 행을 UPDATE합니다. 블록의 ITL에 A의 트랜잭션이 등록되고 행에 락 표식이 남습니다. A는 아직 커밋하지 않았습니다.</p>
+    <p>세션 B가 <b>같은 행</b>을 UPDATE하려 합니다. 행의 주인 TX-A가 살아있으므로 B는 <b style="color:var(--warn)">A의 TX 락에 줄을 서서 대기</b>합니다. 대기 이벤트: <code>enq: TX - row lock contention</code>.</p>
+    <p>반면 세션 C가 <b>다른 행</b>(<code>id=2</code>)을 UPDATE하면? <b style="color:var(--ok)">즉시 성공.</b> Oracle의 락은 정확히 행 단위이고 에스컬레이션이 없으므로, 다른 행끼리는 절대 부딪히지 않습니다.</p>
+    <p>A가 COMMIT하는 순간 TX 락이 풀리고 B가 깨어나 UPDATE를 완수합니다. 주의: <b>행 락 대기에는 타임아웃이 없습니다.</b> A가 커밋 없이 퇴근하면 B는 밤새 기다립니다 — 트랜잭션은 짧게!</p>
+  </div>
+</div>
+
+<h2 id="s4">8.4 ITL 슬롯 — 행 락의 실제 저장소</h2>
+
+<p>블록 헤더의 ITL은 "이 블록에서 지금 작업 중인 트랜잭션 명단"입니다. 슬롯 초기 개수는 <code>INITRANS</code>(테이블 기본 1)로 정해지고, 필요하면 블록의 free space를 먹으며 늘어납니다(최대 255). 이 슬롯이 모자라면 어떻게 될까요?</p>
+
+<div class="anim" data-steps="4" data-title="ITL 슬롯 동작 — 명단에 이름을 올려야 행을 잠근다" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <!-- block -->
+      <rect x="60" y="40" width="420" height="270" rx="12" class="sv-box"/>
+      <text x="76" y="66" class="sv-label">데이터 블록</text>
+      <!-- ITL area -->
+      <rect x="76" y="80" width="388" height="88" rx="8" fill="color-mix(in srgb, var(--purple) 8%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="90" y="100" class="sv-label-sm" fill="var(--purple)">ITL (트랜잭션 명단)</text>
+      <!-- slot1 -->
+      <g data-show="1-4">
+        <rect x="90" y="108" width="170" height="24" rx="5" fill="color-mix(in srgb, var(--accent) 16%, transparent)" stroke="var(--accent)"/>
+        <text x="98" y="125" class="sv-label-sm sv-mono">슬롯1: TX-A (undo 주소)</text>
+      </g>
+      <!-- slot2 -->
+      <g data-show="2">
+        <rect x="278" y="108" width="170" height="24" rx="5" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)"/>
+        <text x="286" y="125" class="sv-label-sm sv-mono">슬롯2: TX-B (새로 확장)</text>
+      </g>
+      <g data-show="1-1">
+        <rect x="278" y="108" width="170" height="24" rx="5" fill="none" stroke="var(--border)" stroke-dasharray="4 4"/>
+        <text x="286" y="125" class="sv-label-sm" fill="var(--text-faint)">빈 슬롯 (필요시 확장)</text>
+      </g>
+      <!-- rows -->
+      <rect x="76" y="182" width="388" height="30" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text x="88" y="202" class="sv-label-sm sv-mono">row 1: lb=1 → 슬롯1(TX-A)이 잠금</text>
+      <g data-show="1-1">
+        <rect x="76" y="220" width="388" height="30" rx="6" class="sv-box"/>
+        <text x="88" y="240" class="sv-label-sm sv-mono">row 2: lb=0 (락 없음)</text>
+      </g>
+      <g data-show="2">
+        <rect x="76" y="220" width="388" height="30" rx="6" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)"/>
+        <text x="88" y="240" class="sv-label-sm sv-mono">row 2: lb=2 → 슬롯2(TX-B)가 잠금</text>
+      </g>
+      <rect x="76" y="258" width="388" height="30" rx="6" class="sv-box"/>
+      <g data-show="1-2">
+        <text x="88" y="278" class="sv-label-sm sv-mono">row 3: lb=0 (락 없음)</text>
+      </g>
+      <g data-show="3">
+        <text x="88" y="278" class="sv-label-sm sv-mono" fill="var(--danger)">row 3: 세션 C가 잠그려는데...</text>
+      </g>
+      <!-- ITL shortage -->
+      <g data-show="3-3">
+        <rect x="520" y="80" width="240" height="110" rx="10" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="640" y="106" text-anchor="middle" class="sv-label" fill="var(--danger)">ITL 슬롯 부족!</text>
+        <text x="640" y="128" text-anchor="middle" class="sv-label-sm">free space도 없어 확장 불가</text>
+        <text x="640" y="148" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">C는 빈 슬롯이 날 때까지 대기</text>
+        <text x="640" y="168" text-anchor="middle" class="sv-label-sm sv-mono">enq: TX - allocate ITL entry</text>
+      </g>
+      <!-- resolution -->
+      <g data-show="4">
+        <rect x="520" y="210" width="240" height="100" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="640" y="236" text-anchor="middle" class="sv-label" fill="var(--ok)">해법</text>
+        <text x="640" y="258" text-anchor="middle" class="sv-label-sm">동시 DML 많은 테이블은</text>
+        <text x="640" y="278" text-anchor="middle" class="sv-label-sm sv-mono">INITRANS 상향 + PCTFREE 여유</text>
+        <text x="640" y="298" text-anchor="middle" class="sv-label-sm">(재구성 필요)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>TX-A가 row 1을 고치면: ①ITL <b>슬롯1</b>에 자기 트랜잭션 ID와 undo 주소를 등록하고 ②row 1의 락 바이트(lb)가 슬롯1을 가리킵니다. 이 두 표식이 행 락의 전부 — 중앙 락 테이블은 없습니다.</p>
+    <p>TX-B가 row 2를 고치려면 자기 슬롯이 필요합니다. 빈 슬롯이 없으면 <b style="color:var(--ok)">free space를 조금 먹어 슬롯2를 확장</b>해 등록합니다(INITRANS 초과분, 최대 255).</p>
+    <p>그런데 블록이 꽉 차서 free space가 없다면? 세션 C는 잠글 행(row 3)이 <b>비어 있는데도</b> 명단에 이름을 못 올려 대기합니다 — <b style="color:var(--danger)">enq: TX - allocate ITL entry</b> 대기의 정체입니다.</p>
+    <p>동시 DML이 몰리는 테이블/인덱스에서 이 대기가 보이면 <code>INITRANS</code>를 높이고 PCTFREE로 여유 공간을 확보한 뒤 재구성(MOVE/REBUILD)하는 것이 정석입니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">8.5 SELECT FOR UPDATE — 읽으면서 미리 잠그기</h2>
+
+<p>"읽고 → 판단하고 → 고치는" 로직에서는 읽기와 쓰기 사이에 다른 세션이 끼어들 수 있습니다. 읽는 시점에 행을 잠그고 싶다면 <code>SELECT ... FOR UPDATE</code>를 씁니다. 대기 방식도 고를 수 있습니다.</p>
+
+<pre><code><span class="c">-- 기본: 행 락을 얻을 때까지 무한 대기</span>
+<span class="k">SELECT</span> bal <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">FOR UPDATE</span>;
+
+<span class="c">-- 잠겨 있으면 즉시 에러 (ORA-00054)</span>
+<span class="k">SELECT</span> bal <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">FOR UPDATE NOWAIT</span>;
+
+<span class="c">-- 5초만 기다려보고 포기 (ORA-30006)</span>
+<span class="k">SELECT</span> bal <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">FOR UPDATE WAIT</span> <span class="n">5</span>;
+
+<span class="c">-- 잠긴 행은 건너뛰고 잠글 수 있는 행만 — 작업 큐 패턴의 단골</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> job_queue <span class="k">WHERE</span> status = <span class="s">'READY'</span>
+<span class="k">FOR UPDATE SKIP LOCKED</span>;</code></pre>
+
+<h2 id="s6">8.6 Deadlock — ORA-00060과 Oracle의 자동 심판</h2>
+
+<p>두 세션이 <strong>서로가 잡은 행을 서로 기다리면</strong> 아무도 영원히 진행할 수 없습니다 — deadlock입니다. Oracle은 이를 자동 감지해 한쪽의 <strong>문장</strong>을 강제로 실패시킵니다.</p>
+
+<div class="anim" data-steps="4" data-title="Deadlock 형성과 자동 감지 — ORA-00060" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 340">
+      <defs>
+        <marker id="arr8c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr8d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- sessions -->
+      <rect x="40" y="120" width="170" height="56" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="125" y="144" text-anchor="middle" class="sv-label">세션 A</text>
+      <text x="125" y="164" text-anchor="middle" class="sv-label-sm">TX 진행 중</text>
+      <rect x="590" y="120" width="170" height="56" rx="10" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+      <text x="675" y="144" text-anchor="middle" class="sv-label">세션 B</text>
+      <text x="675" y="164" text-anchor="middle" class="sv-label-sm">TX 진행 중</text>
+      <!-- rows -->
+      <rect x="300" y="50" width="200" height="44" rx="8" class="sv-box"/>
+      <text x="400" y="77" text-anchor="middle" class="sv-label-sm sv-mono">row X (id=1)</text>
+      <rect x="300" y="230" width="200" height="44" rx="8" class="sv-box"/>
+      <text x="400" y="257" text-anchor="middle" class="sv-label-sm sv-mono">row Y (id=2)</text>
+      <!-- step1: each locks one -->
+      <g data-show="1">
+        <path d="M 214 130 C 260 110 280 95 296 82" class="sv-arrow flow-line" marker-end="url(#arr8c)"/>
+        <text x="240" y="96" class="sv-label-sm" fill="var(--accent)">A가 X 잠금 🔒</text>
+        <path d="M 586 166 C 540 190 530 210 504 240" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr8d)"/>
+        <text x="530" y="216" class="sv-label-sm" fill="var(--warn)">B가 Y 잠금 🔒</text>
+      </g>
+      <!-- step2: cross waits -->
+      <g data-show="2">
+        <path d="M 214 166 C 260 190 280 210 296 240" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="216" y="216" class="sv-label-sm" fill="var(--accent)">A가 Y를 원함 ⏳</text>
+      </g>
+      <g data-show="3">
+        <path d="M 586 130 C 540 110 520 95 504 82" stroke="var(--warn)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="510" y="96" class="sv-label-sm" fill="var(--warn)">B가 X를 원함 ⏳</text>
+        <text x="400" y="170" text-anchor="middle" class="sv-label" fill="var(--danger)">🔄 상호 대기 완성 = deadlock</text>
+      </g>
+      <!-- step4: detection -->
+      <g data-show="4">
+        <rect x="220" y="290" width="360" height="42" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.8"/>
+        <text x="400" y="317" text-anchor="middle" class="sv-label" fill="var(--danger)">ORA-00060 → A의 문장만 롤백 (TX는 유지)</text>
+        <text x="400" y="30" text-anchor="middle" class="sv-label-sm">Oracle이 대기 그래프의 순환을 감지 — DBA 개입 불필요</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>세션 A가 row X를, 세션 B가 row Y를 각각 UPDATE했습니다. 아직 아무도 커밋하지 않았고, 여기까지는 정상입니다.</p>
+    <p>세션 A가 이번엔 <b>row Y</b>를 UPDATE하려 합니다. Y의 주인은 B — A는 B의 TX 락에 줄을 서서 기다립니다.</p>
+    <p>세션 B가 <b>row X</b>를 UPDATE하려 합니다. X의 주인은 A... <b style="color:var(--danger)">서로가 서로를 기다리는 순환</b>이 완성됐습니다. 이대로면 둘 다 영원히 멈춥니다.</p>
+    <p>Oracle이 대기 그래프의 순환을 <b>자동 감지</b>하고, 감지한 세션(A)의 <b>현재 문장 하나만</b> 롤백시키며 <b style="color:var(--danger)">ORA-00060</b>을 던집니다. 트랜잭션 전체가 아니라 문장만 롤백이므로, 애플리케이션은 에러를 받고 <b>전체 ROLLBACK 후 재시도</b>하도록 짜야 합니다. 상세 내역은 트레이스 파일에 남습니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">deadlock은 Oracle 탓이 아니라 코드 탓</div>
+    <p>deadlock의 90%는 <strong>두 트랜잭션이 같은 자원들을 서로 다른 순서로 잠그기 때문</strong>입니다. 해법도 애플리케이션에 있습니다: ① 여러 행/테이블을 갱신할 때 <strong>항상 같은 순서</strong>(예: PK 오름차순)로 ② 트랜잭션은 짧게 ③ 외래키 컬럼에 인덱스 생성(없으면 자식 테이블 DML이 부모에 더 넓은 TM 락을 유발해 deadlock 단골 원인이 됩니다).</p>
+  </div>
+</div>
+
+<h2 id="s7">8.7 락 대기 진단 — 범인은 v$session에 있다</h2>
+
+<p>"화면이 멈췄어요"라는 신고가 오면, 누가 누구를 막고 있는지부터 찾습니다. <code>v$session</code>의 <code>blocking_session</code> 컬럼이 정답을 바로 알려줍니다.</p>
+
+<pre><code><span class="c">-- 지금 락에 막혀 있는 세션과, 그를 막고 있는 범인</span>
+<span class="k">SELECT</span> sid, serial#, username, event,
+       blocking_session,                    <span class="c">-- 나를 막는 세션의 SID</span>
+       final_blocking_session,              <span class="c">-- 대기 사슬 맨 끝의 최종 범인</span>
+       seconds_in_wait
+<span class="k">FROM</span>   v$session
+<span class="k">WHERE</span>  blocking_session <span class="k">IS NOT NULL</span>;
+
+ SID  USERNAME  EVENT                              BLOCKING_SESSION
+----  --------  ---------------------------------  ----------------
+ 152  APP_USER  enq: TX - row lock contention                   34   <span class="c">← 34번이 범인</span>
+
+<span class="c">-- 범인(34번)이 뭘 하는 중인지 확인 후, 응답 없으면 강제 종료</span>
+<span class="k">SELECT</span> sid, serial#, status, sql_id, last_call_et <span class="k">FROM</span> v$session <span class="k">WHERE</span> sid = <span class="n">34</span>;
+<span class="k">ALTER SYSTEM KILL SESSION</span> <span class="s">'34,56789'</span>;   <span class="c">-- 'sid,serial#' — 최후의 수단!</span></code></pre>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div>
+    <div class="callout-title">대기 사슬이 길 때는 final_blocking_session</div>
+    <p>A를 B가 막고, B를 C가 막는 연쇄 대기에서는 중간 세션이 아니라 <strong>사슬 끝의 최종 범인</strong>을 찾아야 합니다. <code>final_blocking_session</code>이 그 답이고, 12장에서 배울 AWR/ASH로는 과거의 락 대기 이력까지 추적할 수 있습니다.</p>
+  </div>
+</div>
+
+<h2 id="s8">8.8 격리 수준 — Oracle의 선택지</h2>
+
+<p>Oracle의 기본 격리 수준은 <strong>READ COMMITTED</strong>입니다. 문장 하나하나가 자기 시작 시점의 SCN으로 읽기 일관성을 보장받습니다(문장 수준 일관성). 더 강한 보장이 필요하면 <strong>SERIALIZABLE</strong>로 올려 트랜잭션 시작 시점의 스냅샷을 트랜잭션 끝까지 고정할 수 있습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>격리 수준</th><th>일관성 범위</th><th>특징</th></tr></thead>
+  <tbody>
+    <tr><td><strong>READ COMMITTED</strong> (기본)</td><td>문장 단위</td><td>각 문장이 시작 SCN 기준으로 읽음. 같은 TX 안에서 두 번 읽으면 다른 결과 가능(non-repeatable read).</td></tr>
+    <tr><td><strong>SERIALIZABLE</strong></td><td>트랜잭션 단위</td><td>TX 시작 시점 스냅샷 고정. 그 후 다른 TX가 커밋한 행을 고치려 하면 <code>ORA-08177: can't serialize access</code> — 재시도 로직 필수.</td></tr>
+    <tr><td><strong>READ ONLY</strong></td><td>트랜잭션 단위</td><td>SERIALIZABLE의 읽기 전용 변형. 장시간 리포트의 일관성 확보용 (DML 불가).</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>눈치채셨나요? <strong>READ UNCOMMITTED가 없습니다.</strong> 읽기 일관성이 공짜(락 없음)로 제공되는 Oracle에서는 dirty read를 허용할 이유가 아예 없기 때문입니다. 또 REPEATABLE READ도 별도로 제공하지 않습니다 — 필요하면 SERIALIZABLE 또는 SELECT FOR UPDATE로 해결합니다.</p>
+
+<pre><code><span class="c">-- 트랜잭션 단위 스냅샷 고정</span>
+<span class="k">SET TRANSACTION ISOLATION LEVEL</span> SERIALIZABLE;
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> bal = bal - <span class="n">100</span> <span class="k">WHERE</span> id = <span class="n">1</span>;
+<span class="c">-- 이 사이 다른 TX가 id=1을 고치고 커밋했다면 → ORA-08177 발생, 재시도 필요</span>
+<span class="k">COMMIT</span>;</code></pre>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">Oracle에 락 에스컬레이션(행 락 → 테이블 락 승격)이 없는 구조적 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">TM 락이 모든 행 락을 대신하기 때문</button>
+    <button type="button" data-correct>행 락이 중앙 락 테이블이 아닌 데이터 블록 안(ITL)에 기록되어, 락 수가 늘어도 별도 메모리가 들지 않기 때문</button>
+    <button type="button">SELECT가 락을 잡지 않아 락 수가 항상 적기 때문</button>
+    <button type="button">Oracle이 행 락 개수를 세션당 255개로 제한하기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ 에스컬레이션은 "락 메모리 절약"이 목적인데, Oracle은 락 정보를 블록 헤더의 ITL과 행의 락 바이트에 분산 저장하므로 락이 100만 개여도 중앙 메모리 비용이 없습니다. 절약할 것이 없으니 승격도 없습니다. 255는 블록당 ITL 슬롯의 최대치이지 세션당 행 락 제한이 아닙니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">deadlock이 발생해 ORA-00060을 받은 세션에 대한 설명으로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">Oracle이 해당 트랜잭션 전체를 자동으로 롤백해 준다</button>
+    <button type="button" data-correct>현재 문장만 롤백되며, 트랜잭션은 남아 있으므로 애플리케이션이 ROLLBACK 후 재시도해야 한다</button>
+    <button type="button">DBA가 두 세션 중 하나를 수동으로 kill해야 해소된다</button>
+    <button type="button">innodb_lock_wait_timeout이 지나면 자동 해소된다</button>
+  </div>
+  <div class="quiz-expl">✅ Oracle은 deadlock을 자동 감지하지만 롤백하는 것은 <strong>문장 하나뿐</strong>입니다. 그 세션의 트랜잭션(이미 잡은 다른 락 포함)은 그대로 살아 있으므로, 에러를 받은 애플리케이션이 명시적으로 ROLLBACK하고 재시도해야 상대 세션도 풀립니다. 감지가 자동이므로 DBA 개입은 불필요합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html" target="_blank" rel="noopener">Data Concurrency and Consistency</a> — 락 종류 전체 목록, deadlock 감지, 격리 수준의 정식 정의 · <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html" target="_blank" rel="noopener">Transactions</a> — 트랜잭션 구조와 자율 트랜잭션까지.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch07.html"><span class="dir">← 이전</span><br><span class="title">7장. Redo · 커밋 · 인스턴스 복구</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch09.html"><span class="dir">다음 →</span><br><span class="title">9장. 인덱스 구조와 활용</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

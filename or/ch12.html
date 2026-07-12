@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12장. AWR과 대기 이벤트 — 모니터링 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch12">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>12장. AWR과 대기 이벤트 — 모니터링</h1>
+<p class="lead">"DB가 느려요"라는 신고 앞에서 감으로 헤매지 않는 방법 — Oracle은 모든 기다림을 이름 붙여 기록합니다. 그 기록을 읽는 법을 배웁니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 2·7·8장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① 대기 이벤트(wait event)라는 진단 언어와 대표 이벤트 5종 ② v$session·v$sql·ASH로 "지금"을 보는 법 ③ AWR 스냅샷 원리와 리포트 읽는 순서 ④ ADDM·Statspack까지, 상황별 도구 선택</p>
+  </div>
+</div>
+
+<h2 id="s1">12.1 대기 이벤트 — Oracle의 진단 언어</h2>
+
+<p>세션은 CPU에서 일하고 있거나, <strong>무언가를 기다리고 있거나</strong> 둘 중 하나입니다. Oracle은 기다림의 종류마다 이름을 붙여 놓았습니다 — 이것이 <strong>대기 이벤트(wait event)</strong>입니다. "느리다"는 막연한 증상이 대기 이벤트를 보는 순간 "디스크 I/O를 기다린다", "락을 기다린다", "커밋 기록을 기다린다"라는 <strong>구체적인 병목 유형</strong>으로 번역됩니다.</p>
+
+<p>현장에서 만나는 빈도순으로, 이 다섯 개만 외워도 절반은 해결됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>대기 이벤트</th><th>뜻</th><th>전형적 원인</th></tr></thead>
+  <tbody>
+    <tr><td><code>db file sequential read</code></td><td><strong>싱글 블록</strong> 디스크 읽기 (이름과 달리 주로 <strong>인덱스 경유 접근</strong>)</td><td>인덱스 스캔 + 테이블 랜덤 접근이 많음. 과하면 나쁜 CF·비효율 인덱스 의심</td></tr>
+    <tr><td><code>db file scattered read</code></td><td><strong>멀티 블록</strong> 읽기를 버퍼 캐시 여기저기(scattered)에 적재</td><td>Full Table Scan / Index Fast Full Scan — 풀스캔이 많다는 신호</td></tr>
+    <tr><td><code>log file sync</code></td><td>커밋 후 LGWR가 redo를 디스크에 쓸 때까지 대기</td><td>커밋이 너무 잦음(루프 내 건별 커밋), redo 디스크가 느림</td></tr>
+    <tr><td><code>buffer busy waits</code></td><td>같은 버퍼 블록을 두고 세션들이 경합</td><td>특정 블록에 삽입/변경 집중 (예: 시퀀스 PK 인덱스의 오른쪽 끝 블록)</td></tr>
+    <tr><td><code>enq: TX - row lock contention</code></td><td>다른 트랜잭션이 잡은 <strong>행 락</strong>을 대기</td><td>커밋하지 않는 긴 트랜잭션, 같은 행 동시 갱신 (8장 참고)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="anim" data-steps="5" data-title="'느려요' 신고 → 대기 이벤트로 병목 찾기" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 340">
+      <defs>
+        <marker id="arr12a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <!-- report -->
+      <g data-active="1-1">
+        <rect x="30" y="30" width="180" height="56" rx="10" fill="color-mix(in srgb, var(--danger) 12%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="120" y="54" text-anchor="middle" class="sv-label" font-size="13">📞 "화면이 느려요!"</text>
+        <text x="120" y="74" text-anchor="middle" class="sv-label-sm">증상만 있고 원인은 미궁</text>
+      </g>
+
+      <!-- v$session -->
+      <g data-show="2" data-active="2-2">
+        <path d="M 214 58 L 268 58" class="sv-arrow flow-line" marker-end="url(#arr12a)"/>
+        <rect x="275" y="24" width="280" height="70" rx="10" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="415" y="46" text-anchor="middle" class="sv-label sv-mono" font-size="12">SELECT sid, event, state FROM v$session</text>
+        <text x="415" y="66" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">event = db file scattered read</text>
+        <text x="415" y="84" text-anchor="middle" class="sv-label-sm">그 세션이 "지금" 기다리는 것</text>
+      </g>
+
+      <!-- branch table -->
+      <g data-show="3">
+        <rect x="80" y="130" width="200" height="64" rx="9" class="sv-box"/>
+        <text x="180" y="152" text-anchor="middle" class="sv-label-sm sv-mono">sequential read</text>
+        <text x="180" y="170" text-anchor="middle" class="sv-label-sm">→ 인덱스 랜덤 I/O</text>
+        <text x="180" y="186" text-anchor="middle" class="sv-label-sm">→ 인덱스/CF 점검</text>
+        <rect x="310" y="130" width="200" height="64" rx="9" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)" stroke-width="1.8" class="pulse"/>
+        <text x="410" y="152" text-anchor="middle" class="sv-label-sm sv-mono">scattered read ✔</text>
+        <text x="410" y="170" text-anchor="middle" class="sv-label-sm">→ Full Scan 다발</text>
+        <text x="410" y="186" text-anchor="middle" class="sv-label-sm">→ 어떤 SQL이? 추적</text>
+        <rect x="540" y="130" width="200" height="64" rx="9" class="sv-box"/>
+        <text x="640" y="152" text-anchor="middle" class="sv-label-sm sv-mono">enq: TX / log file sync</text>
+        <text x="640" y="170" text-anchor="middle" class="sv-label-sm">→ 락 경합 / 커밋 폭주</text>
+        <text x="640" y="186" text-anchor="middle" class="sv-label-sm">→ 블로킹 세션/커밋 습관</text>
+      </g>
+
+      <!-- v$sql -->
+      <g data-show="4">
+        <path d="M 410 198 L 410 226" class="sv-arrow flow-line" marker-end="url(#arr12a)"/>
+        <rect x="180" y="232" width="460" height="46" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="410" y="252" text-anchor="middle" class="sv-label sv-mono" font-size="12">v$session.sql_id → v$sql: 문제 SQL 텍스트·실행횟수·읽은 블록 확인</text>
+        <text x="410" y="270" text-anchor="middle" class="sv-label-sm sv-mono">SELECT * FROM orders WHERE TO_CHAR(order_dt,...) = ...  ← 범인 검거</text>
+      </g>
+
+      <!-- fix -->
+      <g data-show="5">
+        <rect x="180" y="292" width="460" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="410" y="317" text-anchor="middle" class="sv-label" font-size="13">실행계획 확인 → 컬럼 가공 제거 + 인덱스 → scattered read 소멸 ✔</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>신고가 들어옵니다. "느려요"만으로는 CPU 문제인지, I/O인지, 락인지 알 수 없습니다. 감으로 재시작부터 하면 안 됩니다.</p>
+    <p><code>v$session</code>에서 해당 세션의 <b>event 컬럼</b>을 봅니다. Oracle이 "이 세션은 지금 이걸 기다리는 중"이라고 실시간으로 알려줍니다.</p>
+    <p>이벤트 이름이 곧 분기점입니다. <code>sequential read</code>면 인덱스 I/O, <code>scattered read</code>면 풀스캔, <code>enq: TX</code>면 락 경합. 이번 사례는 <b style="color:var(--warn)">scattered read = 풀스캔 다발</b>입니다.</p>
+    <p>세션의 <code>sql_id</code>로 <code>v$sql</code>을 조회해 문제 SQL의 전문과 통계를 확보합니다. 파티션 키를 가공한 쿼리가 전체 스캔을 돌리고 있었네요.</p>
+    <p>실행계획으로 확정하고 SQL을 수정하면 대기 이벤트가 사라집니다. <b>증상 → 이벤트 → SQL → 계획 → 수정</b>. 이 5단계가 Oracle 성능 진단의 표준 동선입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">12.2 "지금"을 보는 창 — v$session, v$sql, ASH</h2>
+
+<p>실시간 진단의 3종 세트입니다. <code>v$</code>로 시작하는 뷰들은 SGA의 현재 상태를 보여주는 <strong>동적 성능 뷰</strong>입니다.</p>
+
+<pre><code><span class="c">-- ① 지금 활동 중인 세션은 무엇을 기다리나</span>
+<span class="k">SELECT</span> sid, serial#, username, sql_id, event, state,
+       seconds_in_wait, blocking_session
+<span class="k">FROM</span>   v$session
+<span class="k">WHERE</span>  status = <span class="s">'ACTIVE'</span> <span class="k">AND</span> username <span class="k">IS NOT NULL</span>;
+
+<span class="c">-- ② 그 세션이 돌리는 SQL의 정체 (sql_id로 조인)</span>
+<span class="k">SELECT</span> sql_id, executions, elapsed_time/1e6 <span class="k">AS</span> elapsed_sec,
+       buffer_gets, disk_reads, sql_text
+<span class="k">FROM</span>   v$sql
+<span class="k">WHERE</span>  sql_id = <span class="s">'&amp;sql_id'</span>;</code></pre>
+
+<p>순간을 보는 v$session의 약점은 "아까 무슨 일이 있었는지"를 모른다는 것. 그래서 Oracle은 <strong>ASH(Active Session History, <code>v$active_session_history</code>)</strong>를 둡니다 — <strong>1초마다 모든 활성 세션의 스냅샷</strong>을 메모리 버퍼에 기록해 두는 블랙박스입니다. "10분 전 그 순간, 누가 무엇을 기다렸나"를 SQL로 되감아 볼 수 있습니다.</p>
+
+<pre><code><span class="c">-- 최근 10분간 대기 이벤트 상위 집계 (ASH)</span>
+<span class="k">SELECT</span> event, <span class="f">COUNT</span>(*) <span class="k">AS</span> samples   <span class="c">-- 샘플 수 ≈ 소요 시간(초)</span>
+<span class="k">FROM</span>   v$active_session_history
+<span class="k">WHERE</span>  sample_time > SYSDATE - 10/1440
+<span class="k">GROUP BY</span> event <span class="k">ORDER BY</span> samples <span class="k">DESC</span>;</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">라이선스 주의 — Diagnostics Pack</div>
+    <p>ASH·AWR·ADDM은 <strong>Enterprise Edition + Diagnostics Pack 라이선스</strong>가 있어야 사용할 수 있습니다. <code>v$active_session_history</code>를 조회하는 것만으로도 팩 사용으로 간주됩니다. 라이선스가 없다면 12.5절의 Statspack이 대안입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">12.3 AWR — 성능의 건강검진 기록부</h2>
+
+<p><strong>AWR(Automatic Workload Repository)</strong>은 인스턴스의 성능 통계를 주기적으로 <strong>스냅샷</strong>으로 찍어 SYSAUX 테이블스페이스에 보관하는 저장소입니다. 기본 설정은 <strong>1시간 간격 스냅샷, 8일 보관</strong>이며 MMON 백그라운드 프로세스가 수행합니다. 리포트는 "두 스냅샷 사이의 차이"로 만들어집니다.</p>
+
+<div class="anim" data-steps="4" data-title="AWR — 스냅샷 주기와 리포트 구간" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 300">
+      <!-- timeline -->
+      <line x1="60" y1="120" x2="780" y2="120" class="sv-line"/>
+      <g data-show="1">
+        <circle cx="120" cy="120" r="9" fill="var(--accent)"/>
+        <circle cx="240" cy="120" r="9" fill="var(--accent)"/>
+        <circle cx="360" cy="120" r="9" fill="var(--accent)"/>
+        <circle cx="480" cy="120" r="9" fill="var(--accent)"/>
+        <circle cx="600" cy="120" r="9" fill="var(--accent)"/>
+        <circle cx="720" cy="120" r="9" fill="var(--accent)"/>
+        <text x="120" y="150" text-anchor="middle" class="sv-label-sm sv-mono">09:00</text>
+        <text x="240" y="150" text-anchor="middle" class="sv-label-sm sv-mono">10:00</text>
+        <text x="360" y="150" text-anchor="middle" class="sv-label-sm sv-mono">11:00</text>
+        <text x="480" y="150" text-anchor="middle" class="sv-label-sm sv-mono">12:00</text>
+        <text x="600" y="150" text-anchor="middle" class="sv-label-sm sv-mono">13:00</text>
+        <text x="720" y="150" text-anchor="middle" class="sv-label-sm sv-mono">14:00</text>
+        <text x="420" y="40" text-anchor="middle" class="sv-label" font-size="13">MMON이 기본 1시간마다 스냅샷 → SYSAUX에 저장 (기본 8일 보관)</text>
+      </g>
+      <!-- incident -->
+      <g data-show="2">
+        <rect x="370" y="95" width="220" height="50" rx="8" fill="color-mix(in srgb, var(--danger) 15%, transparent)" stroke="var(--danger)" stroke-width="1.6" class="blink"/>
+        <text x="480" y="85" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="13">🔥 11:20~12:40 장애 구간</text>
+      </g>
+      <!-- pick snapshots -->
+      <g data-show="3">
+        <circle cx="360" cy="120" r="13" fill="none" stroke="var(--ok)" stroke-width="3"/>
+        <circle cx="600" cy="120" r="13" fill="none" stroke="var(--ok)" stroke-width="3"/>
+        <text x="360" y="178" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">begin snap</text>
+        <text x="600" y="178" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">end snap</text>
+        <path d="M 360 200 Q 480 230 600 200" stroke="var(--ok)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="480" y="235" text-anchor="middle" class="sv-label" font-size="13" fill="var(--ok)">리포트 = 두 스냅샷의 누적 통계 차이 (11:00→13:00)</text>
+      </g>
+      <g data-show="4">
+        <rect x="150" y="252" width="560" height="40" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="430" y="277" text-anchor="middle" class="sv-label" font-size="13">@?/rdbms/admin/awrrpt.sql 실행 → 구간을 감싸는 스냅샷 쌍 선택이 정확도의 전부</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>MMON이 기본 <b>1시간마다</b> 성능 통계 스냅샷을 찍어 SYSAUX에 저장합니다(기본 8일 보관). 이 축적이 AWR입니다.</p>
+    <p>11:20부터 12:40까지 장애가 있었다고 합시다. 이미 지나간 일이지만 스냅샷들 사이에 흔적이 남아 있습니다.</p>
+    <p>장애 구간을 <b>감싸는</b> 두 스냅샷(11:00, 13:00)을 고릅니다. 리포트는 두 시점의 누적 카운터 <b style="color:var(--ok)">차이</b>이므로, 구간을 너무 넓게 잡으면 정상 시간대에 희석되어 문제가 흐려집니다.</p>
+    <p><code>awrrpt.sql</code> 스크립트로 리포트를 생성합니다. 평상시 리포트를 하나 보관해 두면 "장애 때 vs 평소"의 비교가 가능해져 진단이 훨씬 빨라집니다.</p>
+  </div>
+</div>
+
+<h3>리포트 읽는 순서 — 위에서 아래로 좁혀가기</h3>
+
+<ol>
+  <li><strong>Top 10 Foreground Events by Total Wait Time</strong> — DB Time을 무엇이 먹었나. CPU가 상위인 것은 정상일 수 있고, I/O·락 이벤트가 상위면 그것이 병목 유형입니다.</li>
+  <li><strong>SQL ordered by Elapsed Time / Gets / Reads</strong> — 병목 유형을 만든 <strong>구체적인 SQL</strong>을 찾습니다. 보통 상위 몇 개가 전체의 대부분을 차지합니다.</li>
+  <li><strong>해당 SQL의 실행계획</strong>(<code>DBMS_XPLAN.DISPLAY_AWR</code> 또는 DISPLAY_CURSOR)으로 내려가 원인을 확정합니다.</li>
+</ol>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">DB Time이라는 물통</div>
+    <p>AWR의 핵심 지표 <strong>DB Time</strong> = 모든 세션이 DB에서 소비한 시간(CPU + 대기)의 총합입니다. 진단이란 결국 "DB Time이라는 물통을 어떤 이벤트가, 어떤 SQL이 채웠는가"를 추적하는 일입니다. Top Events에서 유형을, SQL ordered by에서 범인을 찾는 순서가 그래서 성립합니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">12.4 사례 연구 — log file sync 급증</h2>
+
+<p>가장 교육적인 단골 사례로 흐름을 연습해 봅시다. 어느 날 오후, 갑자기 모든 화면의 저장 버튼이 느려졌습니다.</p>
+
+<div class="anim" data-steps="4" data-title="log file sync 급증 — 커밋 폭주 시나리오 진단" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 320">
+      <defs>
+        <marker id="arr12b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--warn)"/>
+        </marker>
+      </defs>
+      <!-- normal -->
+      <g data-show="1" data-active="1-1">
+        <text x="200" y="30" text-anchor="middle" class="sv-label" font-size="14">평소</text>
+        <rect x="60" y="46" width="120" height="40" rx="8" class="sv-box"/>
+        <text x="120" y="71" text-anchor="middle" class="sv-label-sm">세션: COMMIT</text>
+        <rect x="240" y="46" width="120" height="40" rx="8" class="sv-box"/>
+        <text x="300" y="63" text-anchor="middle" class="sv-label-sm sv-mono">LGWR</text>
+        <text x="300" y="80" text-anchor="middle" class="sv-label-sm">redo 기록</text>
+        <path d="M 184 66 L 236 66" class="sv-arrow flow-line"/>
+        <text x="200" y="110" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">건당 대기 1ms 미만 — 아무도 못 느낌</text>
+      </g>
+      <!-- deploy -->
+      <g data-show="2">
+        <text x="620" y="30" text-anchor="middle" class="sv-label" font-size="14">배포 이후</text>
+        <rect x="480" y="46" width="280" height="72" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="620" y="68" text-anchor="middle" class="sv-label sv-mono" font-size="12">FOR r IN c LOOP</text>
+        <text x="620" y="86" text-anchor="middle" class="sv-label sv-mono" font-size="12">  UPDATE ...; COMMIT; <tspan fill="var(--danger)">← 루프 안!</tspan></text>
+        <text x="620" y="104" text-anchor="middle" class="sv-label sv-mono" font-size="12">END LOOP;  -- 50만 회 반복</text>
+      </g>
+      <!-- queue -->
+      <g data-show="3">
+        <rect x="80" y="150" width="660" height="70" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="410" y="175" text-anchor="middle" class="sv-label" font-size="13">커밋 50만 번 = LGWR 디스크 기록 확인 50만 번</text>
+        <text x="410" y="200" text-anchor="middle" class="sv-label sv-mono" font-size="12" fill="var(--warn)">모든 세션의 event: log file sync 폭증 📈 — 남의 커밋까지 줄을 선다</text>
+        <path d="M 410 122 L 410 146" stroke="var(--warn)" stroke-width="2" class="flow-line" marker-end="url(#arr12b)"/>
+      </g>
+      <!-- diagnosis -->
+      <g data-show="4">
+        <rect x="80" y="240" width="660" height="62" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="410" y="263" text-anchor="middle" class="sv-label" font-size="13">진단: AWR Top Events 1위 log file sync + user commits 통계 급증 → 커밋 폭주 확정</text>
+        <text x="410" y="285" text-anchor="middle" class="sv-label-sm">해결: 루프 밖 배치 커밋으로 수정 (redo 디스크가 느린 경우라면 스토리지 개선)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>평소의 커밋: 세션이 COMMIT을 치면 LGWR가 redo 버퍼를 디스크에 기록하고, 완료 신호를 받을 때까지 잠깐(<code>log file sync</code>) 기다립니다. 보통 1ms 미만 — 존재감이 없습니다.</p>
+    <p>새 배치가 배포됐습니다. 루프 <b>안에서</b> 건별 COMMIT — 50만 건이면 커밋 50만 번입니다.</p>
+    <p>커밋마다 LGWR의 디스크 기록 완료를 기다려야 하므로 <code>log file sync</code>가 폭증하고, LGWR가 바빠지니 <b style="color:var(--warn)">다른 세션의 평범한 커밋까지 줄을 서게</b> 됩니다. 전사적으로 "저장이 느려요"가 터지는 이유입니다.</p>
+    <p>AWR/ASH에서 log file sync 1위 + user commits 급증을 확인하면 진단 끝. 처방은 <b>루프 밖 배치 커밋</b>입니다. 커밋 횟수는 정상인데 log file sync가 느리다면 그때는 redo 스토리지 성능을 봅니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">12.5 도구 정리 — ADDM과 Statspack까지</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>도구</th><th>보는 것</th><th>언제 쓰나</th><th>라이선스</th></tr></thead>
+  <tbody>
+    <tr><td><code>v$session</code></td><td>지금 이 순간의 세션 상태</td><td>실시간 장애 대응 첫 조회</td><td>기본 포함</td></tr>
+    <tr><td><code>v$sql</code></td><td>공유 풀의 SQL별 누적 통계</td><td>무거운 SQL Top-N 추출</td><td>기본 포함</td></tr>
+    <tr><td>ASH</td><td>1초 단위 활성 세션 이력</td><td>"몇 분 전 순간"의 정밀 분석</td><td>Diagnostics Pack</td></tr>
+    <tr><td>AWR</td><td>시간 단위 스냅샷 리포트</td><td>구간 비교·사후 분석·추세</td><td>Diagnostics Pack</td></tr>
+    <tr><td>ADDM</td><td>AWR을 분석한 <strong>자동 진단 보고서</strong></td><td>스냅샷 생성 시 자동 실행 — 권고사항 훑어보기용</td><td>Diagnostics Pack</td></tr>
+    <tr><td>Statspack</td><td>AWR의 전신 격 수동 스냅샷 도구</td><td><strong>Standard Edition 등 팩 라이선스가 없을 때</strong>의 무료 대안</td><td>기본 포함(수동 설치)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>ADDM(Automatic Database Diagnostic Monitor)</strong>은 AWR 스냅샷이 생성될 때마다 자동으로 돌면서 "이 구간의 DB Time을 가장 많이 잡아먹은 원인과 권고"를 문장으로 뽑아줍니다. 권고를 맹신하기보다 <strong>분석의 출발점</strong>으로 삼는 것이 좋습니다. <strong>Statspack</strong>은 스냅샷을 수동(또는 잡 스케줄)으로 찍고 <code>spreport.sql</code>로 리포트를 만드는 무료 도구로, 리포트 구조와 읽는 순서는 AWR과 유사합니다.</p>
+
+<div class="callout info">
+  <span class="ico">🐘</span>
+  <div>
+    <div class="callout-title">PostgreSQL과 비교하며 읽기</div>
+    <p>PG의 <code>pg_stat_activity</code>(wait_event 컬럼)가 v$session, <code>pg_stat_statements</code>가 v$sql에 해당합니다(<a href="../pg/ch14.html">PG 14장 모니터링</a>). 반면 ASH·AWR처럼 이력을 자동 축적하는 내장 장치는 PG 본체에 없어서 별도 확장/외부 도구로 보완합니다 — Oracle 모니터링 스택의 완성도가 돋보이는 지점입니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">AWR 리포트에서 <code>db file scattered read</code>가 Top Events 1위였습니다. 다음으로 봐야 할 곳과 그 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">log buffer 크기 — redo 기록이 병목이므로</button>
+    <button type="button" data-correct>SQL ordered by Reads(또는 Elapsed Time) — 풀스캔을 유발한 구체적 SQL을 찾아야 하므로</button>
+    <button type="button">buffer busy waits 섹션 — 블록 경합이 원인이므로</button>
+    <button type="button">즉시 인스턴스 재시작으로 캐시를 비운다</button>
+  </div>
+  <div class="quiz-expl">✅ scattered read = 멀티블록 읽기 = Full Scan 계열이 많다는 "유형" 정보입니다. 유형을 알았으면 다음은 "누가?"입니다 — SQL ordered by 섹션에서 디스크 읽기가 큰 SQL을 특정하고, 그 실행계획으로 내려가 인덱스·통계·SQL 수정 여부를 판단합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">배포 직후 모든 세션에서 log file sync 대기가 급증했습니다. 가장 유력한 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">인덱스가 없는 컬럼에 대한 풀스캔 증가</button>
+    <button type="button">옵티마이저 통계가 오래되어 나쁜 플랜 선택</button>
+    <button type="button" data-correct>새 코드가 루프 안에서 건별 COMMIT을 수행해 커밋 횟수가 폭증</button>
+  </div>
+  <div class="quiz-expl">✅ log file sync는 "커밋 → LGWR 기록 완료 대기"입니다. 갑자기 급증했고 배포와 시점이 겹친다면 커밋 횟수 폭증(루프 내 커밋)이 최우선 용의자입니다. AWR의 user commits 통계로 확증할 수 있습니다. 풀스캔·통계 문제는 각각 scattered read, 특정 SQL의 성능 저하로 나타납니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c 공식 문서: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgdba/gathering-database-statistics.html" target="_blank" rel="noopener">Performance Tuning Guide — Gathering Database Statistics (AWR)</a>, <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/tgdba/instance-tuning-using-performance-views.html" target="_blank" rel="noopener">Instance Tuning Using Performance Views (대기 이벤트)</a></p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch11.html"><span class="dir">← 이전</span><br><span class="title">11장. 파티셔닝과 병렬 처리</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="tuning.html"><span class="dir">다음 →</span><br><span class="title">⚡ 쿼리 튜닝 팁 모음</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

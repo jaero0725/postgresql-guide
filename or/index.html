@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oracle 학습 홈 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>🔴 Oracle 학습 홈</h1>
+<p class="lead">기업 시장을 30년 넘게 지켜온 상용 RDBMS의 대명사, Oracle Database. SGA·PGA·백그라운드 프로세스부터 Undo/Redo, 옵티마이저까지 — 아키텍처를 그림과 애니메이션으로 꿰뚫습니다.</p>
+<div class="chapter-meta">
+  <span class="tag">📚 챕터 12개 + 튜닝 팁</span>
+  <span class="tag">🎬 시각화 중심 학습</span>
+  <span class="tag">✅ 완료한 챕터: <span data-progress-of="or/ch">0</span> / 12</span>
+</div>
+
+<h2 id="journey">한눈에 보는 Oracle — SELECT 한 번의 여정</h2>
+<p>Oracle 아키텍처의 전체 그림을 애니메이션 하나로 먼저 느껴보세요. <code>SELECT</code> 한 문장이 클라이언트를 떠나 결과로 돌아오기까지의 여정입니다. 여기 등장하는 리스너, 서버 프로세스, SGA, 데이터파일이 앞으로 12개 챕터의 주인공들입니다.</p>
+
+<div class="anim" data-steps="6" data-title="SELECT 한 번의 여정 — 클라이언트에서 데이터파일까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 860 350">
+      <!-- 클라이언트 -->
+      <rect x="20" y="140" width="130" height="58" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="85" y="165" text-anchor="middle" class="sv-label">💻 클라이언트</text>
+      <text x="85" y="183" text-anchor="middle" class="sv-label-sm sv-mono">SQL*Plus / 앱</text>
+
+      <!-- 리스너 -->
+      <rect x="230" y="36" width="150" height="54" rx="9" class="sv-box"/>
+      <text x="305" y="59" text-anchor="middle" class="sv-label">📡 리스너</text>
+      <text x="305" y="77" text-anchor="middle" class="sv-label-sm sv-mono">Listener :1521</text>
+
+      <!-- 서버 프로세스 (step2부터) -->
+      <g data-show="2" class="rise">
+        <rect x="230" y="142" width="150" height="56" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="305" y="166" text-anchor="middle" class="sv-label">⚙️ 서버 프로세스</text>
+        <text x="305" y="184" text-anchor="middle" class="sv-label-sm">내 전담 일꾼</text>
+      </g>
+
+      <!-- SGA -->
+      <rect x="450" y="112" width="200" height="110" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="550" y="136" text-anchor="middle" class="sv-label">🧠 SGA</text>
+      <text x="550" y="156" text-anchor="middle" class="sv-label-sm">Database Buffer Cache</text>
+      <g data-show="4">
+        <rect x="470" y="168" width="70" height="20" rx="5" fill="color-mix(in srgb, var(--danger) 18%, transparent)" stroke="var(--danger)" stroke-width="1"/>
+        <text x="505" y="182" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">miss ✗</text>
+      </g>
+      <g data-show="5">
+        <rect x="556" y="168" width="74" height="20" rx="5" fill="color-mix(in srgb, var(--ok) 22%, transparent)" stroke="var(--ok)" stroke-width="1"/>
+        <text x="593" y="182" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">block ✓</text>
+      </g>
+
+      <!-- 데이터파일 -->
+      <rect x="712" y="140" width="128" height="58" rx="9" class="sv-box"/>
+      <text x="776" y="165" text-anchor="middle" class="sv-label">💾 데이터파일</text>
+      <text x="776" y="183" text-anchor="middle" class="sv-label-sm sv-mono">DB block 단위</text>
+
+      <!-- 1. 접속 요청 -->
+      <g data-show="1-2">
+        <path d="M 122 138 Q 176 82 226 64" class="sv-arrow flow-line" marker-end="url(#arrhub)"/>
+        <text x="120" y="92" class="sv-label-sm" fill="var(--accent)">① 접속 요청 (TCP 1521)</text>
+      </g>
+
+      <!-- 2. 서버 프로세스 생성 -->
+      <g data-show="2">
+        <path d="M 305 92 L 305 138" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="315" y="120" class="sv-label-sm" fill="var(--ok)">② 프로세스 생성·연결 인계</text>
+      </g>
+
+      <!-- 3. SELECT 전달 -->
+      <g data-show="3">
+        <path d="M 152 170 L 226 170" class="sv-arrow flow-line"/>
+        <text x="120" y="226" class="sv-label-sm" fill="var(--accent)">③ SELECT … (이후 리스너는 관여하지 않음)</text>
+      </g>
+
+      <!-- 4. 버퍼 캐시 확인 -->
+      <g data-show="4">
+        <path d="M 382 168 L 446 168" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="386" y="104" class="sv-label-sm" fill="var(--purple)">④ 버퍼 캐시에 있나?</text>
+      </g>
+
+      <!-- 5. 디스크 읽기 -->
+      <g data-show="5">
+        <path d="M 710 176 L 654 176" stroke="var(--warn)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="600" y="246" class="sv-label-sm" fill="var(--warn)">⑤ 없으면 데이터파일에서 블록을 읽어 캐시에 적재</text>
+      </g>
+
+      <!-- 6. 결과 반환 -->
+      <g data-show="6">
+        <path d="M 226 190 Q 172 232 128 200" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="150" y="256" class="sv-label" fill="var(--ok)" font-size="14">⑥ 결과 반환! 🎉</text>
+      </g>
+
+      <text x="430" y="326" text-anchor="middle" class="sv-label-sm">이 그림의 등장인물을 1~4장(아키텍처 기초)에서 하나씩 자세히 만납니다</text>
+
+      <defs>
+        <marker id="arrhub" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 TCP 1521 포트로 접속을 요청합니다. 요청을 받는 것은 <b>리스너(Listener)</b> — 접속만 중개하고 쿼리는 처리하지 않는 "안내 데스크"입니다.</p>
+    <p>리스너가 이 세션을 전담할 <b>dedicated 서버 프로세스</b>를 만들어 연결을 넘겨줍니다. 이후 클라이언트는 이 프로세스와 직접 대화합니다.</p>
+    <p><code>SELECT</code> 문장이 서버 프로세스에 도착해 파싱과 실행 계획 수립을 거칩니다(공유 풀의 커서 공유는 2장에서!).</p>
+    <p>서버 프로세스는 필요한 블록을 먼저 <b style="color:var(--purple)">SGA의 Database Buffer Cache</b>에서 찾습니다. 이번엔 캐시 미스!</p>
+    <p>캐시에 없으면 <b style="color:var(--warn)">데이터파일에서 DB block을 읽어</b> 버퍼 캐시에 올립니다. 다음번 같은 블록 요청은 메모리에서 바로 히트하겠죠.</p>
+    <p>블록에서 조건에 맞는 행을 골라 클라이언트에 돌려주면 여정 끝! 이 한 번의 왕복에 <b>리스너(1장)·SGA(2장)·서버 프로세스(3장)</b>의 개념이 모두 들어 있습니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">⚡</span>
+  <div>
+    <div class="callout-title">바쁜 분들을 위한 지름길 — 쿼리 튜닝 팁 모음</div>
+    <p>"당장 느린 쿼리부터 잡아야 한다"면 <a href="tuning.html"><strong>⚡ 쿼리 튜닝 팁 모음</strong></a>부터 펼쳐보세요. 인덱스 설계, 실행계획 읽기, 바인드 변수, 힌트 사용법 등 실무에서 바로 쓰는 체크리스트를 한 페이지에 모았습니다. 원리가 궁금해지면 그때 해당 챕터로 돌아오면 됩니다.</p>
+  </div>
+</div>
+
+<h2 id="chapters">챕터 한눈에 보기</h2>
+
+<h3>🧱 아키텍처 기초 — Oracle의 뼈대</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch01.html">01. Oracle 개요 — Instance와 Database</a></h4>
+    <p>Instance(메모리+프로세스)와 Database(파일)의 구분, 리스너와 접속 여정, CDB/PDB 멀티테넌트.</p>
+    <div class="chapter-meta"><span class="tag lv-basic">기초</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch02.html">02. SGA — 공유 메모리 구조</a></h4>
+    <p>Buffer Cache의 LRU, Shared Pool의 커서 공유, 하드 파싱 vs 소프트 파싱, Redo Log Buffer.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch03.html">03. PGA와 서버 프로세스</a></h4>
+    <p>프로세스의 사적 메모리 PGA, 정렬·해시 작업 공간, temp spill, PGA_AGGREGATE_TARGET.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch04.html">04. 백그라운드 프로세스</a></h4>
+    <p>DBWn·LGWR·CKPT·SMON·PMON — "커밋 시 디스크에 쓰는 것은 데이터가 아니라 redo다."</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch05.html">05. 저장 구조 — 테이블스페이스와 블록</a></h4>
+    <p>테이블스페이스 → 세그먼트 → 익스텐트 → 블록의 계층, 블록 내부 해부.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h3>🔄 트랜잭션과 복구 — 데이터를 지키는 원리</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch06.html">06. Undo와 읽기 일관성</a></h4>
+    <p>과거 버전을 복원하는 undo 세그먼트, 읽기 일관성(CR), ORA-01555의 정체.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch07.html">07. Redo · 커밋 · 인스턴스 복구</a></h4>
+    <p>redo 로그의 순환 구조, 커밋의 실제 비용, 크래시 후 roll forward/rollback.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch08.html">08. 트랜잭션과 락</a></h4>
+    <p>행 락(TX)과 테이블 락(TM), 블로킹과 데드락, 격리 수준.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+</div>
+
+<h3>🔍 쿼리 성능 — 빠른 SQL의 조건</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="ch09.html">09. 인덱스 구조와 활용</a></h4>
+    <p>B-tree 인덱스의 내부, 복합 인덱스 설계, 인덱스가 무시되는 순간들.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch10.html">10. 옵티마이저와 실행계획</a></h4>
+    <p>비용 기반 옵티마이저(CBO), 통계, 실행계획 읽는 법, 힌트.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch11.html">11. 파티셔닝과 병렬 처리</a></h4>
+    <p>Range/List/Hash 파티션, 파티션 pruning, 병렬 쿼리의 동작.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+  <div class="card">
+    <h4><a href="ch12.html">12. AWR과 대기 이벤트 — 모니터링</a></h4>
+    <p>AWR 스냅샷·리포트 읽기, 주요 대기 이벤트 해석, 성능 문제의 진단 순서.</p>
+    <div class="chapter-meta"><span class="tag lv-adv">고급</span></div>
+  </div>
+</div>
+
+<h3>⚡ 빠른 참조</h3>
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="tuning.html">⚡ 쿼리 튜닝 팁 모음</a></h4>
+    <p>실무에서 바로 쓰는 튜닝 체크리스트 — 인덱스, 실행계획, 바인드 변수, 힌트, 통계 관리 요약.</p>
+    <div class="chapter-meta"><span class="tag">빠른 참조</span></div>
+  </div>
+</div>
+
+<h2 id="pg-map">PostgreSQL 개념 대응표</h2>
+<p>PostgreSQL 파트를 먼저 공부했다면 이 표가 최고의 지름길입니다. 두 DB는 용어만 다를 뿐 같은 문제(캐싱, 다중 버전, 장애 복구)를 풀고 있어서, 대응 관계를 알면 학습 속도가 두 배가 됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Oracle</th><th>PostgreSQL</th><th>공통 아이디어</th><th>PG 챕터</th></tr></thead>
+  <tbody>
+    <tr><td>SGA Database Buffer Cache</td><td>shared buffers</td><td>디스크 블록을 공유 메모리에 캐싱</td><td><a href="../pg/ch02.html">pg 2장</a></td></tr>
+    <tr><td>Dedicated 서버 프로세스</td><td>backend 프로세스</td><td>세션 1개 = 전담 프로세스 1개</td><td><a href="../pg/ch02.html">pg 2장</a></td></tr>
+    <tr><td>Undo (undo 세그먼트)</td><td>dead tuple + VACUUM</td><td>과거 버전 보관으로 MVCC 구현 — Oracle은 별도 공간, PG는 테이블 안에</td><td><a href="../pg/ch03.html">pg 3장</a> · <a href="../pg/ch08.html">pg 8장</a></td></tr>
+    <tr><td>Redo (redo log)</td><td>WAL</td><td>변경 이력을 먼저 기록해 커밋 내구성 보장</td><td><a href="../pg/ch09.html">pg 9장</a></td></tr>
+    <tr><td>DBWn / CKPT</td><td>background writer / checkpointer</td><td>dirty 페이지를 뒤에서 천천히 디스크로</td><td><a href="../pg/ch09.html">pg 9장</a></td></tr>
+    <tr><td>옵티마이저(CBO) + 힌트</td><td>쿼리 플래너 (힌트 없음)</td><td>통계 기반 비용 계산으로 실행계획 선택</td><td><a href="../pg/ch06.html">pg 6장</a></td></tr>
+    <tr><td>파티셔닝 (Range/List/Hash)</td><td>선언적 파티셔닝</td><td>큰 테이블을 조각내고 pruning으로 스캔 축소</td><td><a href="../pg/ch12.html">pg 12장</a></td></tr>
+    <tr><td>Data Guard</td><td>Streaming Replication</td><td>변경 로그(redo/WAL) 전송으로 대기 서버 유지</td><td><a href="../pg/ch10.html">pg 10장</a></td></tr>
+    <tr><td>RMAN 백업 + 아카이브 로그</td><td>pg_basebackup + WAL 아카이브 (PITR)</td><td>물리 백업 + 로그 재생으로 시점 복구</td><td><a href="../pg/ch11.html">pg 11장</a></td></tr>
+    <tr><td>AWR / v$ 뷰</td><td>pg_stat_statements / pg_stat_* 뷰</td><td>실행 통계 축적으로 병목 진단</td><td><a href="../pg/ch14.html">pg 14장</a></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">가장 큰 사고방식 차이 하나만 기억하세요</div>
+    <p>PostgreSQL은 옛 버전을 <strong>테이블 안에</strong> 남기고(dead tuple → VACUUM이 청소), Oracle은 옛 버전을 <strong>undo라는 별도 공간에</strong> 복사해 둡니다. 그래서 PG에는 Bloat/VACUUM 고민이, Oracle에는 undo 크기/ORA-01555 고민이 생깁니다. 같은 MVCC, 다른 청구서입니다.</p>
+  </div>
+</div>
+
+<h2 id="paths">추천 학습 경로</h2>
+<p>목적에 따라 골라 읽어도 좋습니다. 화살표 순서대로 읽으면 앞 장의 개념이 뒷 장의 발판이 됩니다.</p>
+<div class="grid g3">
+  <div class="card">
+    <h4>🌱 처음 시작 (아키텍처 완주)</h4>
+    <p><a href="ch01.html">1장</a> → <a href="ch02.html">2장</a> → <a href="ch03.html">3장</a> → <a href="ch04.html">4장</a> → <a href="ch05.html">5장</a></p>
+    <p>Instance/Database → SGA → PGA → 백그라운드 프로세스 → 저장 구조. Oracle의 몸을 완성하는 순서입니다.</p>
+  </div>
+  <div class="card">
+    <h4>🔄 트랜잭션 이해가 급할 때</h4>
+    <p><a href="ch06.html">6장</a> → <a href="ch07.html">7장</a> → <a href="ch08.html">8장</a></p>
+    <p>Undo → Redo → 락. "커밋하면 무슨 일이 일어나는가"에 답할 수 있게 됩니다. (2·4장을 먼저 읽으면 더 쉽습니다.)</p>
+  </div>
+  <div class="card">
+    <h4>🚀 쿼리가 느려서 왔습니다</h4>
+    <p><a href="tuning.html">⚡ 튜닝 팁</a> → <a href="ch09.html">9장</a> → <a href="ch10.html">10장</a> → <a href="ch12.html">12장</a></p>
+    <p>응급처치 후 인덱스 → 옵티마이저 → AWR 순서로 원리를 채우는 실전파 경로입니다.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">학습 진도는 자동으로 저장됩니다</div>
+    <p>각 챕터 하단의 "이 장 완료로 표시" 버튼을 누르면 사이드바에 ✓ 표시가 남습니다(브라우저 로컬 저장). 부담 없이 하루 한 챕터씩 진행해 보세요.</p>
+  </div>
+</div>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1장. Oracle 개요 — Instance와 Database — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch01">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>1장. Oracle 개요 — Instance와 Database</h1>
+<p class="lead">"Oracle을 켠다"는 말은 정확히 무엇을 켜는 걸까요? 메모리와 프로세스의 묶음(Instance)과 디스크 위의 파일들(Database)을 구분하는 순간, Oracle 아키텍처의 절반이 열립니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-basic">기초</span>
+  <span class="tag">⏱ 약 20분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">선수 지식: 없음</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Instance(메모리+프로세스)와 Database(파일)의 구분 ② 클라이언트 접속의 여정 — 리스너와 dedicated 서버 프로세스 ③ dedicated vs shared server ④ CDB/PDB 멀티테넌트 개요와 PostgreSQL·MySQL 대비 Oracle의 위상</p>
+  </div>
+</div>
+
+<h2 id="s1">1.1 Oracle Database — 40년을 버틴 상용 RDBMS의 표준</h2>
+
+<p>Oracle Database는 1979년 첫 상용 SQL RDBMS로 출발해, 지금도 금융·통신·제조 등 대규모 기업 시스템의 표준으로 쓰이는 데이터베이스입니다. 이 파트에서 다루는 기준 버전은 <strong>Oracle Database 19c</strong> — 장기 지원(Long Term Release)으로 실무에서 가장 널리 쓰이는 버전입니다.</p>
+
+<p>Oracle을 배우는 가장 좋은 방법은 <strong>"용어의 벽"을 먼저 넘는 것</strong>입니다. SGA, PGA, 리스너, undo, redo… 낯선 단어가 쏟아지지만, 사실 대부분은 다른 DB에도 있는 개념의 Oracle식 이름입니다. 예를 들어 redo는 PostgreSQL의 WAL과, buffer cache는 shared buffers와 같은 문제를 풉니다. 학습 홈의 <a href="index.html#pg-map">PostgreSQL 개념 대응표</a>를 옆에 두고 읽으면 훨씬 빠릅니다.</p>
+
+<p>그 용어의 벽에서 첫 번째이자 가장 중요한 관문이 바로 이것입니다 — <strong>Instance와 Database는 다른 것이다.</strong></p>
+
+<h2 id="s2">1.2 Instance vs Database — 몸과 영혼의 구분</h2>
+
+<p>일상 대화에서는 "오라클 DB"라고 뭉뚱그려 부르지만, Oracle 공식 문서는 두 단어를 엄격히 구분합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Instance (인스턴스)</th><th>Database (데이터베이스)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>정체</strong></td><td>메모리(SGA) + 백그라운드 프로세스의 묶음</td><td>디스크 위의 파일 묶음</td></tr>
+    <tr><td><strong>사는 곳</strong></td><td>RAM (휘발성)</td><td>디스크 (영속성)</td></tr>
+    <tr><td><strong>구성 요소</strong></td><td>SGA, DBWn·LGWR 등 백그라운드 프로세스</td><td>데이터파일, 컨트롤파일, 온라인 리두 로그 파일</td></tr>
+    <tr><td><strong>서버 재시작하면</strong></td><td>사라진다 (다시 기동해야 함)</td><td>남아 있다</td></tr>
+    <tr><td><strong>비유</strong></td><td>깨어 있는 정신과 일손</td><td>서고에 보관된 장부 원본</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>Instance가 Database를 "열어서(open)" 서비스하는 것</strong>이 Oracle의 동작 모델입니다. 인스턴스 하나는 한 번에 데이터베이스 하나만 마운트할 수 있고, 반대로 하나의 데이터베이스를 여러 인스턴스가 동시에 여는 구성이 바로 RAC(Real Application Clusters)입니다.</p>
+
+<p>Database를 이루는 세 가지 파일의 역할은 꼭 기억해 두세요.</p>
+
+<ul>
+  <li><strong>데이터파일(datafile)</strong> — 테이블·인덱스의 실제 데이터가 담긴 본체. 테이블스페이스(5장)를 구성합니다.</li>
+  <li><strong>컨트롤파일(control file)</strong> — 데이터베이스의 "신분증 + 목차". DB 이름, 데이터파일·리두 로그 파일의 위치, 체크포인트 정보를 담습니다. 이 파일이 없으면 인스턴스는 데이터베이스를 마운트조차 못 합니다.</li>
+  <li><strong>온라인 리두 로그 파일(online redo log file)</strong> — 모든 변경의 기록. 장애 시 복구의 원천입니다(7장).</li>
+</ul>
+
+<div class="anim" data-steps="5" data-title="Oracle 서버의 조립 — Database와 Instance가 만나기까지" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <!-- 디스크 영역 -->
+      <rect x="30" y="196" width="500" height="140" rx="12" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="46" y="222" class="sv-label">💾 디스크 — Database</text>
+
+      <!-- step1: 데이터파일 -->
+      <g data-show="1" class="rise">
+        <rect x="50" y="240" width="130" height="72" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+        <text x="115" y="270" text-anchor="middle" class="sv-label">데이터파일</text>
+        <text x="115" y="290" text-anchor="middle" class="sv-label-sm">테이블·인덱스 본체</text>
+      </g>
+
+      <!-- step2: 컨트롤파일 + 리두 로그 -->
+      <g data-show="2" class="rise">
+        <rect x="200" y="240" width="140" height="72" rx="9" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.6"/>
+        <text x="270" y="270" text-anchor="middle" class="sv-label">컨트롤파일</text>
+        <text x="270" y="290" text-anchor="middle" class="sv-label-sm">신분증 + 목차</text>
+        <rect x="360" y="240" width="150" height="72" rx="9" fill="color-mix(in srgb, var(--danger) 10%, transparent)" stroke="var(--danger)" stroke-width="1.6"/>
+        <text x="435" y="270" text-anchor="middle" class="sv-label">리두 로그 파일</text>
+        <text x="435" y="290" text-anchor="middle" class="sv-label-sm">변경 기록 (복구용)</text>
+      </g>
+
+      <!-- 메모리 영역 -->
+      <g data-show="3">
+        <rect x="30" y="24" width="500" height="140" rx="12" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="46" y="50" class="sv-label">🧠 메모리 + 프로세스 — Instance</text>
+      </g>
+
+      <!-- step3: SGA -->
+      <g data-show="3" class="rise">
+        <rect x="50" y="66" width="220" height="80" rx="9" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="160" y="98" text-anchor="middle" class="sv-label">SGA (공유 메모리)</text>
+        <text x="160" y="120" text-anchor="middle" class="sv-label-sm">Buffer Cache · Shared Pool …</text>
+      </g>
+
+      <!-- step4: 백그라운드 프로세스 -->
+      <g data-show="4" class="rise">
+        <rect x="292" y="66" width="66" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="325" y="88" text-anchor="middle" class="sv-label-sm sv-mono">DBWn</text>
+        <rect x="366" y="66" width="66" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="399" y="88" text-anchor="middle" class="sv-label-sm sv-mono">LGWR</text>
+        <rect x="440" y="66" width="66" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="473" y="88" text-anchor="middle" class="sv-label-sm sv-mono">CKPT</text>
+        <rect x="292" y="110" width="66" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="325" y="132" text-anchor="middle" class="sv-label-sm sv-mono">SMON</text>
+        <rect x="366" y="110" width="66" height="34" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.4"/>
+        <text x="399" y="132" text-anchor="middle" class="sv-label-sm sv-mono">PMON</text>
+        <text x="473" y="132" text-anchor="middle" class="sv-label-sm">…4장</text>
+      </g>
+
+      <!-- step5: open -->
+      <g data-show="5">
+        <path d="M 280 166 L 280 194" stroke="var(--ok)" stroke-width="3" fill="none" class="flow-line"/>
+        <text x="292" y="184" class="sv-label" fill="var(--ok)">OPEN!</text>
+        <rect x="570" y="90" width="220" height="150" rx="12" fill="color-mix(in srgb, var(--ok) 8%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="680" y="122" text-anchor="middle" class="sv-label" font-size="15">🎉 Oracle 서버 완성</text>
+        <text x="680" y="152" text-anchor="middle" class="sv-label-sm">Instance가 Database를</text>
+        <text x="680" y="170" text-anchor="middle" class="sv-label-sm">mount → open 하면</text>
+        <text x="680" y="188" text-anchor="middle" class="sv-label-sm">비로소 SQL을 받을 수 있는</text>
+        <text x="680" y="206" text-anchor="middle" class="sv-label-sm">상태가 됩니다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>디스크에 <b>데이터파일</b>이 있습니다. 테이블과 인덱스의 실제 데이터가 담긴 본체입니다.</p>
+    <p><b>컨트롤파일</b>(DB의 신분증+목차)과 <b>온라인 리두 로그 파일</b>(변경 기록)이 더해지면 <b>Database</b> — 디스크 위 파일 3종 세트가 완성됩니다.</p>
+    <p>서버를 기동(<code>STARTUP</code>)하면 RAM에 <b style="color:var(--purple)">SGA</b>(공유 메모리)가 할당됩니다. 아직 파일과는 연결되지 않은 상태(NOMOUNT)입니다.</p>
+    <p><b style="color:var(--ok)">백그라운드 프로세스들</b>(DBWn, LGWR, CKPT, SMON, PMON…)이 함께 떠오르면 <b>Instance</b>가 완성됩니다. Instance = SGA + 백그라운드 프로세스!</p>
+    <p>Instance가 컨트롤파일을 읽고(MOUNT) 데이터파일·리두 로그를 열면(OPEN) 드디어 SQL을 처리할 수 있습니다. <b>"Oracle을 켠다" = Instance를 만들어 Database를 여는 것</b>입니다.</p>
+  </div>
+</div>
+
+<p>기동 단계를 눈으로 확인해 봅시다. SQL*Plus에서 관리자로 접속해 조회하면 인스턴스와 데이터베이스의 상태가 각각 따로 보입니다.</p>
+
+<pre><code><span class="c">-- 인스턴스 상태 확인 (메모리+프로세스 쪽)</span>
+<span class="k">SELECT</span> instance_name, status, version <span class="k">FROM</span> v$instance;
+
+INSTANCE_NAME  STATUS   VERSION
+-------------- -------- -----------
+orcl           OPEN     19.0.0.0.0
+
+<span class="c">-- 데이터베이스 상태 확인 (파일 쪽)</span>
+<span class="k">SELECT</span> name, open_mode <span class="k">FROM</span> v$database;
+
+NAME   OPEN_MODE
+------ ----------
+ORCL   READ WRITE</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">v$ 뷰 — Oracle 관찰의 창</div>
+    <p><code>v$instance</code>, <code>v$database</code>처럼 <strong>v$로 시작하는 동적 성능 뷰</strong>는 인스턴스의 현재 상태를 보여주는 창입니다. PostgreSQL의 <code>pg_stat_*</code> 뷰에 해당하며, 이 가이드 전체에서 계속 등장합니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">1.3 접속의 여정 — 리스너에서 서버 프로세스까지</h2>
+
+<p>애플리케이션이 Oracle에 접속하면 무슨 일이 일어날까요? 주인공은 두 명입니다.</p>
+
+<ul>
+  <li><strong>리스너(Listener)</strong> — 데이터베이스 밖에서 기다리는 별도 프로세스. 기본 포트 1521에서 접속 요청을 받아 <em>중개만</em> 합니다. 건물 1층의 안내 데스크라고 생각하세요.</li>
+  <li><strong>서버 프로세스(server process)</strong> — 접속이 성사되면 그 세션의 SQL을 실제로 처리하는 일꾼. 파싱, 실행, 결과 반환을 모두 이 프로세스가 합니다.</li>
+</ul>
+
+<div class="anim" data-steps="5" data-title="클라이언트 접속의 여정 — 리스너는 중개만, 대화는 서버 프로세스와" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 330">
+      <!-- 클라이언트 -->
+      <rect x="24" y="130" width="140" height="60" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="94" y="156" text-anchor="middle" class="sv-label">💻 클라이언트</text>
+      <text x="94" y="175" text-anchor="middle" class="sv-label-sm sv-mono">JDBC / SQL*Plus</text>
+
+      <!-- 리스너 -->
+      <rect x="270" y="34" width="160" height="60" rx="9" class="sv-box"/>
+      <text x="350" y="60" text-anchor="middle" class="sv-label">📡 리스너</text>
+      <text x="350" y="79" text-anchor="middle" class="sv-label-sm sv-mono">포트 1521 대기</text>
+
+      <!-- DB 서버 박스 -->
+      <rect x="250" y="120" width="540" height="190" rx="12" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="266" y="146" class="sv-label-sm">Oracle 서버 (Instance)</text>
+
+      <!-- 서버 프로세스 -->
+      <g data-show="2" class="rise">
+        <rect x="290" y="170" width="170" height="64" rx="9" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="375" y="196" text-anchor="middle" class="sv-label">⚙️ 서버 프로세스</text>
+        <text x="375" y="216" text-anchor="middle" class="sv-label-sm">이 세션 전담 (dedicated)</text>
+      </g>
+
+      <!-- SGA -->
+      <rect x="530" y="160" width="230" height="90" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+      <text x="645" y="192" text-anchor="middle" class="sv-label">🧠 SGA</text>
+      <text x="645" y="214" text-anchor="middle" class="sv-label-sm">모든 서버 프로세스가 공유</text>
+
+      <!-- 1: 접속 요청 -->
+      <g data-show="1-2">
+        <path d="M 140 128 Q 200 76 266 62" class="sv-arrow flow-line" marker-end="url(#arr1a)"/>
+        <text x="120" y="84" class="sv-label-sm" fill="var(--accent)">① 접속 요청</text>
+      </g>
+
+      <!-- 2: 프로세스 생성 -->
+      <g data-show="2">
+        <path d="M 355 96 L 368 166" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+        <text x="392" y="130" class="sv-label-sm" fill="var(--ok)">② 서버 프로세스 생성</text>
+      </g>
+
+      <!-- 3: 연결 인계 -->
+      <g data-show="3">
+        <path d="M 166 176 L 286 196" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line"/>
+        <text x="168" y="226" class="sv-label-sm" fill="var(--ok)">③ 연결 인계 — 이후 직통!</text>
+      </g>
+
+      <!-- 4: SQL 직접 처리 -->
+      <g data-show="4">
+        <path d="M 464 192 L 526 192" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line"/>
+        <text x="410" y="270" class="sv-label-sm" fill="var(--purple)">④ SQL 처리 — 서버 프로세스가 SGA를 이용해 실행</text>
+      </g>
+
+      <!-- 5: 리스너 자유 -->
+      <g data-show="5">
+        <text x="470" y="60" class="sv-label-sm" fill="var(--warn)">⑤ 리스너는 이 세션에서 손을 뗌 —</text>
+        <text x="470" y="78" class="sv-label-sm" fill="var(--warn)">다음 접속 요청 대기</text>
+        <path d="M 94 192 Q 94 300 375 300 Q 500 300 375 240" stroke="var(--accent)" stroke-width="1.8" fill="none" stroke-dasharray="4 5"/>
+        <text x="150" y="292" class="sv-label-sm" fill="var(--accent)">세션 유지 중: 클라이언트 ↔ 서버 프로세스 직통</text>
+      </g>
+
+      <defs>
+        <marker id="arr1a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>클라이언트가 접속 문자열(호스트, 포트 1521, 서비스 이름)로 <b>리스너</b>에게 접속을 요청합니다.</p>
+    <p>리스너는 요청을 확인하고 이 세션을 전담할 <b style="color:var(--ok)">dedicated 서버 프로세스</b>를 새로 만듭니다.</p>
+    <p>연결이 서버 프로세스로 <b>인계</b>됩니다. 이 순간부터 클라이언트와 서버 프로세스는 리스너를 거치지 않고 직접 대화합니다.</p>
+    <p>서버 프로세스는 SQL을 파싱·실행하며 <b style="color:var(--purple)">SGA</b>(공유 메모리)를 이용합니다. 세션의 사적 작업 공간인 PGA는 3장에서!</p>
+    <p>리스너는 이 세션에서 완전히 손을 떼고 다음 접속 요청을 기다립니다. <b>리스너 장애는 "새 접속"만 막을 뿐, 이미 맺어진 세션은 계속 동작</b>하는 이유가 이것입니다.</p>
+  </div>
+</div>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">"리스너가 죽었는데 서비스는 된다?"</div>
+    <p>실무에서 종종 겪는 상황입니다. 리스너는 접속 <strong>중개</strong>만 하므로, 리스너가 내려가도 기존 세션(커넥션 풀)은 정상 동작합니다. 대신 새 접속이 <code>ORA-12541: TNS:no listener</code>로 실패하죠. 반대로 인스턴스가 죽으면 기존 세션까지 모두 끊어집니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">1.4 Dedicated vs Shared Server — 일꾼을 배치하는 두 가지 방식</h2>
+
+<p>위 애니메이션은 기본값인 <strong>dedicated server</strong> 방식입니다. 세션 하나에 서버 프로세스 하나가 1:1로 붙습니다. PostgreSQL의 backend 프로세스와 같은 모델이죠. 반면 <strong>shared server</strong> 방식에서는 소수의 공유 서버 프로세스 풀이 여러 세션의 요청을 번갈아 처리합니다. 요청은 <em>dispatcher</em>라는 중간 프로세스가 큐에 넣어 분배합니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Dedicated Server (기본)</th><th>Shared Server</th></tr></thead>
+  <tbody>
+    <tr><td><strong>구조</strong></td><td>세션 1 : 서버 프로세스 1</td><td>여러 세션 : 공유 프로세스 풀 (dispatcher가 분배)</td></tr>
+    <tr><td><strong>장점</strong></td><td>구조 단순, 세션 간 간섭 없음, 배치·대량 작업에 유리</td><td>수천 세션도 적은 프로세스로 수용 (메모리 절약)</td></tr>
+    <tr><td><strong>단점</strong></td><td>세션 수만큼 프로세스·메모리 소비</td><td>요청 큐 대기 발생 가능, 긴 작업에 불리</td></tr>
+    <tr><td><strong>세션 메모리(UGA) 위치</strong></td><td>PGA 안 (프로세스 사적 공간)</td><td>SGA 안 (어느 프로세스든 이어받아야 하므로)</td></tr>
+    <tr><td><strong>요즘 실무</strong></td><td>대부분 이쪽 + 애플리케이션 커넥션 풀</td><td>커넥션 풀의 보편화로 사용 빈도 낮음</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>UGA(세션 메모리)의 위치가 왜 달라지는지는 3장 PGA에서 그림으로 다시 봅니다. 지금은 "shared server에서는 아무 공유 프로세스나 내 세션을 이어받아야 하니, 세션 상태를 모두가 보는 SGA에 둘 수밖에 없다"는 논리만 기억하세요.</p>
+
+<h2 id="s5">1.5 CDB와 PDB — 멀티테넌트 아키텍처</h2>
+
+<p>Oracle 12c에서 도입되어 19c에서 표준이 된 <strong>멀티테넌트(multitenant)</strong> 구조에서는, 하나의 컨테이너 데이터베이스(<strong>CDB</strong>) 안에 여러 개의 플러거블 데이터베이스(<strong>PDB</strong>)가 들어갑니다.</p>
+
+<ul>
+  <li><strong>CDB$ROOT</strong> — 컨테이너 전체의 메타데이터와 공통 사용자를 관리하는 루트.</li>
+  <li><strong>PDB$SEED</strong> — 새 PDB를 찍어내는 템플릿(읽기 전용).</li>
+  <li><strong>PDB들</strong> — 애플리케이션이 실제로 접속하는 "각각 독립된 데이터베이스처럼 보이는" 단위. 통째로 떼어(unplug) 다른 CDB에 꽂을(plug) 수 있어서 pluggable입니다.</li>
+</ul>
+
+<p>핵심 이점은 <strong>인스턴스 하나(SGA와 백그라운드 프로세스 한 벌)를 여러 PDB가 공유</strong>한다는 점입니다. DB 10개를 서버 하나에 통합할 때, 인스턴스 10개를 띄우는 대신 CDB 하나에 PDB 10개를 꽂으면 메모리와 관리 비용이 크게 줄어듭니다.</p>
+
+<pre><code><span class="c">-- 지금 내가 어떤 컨테이너에 있는지, 어떤 PDB들이 있는지</span>
+<span class="k">SHOW</span> con_name;
+
+CON_NAME
+--------
+CDB$ROOT
+
+<span class="k">SHOW</span> pdbs;
+
+CON_ID  CON_NAME   OPEN MODE   RESTRICTED
+------  ---------  ----------  ----------
+     2  PDB$SEED   READ ONLY   NO
+     3  ORCLPDB1   READ WRITE  NO
+
+<span class="c">-- PDB로 이동해서 작업하기</span>
+<span class="k">ALTER SESSION SET</span> container = ORCLPDB1;</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">헷갈리면 이렇게 정리하세요</div>
+    <p>Instance : Database = 1 : 1 (RAC에서는 N : 1). 그리고 그 Database가 CDB라면 안에 PDB가 여러 개. <strong>애플리케이션 개발자가 접속하는 대상은 보통 PDB의 서비스 이름</strong>입니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">1.6 PostgreSQL·MySQL과 나란히 놓고 보기</h2>
+
+<p>같은 관계형 DB지만 설계 철학과 생태계의 위치가 다릅니다. 앞으로 각 장에서 세부 비교가 계속 나오니, 여기서는 큰 그림만 잡습니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th></th><th>Oracle</th><th>PostgreSQL</th><th>MySQL</th></tr></thead>
+  <tbody>
+    <tr><td><strong>라이선스</strong></td><td>상용 (고가, 강력한 기술지원)</td><td>오픈소스 (PostgreSQL License)</td><td>오픈소스 (GPL) + 상용 에디션</td></tr>
+    <tr><td><strong>세션 처리</strong></td><td>프로세스 기반 (dedicated) + shared server 옵션</td><td>프로세스 기반 (backend)</td><td>스레드 기반</td></tr>
+    <tr><td><strong>MVCC 옛 버전 보관</strong></td><td>undo 세그먼트 (별도 공간)</td><td>테이블 안 dead tuple + VACUUM</td><td>(InnoDB) undo 로그 — Oracle과 유사</td></tr>
+    <tr><td><strong>변경 로그</strong></td><td>redo log</td><td>WAL</td><td>(InnoDB) redo log + binlog</td></tr>
+    <tr><td><strong>강점 영역</strong></td><td>대규모 OLTP, RAC 고가용성, 옵티마이저·진단 도구 성숙도</td><td>확장성(Extension), 표준 SQL, 다양한 워크로드</td><td>웹 서비스, 단순 OLTP, 운영 용이성</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">Oracle에서 "Instance"에 포함되는 것을 가장 정확히 고른 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">데이터파일, 컨트롤파일, 리두 로그 파일</button>
+    <button type="button" data-correct>SGA(공유 메모리)와 백그라운드 프로세스</button>
+    <button type="button">리스너와 클라이언트 세션</button>
+    <button type="button">테이블스페이스와 세그먼트</button>
+  </div>
+  <div class="quiz-expl">✅ Instance = SGA + 백그라운드 프로세스, 즉 메모리와 프로세스의 묶음입니다. 파일들(데이터파일·컨트롤파일·리두 로그)은 Database에 속합니다. 리스너는 인스턴스와 별개로 도는 접속 중개 프로세스입니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">리스너 프로세스가 죽었을 때 일어나는 일로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">모든 기존 세션이 즉시 끊어진다</button>
+    <button type="button">데이터베이스가 자동으로 종료된다</button>
+    <button type="button" data-correct>기존 세션은 정상 동작하지만 새 접속이 실패한다</button>
+    <button type="button">서버 프로세스가 리스너 역할을 대신 수행한다</button>
+  </div>
+  <div class="quiz-expl">✅ 리스너는 접속을 "중개"만 하고, 연결이 성립되면 클라이언트와 서버 프로세스가 직접 통신합니다. 따라서 리스너가 죽어도 기존 세션은 멀쩡하고, 새 접속만 ORA-12541로 실패합니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide — <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/introduction-to-oracle-database.html" target="_blank" rel="noopener">Introduction to Oracle Database</a> 장에서 인스턴스/데이터베이스 구분, 멀티테넌트, 프로세스 구조의 공식 정의를 확인할 수 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html"><span class="dir">← 이전</span><br><span class="title">학습 홈</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch02.html"><span class="dir">다음 →</span><br><span class="title">2장. SGA</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

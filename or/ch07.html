@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7장. Redo · 커밋 · 인스턴스 복구 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch07">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>7장. Redo · 커밋 · 인스턴스 복구</h1>
+<p class="lead">전원이 뽑혀도 커밋된 데이터는 살아남는다 — 그 약속을 지키는 것이 redo입니다. COMMIT 한 번이 디스크까지 가는 여정과, 크래시 후 Oracle이 스스로 일어서는 2단계 복구를 봅니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 4장 백그라운드 프로세스, 6장 Undo</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① redo의 생성 경로 — log buffer → LGWR → online redo log ② COMMIT의 실제 동작과 log file sync 대기 ③ log switch · ARCHIVELOG · checkpoint ④ 인스턴스 크래시 복구 2단계: roll forward(redo 재생) → rollback(undo로 미커밋 취소)</p>
+  </div>
+</div>
+
+<h2 id="s1">7.1 Redo란 — 모든 변경의 일기장</h2>
+
+<p>6장의 undo가 "되돌리기 위한" 데이터라면, <strong>redo는 "다시 하기(re-do) 위한" 데이터</strong>입니다. 데이터 블록에 가해지는 <strong>모든 변경</strong>은 그 변경을 재현할 수 있는 <strong>redo record</strong>로 먼저 기록됩니다. 테이블 블록 변경도, 인덱스 블록 변경도, 심지어 <strong>undo 블록 변경도</strong> redo에 남습니다.</p>
+
+<p>왜 이런 이중 기록을 할까요? Buffer Cache의 변경된(dirty) 블록을 매번 디스크에 쓰는 것은 느립니다 — 블록이 datafile 여기저기에 흩어져 있어 <strong>랜덤 I/O</strong>이기 때문입니다. 반면 redo는 로그 파일 끝에 이어 쓰기만 하는 <strong>순차 I/O</strong>라 빠릅니다. 그래서 Oracle의 전략은:</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">Write-Ahead의 철학</div>
+    <p><strong>"변경의 기록(redo)만 빠르게 디스크에 확정하고, 실제 블록 쓰기는 DBWn이 나중에 천천히."</strong> 크래시가 나도 일기장(redo)만 있으면 블록을 다시 만들 수 있으니까요. PostgreSQL의 WAL(Write-Ahead Log)과 완전히 같은 철학입니다 — <a href="../pg/ch09.html">PostgreSQL 9장</a>과 비교해 보세요.</p>
+  </div>
+</div>
+
+<p>redo가 흐르는 경로는 세 정거장입니다.</p>
+<ul>
+  <li><strong>Redo Log Buffer</strong> — SGA 안의 작은 원형 버퍼. 서버 프로세스가 redo record를 일단 여기에 씁니다.</li>
+  <li><strong>LGWR(Log Writer)</strong> — log buffer의 내용을 디스크로 내리쓰는 전담 백그라운드 프로세스(4장).</li>
+  <li><strong>Online Redo Log 파일</strong> — 디스크 위의 redo 최종 목적지. 최소 2개의 그룹이 돌아가며 쓰입니다.</li>
+</ul>
+
+<h2 id="s2">7.2 COMMIT 한 번의 여정 — 커밋은 왜 빠른가</h2>
+
+<p>많은 분들이 오해합니다. "커밋하면 변경된 데이터가 디스크에 저장된다"고요. 사실 커밋 시점에 디스크에 확실히 쓰이는 것은 <strong>데이터 블록이 아니라 redo</strong>입니다.</p>
+
+<div class="anim" data-steps="5" data-title="COMMIT 한 번의 여정 — log file sync" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 360">
+      <defs>
+        <marker id="arr7b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- session -->
+      <rect x="30" y="30" width="220" height="60" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="140" y="55" text-anchor="middle" class="sv-label">세션: UPDATE 후 COMMIT</text>
+      <text x="140" y="76" text-anchor="middle" class="sv-label-sm sv-mono" data-show="2">COMMIT → SCN 확정</text>
+      <!-- SGA box -->
+      <rect x="30" y="130" width="480" height="130" rx="12" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 5"/>
+      <text x="46" y="154" class="sv-label-sm">SGA (메모리)</text>
+      <!-- buffer cache -->
+      <g data-show="1">
+        <rect x="50" y="166" width="200" height="76" rx="8" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="150" y="190" text-anchor="middle" class="sv-label" fill="var(--warn)">Buffer Cache</text>
+        <text x="150" y="210" text-anchor="middle" class="sv-label-sm">dirty 블록 (bal=200)</text>
+        <text x="150" y="228" text-anchor="middle" class="sv-label-sm">아직 메모리에만 있음</text>
+      </g>
+      <!-- log buffer -->
+      <g data-show="1">
+        <rect x="290" y="166" width="200" height="76" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.5"/>
+        <text x="390" y="190" text-anchor="middle" class="sv-label" fill="var(--purple)">Redo Log Buffer</text>
+        <text x="390" y="210" text-anchor="middle" class="sv-label-sm sv-mono">redo record: bal 100→200</text>
+        <path d="M 140 90 C 140 110 140 130 140 164" class="sv-arrow flow-line"/>
+        <path d="M 200 90 C 280 110 340 130 380 164" class="sv-arrow flow-line"/>
+      </g>
+      <!-- LGWR -->
+      <g data-show="3">
+        <rect x="560" y="166" width="110" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 12%, transparent)" stroke="var(--ok)" stroke-width="1.8" class="pulse"/>
+        <text x="615" y="200" text-anchor="middle" class="sv-label" fill="var(--ok)">LGWR</text>
+        <text x="615" y="220" text-anchor="middle" class="sv-label-sm">기상! ⏰</text>
+        <path d="M 492 204 L 556 204" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr7b)"/>
+      </g>
+      <!-- redo log file -->
+      <g data-show="3">
+        <rect x="560" y="290" width="220" height="54" rx="10" class="sv-box"/>
+        <text x="670" y="312" text-anchor="middle" class="sv-label">Online Redo Log 💾</text>
+        <text x="670" y="332" text-anchor="middle" class="sv-label-sm">순차 쓰기 (빠름)</text>
+        <path d="M 615 244 L 615 286" stroke="var(--ok)" stroke-width="2.2" fill="none" class="flow-line" marker-end="url(#arr7b)"/>
+      </g>
+      <!-- waiting -->
+      <g data-show="3-3">
+        <text x="140" y="116" class="sv-label-sm" fill="var(--warn)">세션은 대기: log file sync ⏳</text>
+      </g>
+      <!-- ack -->
+      <g data-show="4">
+        <path d="M 560 290 C 400 330 220 330 150 96" stroke="var(--ok)" stroke-width="2" fill="none" stroke-dasharray="6 5" marker-end="url(#arr7b)"/>
+        <text x="330" y="300" class="sv-label" fill="var(--ok)">쓰기 완료 → "커밋 성공" 응답 ✅</text>
+      </g>
+      <!-- dbwn note -->
+      <g data-show="5">
+        <rect x="30" y="290" width="330" height="54" rx="10" fill="color-mix(in srgb, var(--warn) 10%, transparent)" stroke="var(--warn)" stroke-width="1.5"/>
+        <text x="195" y="312" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">dirty 블록은 아직 메모리에!</text>
+        <text x="195" y="330" text-anchor="middle" class="sv-label-sm">DBWn이 나~중에 여유롭게 씀 (체크포인트)</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>UPDATE 실행 시점: 데이터 블록은 Buffer Cache에서 dirty 상태가 되고, 변경 내용의 <b style="color:var(--purple)">redo record는 Redo Log Buffer</b>에 쌓입니다. 아직 전부 메모리 위입니다.</p>
+    <p><b>COMMIT!</b> 트랜잭션에 커밋 SCN이 확정되고, 커밋 기록이 redo record로 log buffer에 추가됩니다.</p>
+    <p><b style="color:var(--ok)">LGWR</b>가 log buffer의 내용을 online redo log 파일에 순차 쓰기합니다. 이 디스크 쓰기가 끝날 때까지 세션은 <b style="color:var(--warn)">log file sync</b> 이벤트를 대기합니다 — 커밋 응답 시간의 정체가 바로 이것.</p>
+    <p>쓰기 완료! 세션은 "커밋 성공"을 받습니다. 이 순간부터 <b style="color:var(--ok)">전원이 뽑혀도 이 트랜잭션은 살아남습니다</b> — redo가 디스크에 있으니까요(내구성, Durability).</p>
+    <p>반전: 정작 <b>데이터 블록은 아직 디스크에 안 쓰였습니다</b>. DBWn이 나중에 체크포인트 등 계기로 천천히 씁니다. 커밋이 데이터 양과 무관하게 빠른 이유 — 디스크에 쓰는 건 작은 redo뿐이기 때문입니다.</p>
+  </div>
+</div>
+
+<p>LGWR가 log buffer를 디스크로 내리는 계기는 커밋만이 아닙니다.</p>
+
+<ul>
+  <li>세션이 <strong>COMMIT</strong>(또는 ROLLBACK)할 때</li>
+  <li><strong>3초</strong>마다 주기적으로</li>
+  <li>log buffer가 <strong>1/3</strong> 찼거나 쌓인 redo가 <strong>1MB</strong>에 달했을 때</li>
+  <li><strong>DBWn이 dirty 블록을 쓰기 직전</strong> — 블록보다 그 블록의 redo가 먼저 디스크에 있어야 한다는 <strong>write-ahead 규칙</strong> 때문</li>
+</ul>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">건별 커밋은 log file sync 폭탄</div>
+    <p>루프 안에서 1건 처리할 때마다 커밋하면, 매번 LGWR의 디스크 쓰기를 기다립니다. 10만 건이면 10만 번의 동기 I/O 대기죠. 배치 작업은 <strong>모아서 커밋</strong>하는 것이 기본입니다. AWR에서 <code>log file sync</code>가 상위 대기 이벤트라면 과도한 커밋 빈도나 느린 redo 디스크를 의심하세요.</p>
+  </div>
+</div>
+
+<h2 id="s3">7.3 Log Switch와 ARCHIVELOG — 일기장 돌려쓰기</h2>
+
+<p>online redo log는 <strong>최소 2개의 그룹</strong>이 원형으로 돌아가며 쓰입니다. 현재 그룹이 가득 차면 다음 그룹으로 넘어가는 것이 <strong>log switch</strong>입니다. 그런데 한 바퀴 돌아 다시 첫 그룹을 덮어써야 할 때, 그 안의 redo가 지워지면 그 시점 이전으로의 복구 능력도 사라집니다. 그래서 운영 DB는 <strong>ARCHIVELOG 모드</strong>를 켜고, 덮어쓰기 전에 <strong>ARCn 프로세스가 사본(archived log)을 떠 둡니다</strong>.</p>
+
+<div class="anim" data-steps="4" data-title="Log Switch 순환 — 덮어쓰기 전에 아카이브" data-interval="2800">
+  <div class="anim-stage">
+    <svg viewBox="0 0 800 320">
+      <defs>
+        <marker id="arr7c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+      <!-- three groups -->
+      <g data-active="1-1">
+        <rect x="60" y="70" width="180" height="90" rx="10" class="sv-box"/>
+        <text x="150" y="100" text-anchor="middle" class="sv-label">Group 1</text>
+      </g>
+      <g data-show="1-1">
+        <rect x="60" y="70" width="180" height="90" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2" class="blink"/>
+        <text x="150" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✍️ CURRENT (쓰는 중)</text>
+      </g>
+      <g data-show="2">
+        <text x="150" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--warn)">가득 참 → ACTIVE</text>
+      </g>
+      <g data-show="4">
+        <rect x="60" y="70" width="180" height="90" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="150" y="148" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">아카이브 완료 → 재사용 OK ♻️</text>
+      </g>
+
+      <rect x="310" y="70" width="180" height="90" rx="10" class="sv-box"/>
+      <text x="400" y="100" text-anchor="middle" class="sv-label">Group 2</text>
+      <g data-show="2">
+        <rect x="310" y="70" width="180" height="90" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2" class="blink"/>
+        <text x="400" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✍️ CURRENT (log switch!)</text>
+      </g>
+
+      <rect x="560" y="70" width="180" height="90" rx="10" class="sv-box"/>
+      <text x="650" y="100" text-anchor="middle" class="sv-label">Group 3</text>
+      <g data-show="4">
+        <rect x="560" y="70" width="180" height="90" rx="10" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="2" class="blink"/>
+        <text x="650" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✍️ CURRENT</text>
+      </g>
+
+      <!-- circular arrows -->
+      <path d="M 244 115 L 306 115" class="sv-line" marker-end="url(#arr7c)" data-show="2"/>
+      <path d="M 494 115 L 556 115" class="sv-line" marker-end="url(#arr7c)" data-show="4"/>
+      <path d="M 650 164 C 650 230 400 250 150 168" class="sv-line" stroke-dasharray="5 5" data-show="4"/>
+
+      <!-- ARCn -->
+      <g data-show="3">
+        <rect x="80" y="210" width="140" height="50" rx="10" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.8" class="pulse"/>
+        <text x="150" y="240" text-anchor="middle" class="sv-label" fill="var(--purple)">ARCn 🗃️</text>
+        <path d="M 150 164 L 150 206" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr7c)"/>
+        <rect x="280" y="210" width="240" height="50" rx="10" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="6 5"/>
+        <text x="400" y="232" text-anchor="middle" class="sv-label-sm" fill="var(--purple)">archived log: arch_0001.arc</text>
+        <text x="400" y="250" text-anchor="middle" class="sv-label-sm">백업/PITR 복구의 재료</text>
+        <path d="M 224 235 L 276 235" stroke="var(--purple)" stroke-width="2" fill="none" class="flow-line" marker-end="url(#arr7c)"/>
+      </g>
+      <g data-show="1-1">
+        <text x="400" y="40" text-anchor="middle" class="sv-label-sm">online redo log 그룹은 최소 2개 — 원형으로 돌려쓴다</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>LGWR는 <b>Group 1</b>(CURRENT 상태)에 redo를 쓰고 있습니다. 그룹들은 원형 큐처럼 순서대로 돌려쓰입니다.</p>
+    <p>Group 1이 가득 찼습니다! <b>log switch</b> — LGWR는 즉시 Group 2로 펜을 옮깁니다. Group 1은 "복구에 아직 필요할 수 있는" ACTIVE 상태가 됩니다.</p>
+    <p>ARCHIVELOG 모드라면 <b style="color:var(--purple)">ARCn 프로세스가 Group 1의 사본을 archived log로 복사</b>합니다. 이 사본들이 쌓여 백업 이후의 모든 변경 기록이 되고, PITR(특정 시점 복구)의 재료가 됩니다.</p>
+    <p>순환 계속: Group 2 → Group 3 → 다시 Group 1... 단, <b>아카이브가 끝나지 않은 그룹은 덮어쓸 수 없습니다</b>. 아카이브가 밀리면 DB 전체가 멈추는 이유입니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- redo log 그룹 상태 확인</span>
+<span class="k">SELECT</span> group#, status, bytes/1024/1024 <span class="k">AS</span> mb, archived
+<span class="k">FROM</span>   v$log;
+
+GROUP#  STATUS    MB   ARCHIVED
+------  --------  ---  --------
+     1  INACTIVE  200  YES      <span class="c">← 아카이브 완료, 재사용 가능</span>
+     2  CURRENT   200  NO       <span class="c">← LGWR가 지금 쓰는 중</span>
+     3  ACTIVE    200  YES      <span class="c">← 체크포인트 미완료, 아직 복구에 필요</span>
+
+<span class="c">-- 아카이브 모드 확인 / 수동 log switch</span>
+<span class="k">ARCHIVE LOG LIST</span>;
+<span class="k">ALTER SYSTEM SWITCH LOGFILE</span>;</code></pre>
+
+<div class="callout danger">
+  <span class="ico">🚨</span>
+  <div>
+    <div class="callout-title">아카이브가 밀리면 DB가 멈춘다</div>
+    <p>archived log를 쓸 디스크가 가득 차면 ARCn이 멈추고, 아카이브 안 된 그룹은 재사용할 수 없으므로 결국 LGWR도 멈춥니다. 증상은 모든 세션이 매달리는 대기와 alert log의 <strong>"all online logs needed archiving"</strong>. 아카이브 영역 공간 모니터링은 Oracle 운영의 기본 중 기본입니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">7.4 Checkpoint — 복구 시작선을 앞으로 당기기</h2>
+
+<p><strong>Checkpoint</strong>는 "여기까지의 변경은 datafile에 확실히 반영되었다"는 동기화 지점입니다. DBWn이 그 시점까지의 dirty 블록을 디스크에 쓰고, CKPT 프로세스가 컨트롤 파일과 datafile 헤더에 체크포인트 위치(SCN)를 기록합니다.</p>
+
+<p>체크포인트가 중요한 이유는 단 하나 — <strong>크래시 복구를 어디서부터 시작할지</strong>를 정하기 때문입니다. 체크포인트 이전의 redo는 이미 datafile에 반영됐으니 재생할 필요가 없습니다. 체크포인트가 자주 진행될수록 복구는 빨라지고, 대신 평상시 디스크 쓰기는 늘어납니다. 이 균형은 <code>FAST_START_MTTR_TARGET</code>(목표 복구 시간, 초 단위) 파라미터로 조절합니다.</p>
+
+<h2 id="s5">7.5 인스턴스 복구 — 크래시에서 스스로 일어서는 2단계</h2>
+
+<p>전원 장애로 인스턴스가 즉사했다고 합시다. 그 순간 디스크의 상태는 엉망입니다.</p>
+<ul>
+  <li>커밋됐지만 <strong>datafile에는 아직 안 쓰인</strong> 변경이 있고 (dirty 블록은 메모리와 함께 증발),</li>
+  <li>반대로 커밋 안 됐는데 <strong>datafile에 이미 쓰인</strong> 변경도 있습니다 (DBWn은 커밋 여부와 무관하게 씁니다).</li>
+</ul>
+
+<p>다음 기동 때 <strong>SMON</strong>이 이 둘을 정리합니다. 무기는 redo와 undo, 순서는 정확히 2단계입니다.</p>
+
+<div class="anim" data-steps="5" data-title="인스턴스 복구 — roll forward 그리고 rollback" data-interval="2900">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 350">
+      <defs>
+        <marker id="arr7d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+        <marker id="arr7e" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+      <!-- crash -->
+      <g data-show="1-1">
+        <text x="410" y="40" text-anchor="middle" class="sv-label" fill="var(--danger)" font-size="16">⚡ 크래시! 인스턴스(메모리) 증발</text>
+      </g>
+      <g data-show="2">
+        <text x="410" y="40" text-anchor="middle" class="sv-label" fill="var(--accent)" font-size="15">재기동 — SMON이 복구 시작</text>
+      </g>
+      <!-- datafile state -->
+      <rect x="40" y="70" width="340" height="180" rx="12" class="sv-box"/>
+      <text x="56" y="96" class="sv-label">Datafiles (크래시 직후)</text>
+      <g data-show="1-2">
+        <rect x="56" y="110" width="300" height="34" rx="6" fill="none" stroke="var(--danger)" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <text x="68" y="132" class="sv-label-sm" fill="var(--danger)">TX1 (커밋됨): 변경이 파일에 없음 😱</text>
+      </g>
+      <rect x="56" y="154" width="300" height="34" rx="6" fill="color-mix(in srgb, var(--warn) 14%, transparent)" stroke="var(--warn)"/>
+      <text x="68" y="176" class="sv-label-sm" fill="var(--warn)">TX2 (미커밋): 변경이 파일에 있음 😱</text>
+      <g data-show="1-4">
+        <rect x="56" y="198" width="300" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="68" y="220" class="sv-label-sm">TX0 (커밋+반영 완료): 문제 없음</text>
+      </g>
+      <!-- redo log -->
+      <g data-show="2-3">
+        <rect x="480" y="70" width="300" height="76" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="630" y="96" text-anchor="middle" class="sv-label" fill="var(--ok)">Online Redo Log</text>
+        <text x="630" y="118" text-anchor="middle" class="sv-label-sm">체크포인트 이후의 모든 변경 기록</text>
+        <text x="630" y="136" text-anchor="middle" class="sv-label-sm">(TX1, TX2의 redo + undo 블록의 redo)</text>
+      </g>
+      <!-- roll forward -->
+      <g data-show="3">
+        <path d="M 476 110 C 430 110 420 120 386 126" stroke="var(--ok)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#arr7d)"/>
+        <text x="430" y="90" text-anchor="middle" class="sv-label" fill="var(--ok)">1단계 roll forward ▶</text>
+        <rect x="56" y="110" width="300" height="34" rx="6" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="68" y="132" class="sv-label-sm" fill="var(--ok)">TX1 (커밋됨): redo 재생으로 복원 ✅</text>
+      </g>
+      <!-- undo -->
+      <g data-show="4">
+        <rect x="480" y="180" width="300" height="70" rx="10" fill="color-mix(in srgb, var(--purple) 10%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="630" y="206" text-anchor="middle" class="sv-label" fill="var(--purple)">Undo (roll forward로 복원됨)</text>
+        <text x="630" y="228" text-anchor="middle" class="sv-label-sm sv-mono">TX2의 before image</text>
+        <path d="M 476 215 C 430 215 420 190 386 176" stroke="var(--purple)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#arr7e)"/>
+        <text x="428" y="250" text-anchor="middle" class="sv-label" fill="var(--purple)">2단계 rollback ◀</text>
+        <rect x="56" y="154" width="300" height="34" rx="6" fill="color-mix(in srgb, var(--purple) 14%, transparent)" stroke="var(--purple)" stroke-width="1.6"/>
+        <text x="68" y="176" class="sv-label-sm" fill="var(--purple)">TX2 (미커밋): undo로 취소 ↩️</text>
+      </g>
+      <!-- done -->
+      <g data-show="5">
+        <rect x="40" y="286" width="740" height="48" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)" stroke-width="1.6"/>
+        <text x="410" y="316" text-anchor="middle" class="sv-label" fill="var(--ok)">✅ 복구 완료: 커밋된 것은 전부 살고, 미커밋은 전부 사라졌다 — 원자성과 내구성의 증명</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>⚡ 크래시 직후의 datafile: <b style="color:var(--danger)">커밋된 TX1의 변경은 파일에 없고</b>(dirty 블록이 메모리째 증발), <b style="color:var(--warn)">미커밋 TX2의 변경은 파일에 있는</b>(DBWn이 먼저 써버림) 모순 상태입니다.</p>
+    <p>재기동. SMON이 컨트롤 파일의 체크포인트 위치를 보고 "여기부터 정리가 필요하다"를 파악합니다. 무기는 online redo log — 체크포인트 이후의 모든 변경 기록이 담겨 있습니다.</p>
+    <p><b style="color:var(--ok)">1단계 roll forward(전진)</b>: 체크포인트 위치부터 redo를 순서대로 재생합니다. 커밋 여부를 따지지 않고 <b>전부</b> 재적용 — TX1도, TX2도, 심지어 undo 블록의 변경까지 크래시 직전 상태로 복원됩니다.</p>
+    <p><b style="color:var(--purple)">2단계 rollback(후진)</b>: 이제 6장의 undo가 등판합니다. roll forward로 되살아난 undo에서 TX2의 before image를 꺼내 <b>미커밋 변경을 취소</b>합니다. (DB는 roll forward만 끝나면 열리고, rollback은 열린 뒤에도 백그라운드로 이어집니다.)</p>
+    <p>결과: <b style="color:var(--ok)">커밋된 것은 전부 살아남고, 미커밋은 흔적 없이 사라졌습니다.</b> redo가 내구성(D)을, undo가 원자성(A)을 책임진 셈입니다. DBA가 한 일은? 그냥 startup 한 번.</p>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">왜 "redo 먼저, undo 나중"인가</div>
+    <p>undo 자체도 데이터 블록이라(6장) 크래시로 최신 undo가 디스크에 없을 수 있습니다. 그래서 <strong>redo 재생으로 undo부터 되살린 다음에야</strong> 그 undo로 미커밋을 되돌릴 수 있습니다. "redo가 undo를 복원하고, undo가 트랜잭션을 되돌린다" — 이 한 문장이 Oracle 복구의 전부입니다.</p>
+  </div>
+</div>
+
+<h2 id="s6">7.6 PostgreSQL WAL과 나란히 놓고 보기</h2>
+
+<p>같은 write-ahead 철학이라 대응 관계가 깔끔합니다. PostgreSQL을 아는 분이라면 이 표 하나로 이 장을 복습할 수 있습니다 (<a href="../pg/ch09.html">PostgreSQL 9장 WAL과 Checkpoint</a>).</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>역할</th><th>Oracle</th><th>PostgreSQL</th></tr></thead>
+  <tbody>
+    <tr><td>변경 로그</td><td>redo (online redo log)</td><td>WAL 세그먼트</td></tr>
+    <tr><td>로그 쓰기 프로세스</td><td>LGWR</td><td>walwriter (+ 커밋 시 백엔드 직접)</td></tr>
+    <tr><td>커밋 대기 이벤트</td><td>log file sync</td><td>WALWrite / fsync 대기</td></tr>
+    <tr><td>로그 파일 운용</td><td>고정 그룹 순환 + 아카이브</td><td>세그먼트 생성·재활용 + archive_command</td></tr>
+    <tr><td>미커밋 취소 정보</td><td>undo (별도 저장소, 복구 2단계에 필수)</td><td>불필요 — 옛 버전이 heap에 남아 있어 롤백이 저렴</td></tr>
+    <tr><td>크래시 복구</td><td>roll forward(redo) → rollback(undo)</td><td>REDO 지점부터 WAL 재생 (undo 단계 없음)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>가장 큰 차이는 마지막 줄입니다. PostgreSQL은 미커밋 변경도 "새 버전 튜플"일 뿐이라 <strong>복구에서 되돌릴 것이 없습니다</strong>(커밋 안 된 XID의 튜플은 그냥 안 보임). Oracle은 제자리 수정 구조라 undo를 이용한 rollback 단계가 반드시 필요합니다 — 6장에서 본 구조 차이가 복구 절차의 차이로 그대로 이어지는 것이죠.</p>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">COMMIT이 성공적으로 반환된 직후의 상태로 옳은 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">변경된 데이터 블록이 모두 datafile에 기록되어 있다</button>
+    <button type="button" data-correct>redo가 online redo log에 기록되어 있고, 데이터 블록은 아직 메모리에만 있을 수 있다</button>
+    <button type="button">DBWn이 dirty 블록을 쓸 때까지 커밋 응답이 지연된다</button>
+    <button type="button">undo가 즉시 삭제되어 공간이 회수된다</button>
+  </div>
+  <div class="quiz-expl">✅ 커밋 시 디스크에 확정되는 것은 redo뿐입니다(LGWR의 쓰기 완료 = log file sync 대기 종료). 데이터 블록은 DBWn이 나중에 씁니다. 크래시가 나도 redo로 재현할 수 있으므로 내구성은 보장됩니다. undo도 읽기 일관성을 위해 당분간 보존됩니다(6장).</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">인스턴스 복구에서 roll forward가 rollback보다 먼저 수행되어야 하는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">커밋된 트랜잭션이 미커밋 트랜잭션보다 항상 먼저 실행되었기 때문</button>
+    <button type="button">rollback이 완료되어야 redo log를 재사용할 수 있기 때문</button>
+    <button type="button" data-correct>미커밋 취소에 필요한 undo 자체가 redo 재생으로 먼저 복원되어야 하기 때문</button>
+    <button type="button">roll forward가 rollback보다 빠른 작업이라 사용자 대기를 줄이기 위해</button>
+  </div>
+  <div class="quiz-expl">✅ undo도 데이터 블록이므로 크래시로 최신 상태가 디스크에 없을 수 있습니다. roll forward가 redo를 재생해 undo까지 크래시 직전 상태로 복원한 뒤에야, 그 undo로 미커밋 트랜잭션을 되돌릴(rollback) 수 있습니다. 참고로 DB는 roll forward 후 바로 열리고 rollback은 백그라운드로 계속됩니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c Concepts Guide: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/physical-storage-structures.html" target="_blank" rel="noopener">Physical Storage Structures</a> (online redo log 구조) · <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/oracle-database-instance.html" target="_blank" rel="noopener">Oracle Database Instance</a> (인스턴스 복구 절차와 체크포인트) — SCN, thread, 멀티플렉싱 등 심화 내용이 있습니다.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06.html"><span class="dir">← 이전</span><br><span class="title">6장. Undo와 읽기 일관성</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch08.html"><span class="dir">다음 →</span><br><span class="title">8장. 트랜잭션과 락</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

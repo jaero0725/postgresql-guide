@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11장. 파티셔닝과 병렬 처리 — Oracle 가이드 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="or/ch11">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a class="on-or" href="index.html">🔴 Oracle</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">🔴 Oracle 가이드</div>
+  <a class="chap" href="index.html" data-page="or/"><span class="num">🏠</span> 학습 홈</a>
+  <div class="group-title">아키텍처 기초</div>
+  <a class="chap" href="ch01.html" data-page="or/ch01"><span class="num">01</span> Oracle 개요 — Instance와 Database</a>
+  <a class="chap" href="ch02.html" data-page="or/ch02"><span class="num">02</span> SGA — 공유 메모리 구조</a>
+  <a class="chap" href="ch03.html" data-page="or/ch03"><span class="num">03</span> PGA와 서버 프로세스</a>
+  <a class="chap" href="ch04.html" data-page="or/ch04"><span class="num">04</span> 백그라운드 프로세스</a>
+  <a class="chap" href="ch05.html" data-page="or/ch05"><span class="num">05</span> 저장 구조 — 테이블스페이스와 블록</a>
+  <div class="group-title">트랜잭션과 복구</div>
+  <a class="chap" href="ch06.html" data-page="or/ch06"><span class="num">06</span> Undo와 읽기 일관성</a>
+  <a class="chap" href="ch07.html" data-page="or/ch07"><span class="num">07</span> Redo · 커밋 · 인스턴스 복구</a>
+  <a class="chap" href="ch08.html" data-page="or/ch08"><span class="num">08</span> 트랜잭션과 락</a>
+  <div class="group-title">쿼리 성능</div>
+  <a class="chap" href="ch09.html" data-page="or/ch09"><span class="num">09</span> 인덱스 구조와 활용</a>
+  <a class="chap" href="ch10.html" data-page="or/ch10"><span class="num">10</span> 옵티마이저와 실행계획</a>
+  <a class="chap" href="ch11.html" data-page="or/ch11"><span class="num">11</span> 파티셔닝과 병렬 처리</a>
+  <a class="chap" href="ch12.html" data-page="or/ch12"><span class="num">12</span> AWR과 대기 이벤트 — 모니터링</a>
+  <div class="group-title">빠른 참조</div>
+  <a class="chap" href="tuning.html" data-page="or/tuning"><span class="num">⚡</span> 쿼리 튜닝 팁 모음</a>
+</aside>
+
+<main class="content">
+
+<h1>11장. 파티셔닝과 병렬 처리</h1>
+<p class="lead">10억 건짜리 테이블을 다루는 두 가지 무기 — 읽을 범위를 잘라내는 파티셔닝, 읽는 손을 늘리는 병렬 처리. 대용량 Oracle 운영의 양대 축입니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-adv">고급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 3개</span>
+  <span class="tag">선수 지식: 9~10장</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 장에서 배우는 것</div>
+    <p>① Range/List/Hash/Composite 파티셔닝의 선택 기준 ② Partition Pruning으로 스캔 범위를 잘라내는 원리 ③ Local vs Global 인덱스와 파티션 유지보수(DROP/EXCHANGE) ④ Parallel Query의 PX 서버·granule 동작과 병렬의 비용</p>
+  </div>
+</div>
+
+<h2 id="s1">11.1 파티셔닝 — 하나의 테이블, 여러 개의 서랍</h2>
+
+<p><strong>파티셔닝</strong>은 논리적으로는 하나인 테이블을 물리적으로 여러 조각(파티션 = 각각 독립된 세그먼트)으로 나누어 저장하는 기능입니다(Enterprise Edition 옵션). 응용 프로그램은 여전히 테이블 하나로 보고 쿼리하지만, Oracle은 내부적으로 필요한 서랍만 열 수 있게 됩니다.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>방식</th><th>나누는 기준</th><th>대표 용도</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Range</strong></td><td>값의 범위 (<code>VALUES LESS THAN</code>)</td><td>날짜·기간 데이터. 가장 널리 쓰임. 오래된 파티션 DROP으로 보관주기 관리</td></tr>
+    <tr><td><strong>List</strong></td><td>명시한 값 목록</td><td>지역 코드, 국가, 지점처럼 이산적인 값</td></tr>
+    <tr><td><strong>Hash</strong></td><td>해시 함수로 균등 분산</td><td>자연스러운 기준이 없을 때 I/O·경합 분산 (파티션 수는 2의 거듭제곱 권장)</td></tr>
+    <tr><td><strong>Composite</strong></td><td>2단 조합 (파티션 → 서브파티션)</td><td>Range-Hash(월별 + 고객 분산), Range-List(월별 + 지역별) 등</td></tr>
+    <tr><td><strong>Interval</strong></td><td>Range의 자동화 버전</td><td>새 범위의 데이터가 들어오면 파티션을 자동 생성 (11g+)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><code><span class="c">-- 월별 Range 파티셔닝의 전형</span>
+<span class="k">CREATE TABLE</span> sales (
+  sale_id   <span class="k">NUMBER</span>,
+  sale_date <span class="k">DATE</span> <span class="k">NOT NULL</span>,
+  amount    <span class="k">NUMBER</span>(12,2)
+)
+<span class="k">PARTITION BY RANGE</span> (sale_date) (
+  <span class="k">PARTITION</span> p2026_01 <span class="k">VALUES LESS THAN</span> (<span class="k">DATE</span> <span class="s">'2026-02-01'</span>),
+  <span class="k">PARTITION</span> p2026_02 <span class="k">VALUES LESS THAN</span> (<span class="k">DATE</span> <span class="s">'2026-03-01'</span>),
+  <span class="k">PARTITION</span> p2026_03 <span class="k">VALUES LESS THAN</span> (<span class="k">DATE</span> <span class="s">'2026-04-01'</span>)
+  <span class="c">-- ... 월마다 계속</span>
+);</code></pre>
+
+<h2 id="s2">11.2 Partition Pruning — 안 읽는 것이 가장 빠르다</h2>
+
+<p>파티셔닝의 성능 효과는 대부분 <strong>pruning(가지치기)</strong>에서 나옵니다. WHERE 절에 파티션 키 조건이 있으면 옵티마이저는 대상이 아닌 파티션을 <strong>아예 접근 대상에서 제외</strong>합니다. 실행계획의 <code>Pstart</code>/<code>Pstop</code> 컬럼에서 몇 번 파티션만 읽는지 확인할 수 있습니다.</p>
+
+<div class="anim" data-steps="4" data-title="Partition Pruning — 날짜 조건으로 서랍 하나만 열기" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 320">
+      <text x="20" y="26" class="sv-label sv-mono" font-size="13">SELECT SUM(amount) FROM sales WHERE sale_date &gt;= DATE '2026-03-01' AND sale_date &lt; DATE '2026-04-01'</text>
+
+      <!-- 12 partitions -->
+      <g data-active="1-2">
+        <rect x="30" y="70" width="120" height="70" rx="8" class="sv-box"/>
+        <text x="90" y="100" text-anchor="middle" class="sv-label-sm sv-mono">p2026_01</text>
+        <text x="90" y="120" text-anchor="middle" class="sv-label-sm">1월 · 8천만행</text>
+      </g>
+      <g data-active="1-2">
+        <rect x="160" y="70" width="120" height="70" rx="8" class="sv-box"/>
+        <text x="220" y="100" text-anchor="middle" class="sv-label-sm sv-mono">p2026_02</text>
+        <text x="220" y="120" text-anchor="middle" class="sv-label-sm">2월 · 8천만행</text>
+      </g>
+      <rect x="290" y="70" width="120" height="70" rx="8" class="sv-box"/>
+      <text x="350" y="100" text-anchor="middle" class="sv-label-sm sv-mono">p2026_03</text>
+      <text x="350" y="120" text-anchor="middle" class="sv-label-sm">3월 · 8천만행</text>
+      <g data-active="1-2">
+        <rect x="420" y="70" width="120" height="70" rx="8" class="sv-box"/>
+        <text x="480" y="100" text-anchor="middle" class="sv-label-sm sv-mono">p2026_04</text>
+        <text x="480" y="120" text-anchor="middle" class="sv-label-sm">4월 · 8천만행</text>
+      </g>
+      <g data-active="1-2">
+        <rect x="550" y="70" width="120" height="70" rx="8" class="sv-box"/>
+        <text x="610" y="100" text-anchor="middle" class="sv-label-sm sv-mono">p2026_05</text>
+        <text x="610" y="120" text-anchor="middle" class="sv-label-sm">5월 · 8천만행</text>
+      </g>
+      <g data-active="1-2">
+        <rect x="680" y="70" width="110" height="70" rx="8" class="sv-box"/>
+        <text x="735" y="100" text-anchor="middle" class="sv-label-sm sv-mono">… p2026_12</text>
+        <text x="735" y="120" text-anchor="middle" class="sv-label-sm">이하 7개</text>
+      </g>
+
+      <!-- step2: optimizer decision -->
+      <g data-show="2">
+        <rect x="230" y="180" width="360" height="46" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="410" y="200" text-anchor="middle" class="sv-label" font-size="13">🧠 파티션 키 조건 발견 → 경계와 비교</text>
+        <text x="410" y="218" text-anchor="middle" class="sv-label-sm sv-mono">Pstart = 3, Pstop = 3</text>
+      </g>
+
+      <!-- step3: pruning -->
+      <g data-show="3">
+        <rect x="290" y="70" width="120" height="70" rx="8" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="2" class="pulse"/>
+        <text x="350" y="60" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">✔ 이 서랍만 스캔</text>
+        <text x="90" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">pruned ✂</text>
+        <text x="220" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">pruned ✂</text>
+        <text x="480" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">pruned ✂</text>
+        <text x="610" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">pruned ✂</text>
+        <text x="735" y="160" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">pruned ✂</text>
+      </g>
+
+      <!-- step4: result -->
+      <g data-show="4">
+        <rect x="130" y="248" width="560" height="52" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="410" y="270" text-anchor="middle" class="sv-label" font-size="13">스캔량 9.6억 → 8천만 행 (1/12) — 인덱스 없이도 조건만으로 I/O 92% 절감</text>
+        <text x="410" y="290" text-anchor="middle" class="sv-label-sm">단, TRUNC(sale_date) 처럼 파티션 키를 가공하면 pruning 실패 → 12개 전부 스캔</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>sales 테이블은 월별 12개 파티션, 총 9.6억 행입니다. 쿼리는 3월 매출 합계를 구합니다.</p>
+    <p>옵티마이저가 WHERE의 <b>파티션 키 조건</b>을 파티션 경계와 비교합니다. 결과는 실행계획의 <code>Pstart/Pstop</code>으로 나타납니다 — "3번 파티션에서 시작해 3번에서 끝".</p>
+    <p>나머지 11개 파티션은 <b style="color:var(--danger)">아예 열지도 않습니다(pruned)</b>. 읽고 버리는 것이 아니라 처음부터 대상에서 제외하는 것이라 비용이 0입니다.</p>
+    <p>스캔량이 1/12로. 다만 파티션 키를 <b>함수로 가공하면 pruning이 깨져</b> 전 파티션 스캔이 됩니다 — 인덱스 컬럼 가공 금지 원칙(튜닝 팁 페이지)과 같은 이유입니다.</p>
+  </div>
+</div>
+
+<div class="callout info">
+  <span class="ico">🔀</span>
+  <div>
+    <div class="callout-title">다른 DB와 비교하며 읽기</div>
+    <p>PostgreSQL도 선언적 파티셔닝과 pruning을 지원하지만(<a href="../pg/ch12.html">PG 12장 파티셔닝</a>) Oracle처럼 EXCHANGE 같은 풍부한 유지보수 명령은 제한적입니다. ClickHouse의 파티션(<a href="../ch/ch05.html">CH 5장</a>)은 MergeTree의 물리 디렉터리 단위로, "파티션 DROP으로 보관주기 관리"라는 운영 패턴은 세 DB가 놀랍도록 닮았습니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">11.3 Local vs Global 인덱스</h2>
+
+<p>파티션 테이블의 인덱스는 두 종류입니다. 이 선택이 유지보수 편의성을 좌우합니다.</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🗂 Local Index</h4>
+    <p>테이블과 <strong>같은 기준으로 잘린</strong> 인덱스 — 파티션마다 자기만의 작은 인덱스를 가집니다. 파티션을 DROP/EXCHANGE해도 <strong>해당 조각만 함께 처리</strong>되어 유지보수가 깔끔합니다. DW·이력성 테이블의 기본 선택.</p>
+  </div>
+  <div class="card">
+    <h4>🌐 Global Index</h4>
+    <p>파티션 경계와 무관하게 <strong>테이블 전체를 하나로 커버</strong>하는 인덱스(자체적으로 다르게 파티셔닝할 수도 있음). 파티션 키가 조건에 없는 조회(예: PK 단건 조회)에 유리하지만, 파티션 DDL 시 <strong>인덱스가 통째로 UNUSABLE</strong>이 될 수 있습니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- local: 파티션마다 하나씩, 테이블과 같은 기준으로 분할</span>
+<span class="k">CREATE INDEX</span> sales_cust_ix <span class="k">ON</span> sales(cust_id) <span class="k">LOCAL</span>;
+
+<span class="c">-- 파티션 DDL 시 global 인덱스를 살리려면 UPDATE INDEXES를 붙인다 (대신 DDL이 느려짐)</span>
+<span class="k">ALTER TABLE</span> sales <span class="k">DROP PARTITION</span> p2025_01 <span class="k">UPDATE INDEXES</span>;</code></pre>
+
+<h2 id="s4">11.4 파티션 유지보수 — DROP과 EXCHANGE</h2>
+
+<p>파티셔닝의 진짜 매력은 조회보다 <strong>운영</strong>에 있습니다. 1억 건 삭제를 <code>DELETE</code>로 하면 몇 시간 + 대량 undo/redo가 들지만, <code>DROP PARTITION</code>은 딕셔너리 작업 수준으로 끝납니다. 대량 적재의 비밀 병기는 <strong>EXCHANGE PARTITION</strong>입니다.</p>
+
+<div class="anim" data-steps="4" data-title="EXCHANGE PARTITION — 데이터 이동 없는 대량 적재" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 320">
+      <defs>
+        <marker id="arr11a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+      <!-- service table -->
+      <text x="200" y="30" text-anchor="middle" class="sv-label" font-size="14">🏛 운영 테이블 sales (서비스 중)</text>
+      <rect x="60" y="46" width="90" height="60" rx="8" class="sv-box"/>
+      <text x="105" y="72" text-anchor="middle" class="sv-label-sm sv-mono">p2026_05</text>
+      <text x="105" y="92" text-anchor="middle" class="sv-label-sm">5월 데이터</text>
+      <rect x="160" y="46" width="90" height="60" rx="8" class="sv-box"/>
+      <text x="205" y="72" text-anchor="middle" class="sv-label-sm sv-mono">p2026_06</text>
+      <text x="205" y="92" text-anchor="middle" class="sv-label-sm">6월 데이터</text>
+      <g data-active="1-2">
+        <rect x="260" y="46" width="90" height="60" rx="8" fill="none" stroke="var(--warn)" stroke-width="1.8" stroke-dasharray="5 4"/>
+        <text x="305" y="72" text-anchor="middle" class="sv-label-sm sv-mono">p2026_07</text>
+        <text x="305" y="92" text-anchor="middle" class="sv-label-sm">(빈 파티션)</text>
+      </g>
+
+      <!-- staging -->
+      <g data-show="1">
+        <text x="620" y="30" text-anchor="middle" class="sv-label" font-size="14">🚚 임시 테이블 sales_stage</text>
+        <rect x="540" y="46" width="160" height="60" rx="8" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8"/>
+        <text x="620" y="72" text-anchor="middle" class="sv-label-sm">7월 신규 1억 건 적재 완료</text>
+        <text x="620" y="92" text-anchor="middle" class="sv-label-sm">+ 인덱스·통계까지 준비</text>
+        <text x="620" y="130" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">서비스와 무관한 곳에서 느긋하게 작업</text>
+      </g>
+
+      <!-- exchange command -->
+      <g data-show="2">
+        <rect x="150" y="170" width="520" height="40" rx="9" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="410" y="195" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">ALTER TABLE sales EXCHANGE PARTITION p2026_07 WITH TABLE sales_stage;</text>
+      </g>
+
+      <!-- swap arrows -->
+      <g data-show="3">
+        <path d="M 355 66 Q 445 40 536 66" stroke="var(--purple)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#arr11a)"/>
+        <path d="M 536 96 Q 445 122 355 96" stroke="var(--purple)" stroke-width="2.4" fill="none" class="flow-line" marker-end="url(#arr11a)"/>
+        <text x="445" y="135" text-anchor="middle" class="sv-label" fill="var(--purple)" font-size="13">딕셔너리의 세그먼트 포인터만 맞교환!</text>
+      </g>
+
+      <!-- result -->
+      <g data-show="4">
+        <rect x="260" y="46" width="90" height="60" rx="8" fill="color-mix(in srgb, var(--ok) 16%, transparent)" stroke="var(--ok)" stroke-width="2"/>
+        <text x="305" y="72" text-anchor="middle" class="sv-label-sm sv-mono">p2026_07</text>
+        <text x="305" y="92" text-anchor="middle" class="sv-label-sm">7월 1억 건 ✔</text>
+        <rect x="120" y="235" width="580" height="56" rx="10" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="410" y="258" text-anchor="middle" class="sv-label" font-size="13">데이터 블록은 1바이트도 이동하지 않음 → 1억 건 적재가 사실상 즉시 완료</text>
+        <text x="410" y="279" text-anchor="middle" class="sv-label-sm">임시 테이블은 빈 파티션과 교환되어 빈 껍데기가 됨 — DW 야간 적재의 표준 패턴</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>운영 테이블에는 7월용 <b>빈 파티션</b>을 준비해 두고, 신규 데이터 1억 건은 서비스와 무관한 <b>임시 테이블</b>에 느긋하게 적재합니다. 인덱스 생성·통계 수집·검증까지 여기서 끝냅니다.</p>
+    <p>준비가 끝나면 단 한 줄 — <code>EXCHANGE PARTITION</code>을 실행합니다.</p>
+    <p>Oracle이 하는 일은 데이터 복사가 아니라 <b style="color:var(--purple)">데이터 딕셔너리에서 두 세그먼트의 소속을 맞바꾸는 것</b>뿐입니다. "임시 테이블의 세그먼트"가 "파티션의 세그먼트"로 명찰만 바뀝니다.</p>
+    <p>1억 건이 순간에 운영 테이블 소속이 됩니다. 블록 이동이 없으니 undo/redo 부담도 거의 없습니다. 반대 방향(오래된 파티션을 테이블로 빼내 아카이브)에도 같은 기법을 씁니다.</p>
+  </div>
+</div>
+
+<h2 id="s5">11.5 Parallel Query — PX 서버와 granule</h2>
+
+<p>파티셔닝이 "읽을 양"을 줄인다면, <strong>병렬 처리(Parallel Execution)</strong>는 "읽는 속도"를 늘립니다. 세션의 서버 프로세스가 <strong>QC(Query Coordinator)</strong>가 되고, <strong>PX 서버</strong>라는 일꾼 프로세스들이 작업을 나눠 맡습니다. 동시에 일하는 일꾼 수가 <strong>DOP(Degree of Parallelism)</strong>입니다.</p>
+
+<p>작업 분배 단위는 <strong>granule</strong>입니다. 풀스캔이라면 테이블을 <strong>블록 범위 granule</strong>로 잘게 나누고, PX 서버들이 하나씩 가져가 처리한 뒤 끝나면 다음 것을 가져갑니다 — 먼저 끝난 일꾼이 놀지 않는 동적 분배입니다(파티션 단위 granule이 쓰이는 연산도 있습니다).</p>
+
+<div class="anim" data-steps="4" data-title="Parallel Full Scan — PX 서버들의 granule 분배" data-interval="2700">
+  <div class="anim-stage">
+    <svg viewBox="0 0 820 330">
+      <defs>
+        <marker id="arr11b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--ok)"/>
+        </marker>
+      </defs>
+      <!-- QC -->
+      <rect x="330" y="20" width="160" height="44" rx="9" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="410" y="40" text-anchor="middle" class="sv-label" font-size="13">QC (조정자)</text>
+      <text x="410" y="57" text-anchor="middle" class="sv-label-sm sv-mono">DOP = 4 결정</text>
+
+      <!-- PX servers -->
+      <g data-show="2">
+        <rect x="80" y="110" width="120" height="38" rx="8" class="sv-box"/>
+        <text x="140" y="134" text-anchor="middle" class="sv-label-sm sv-mono">PX 서버 P001</text>
+        <rect x="260" y="110" width="120" height="38" rx="8" class="sv-box"/>
+        <text x="320" y="134" text-anchor="middle" class="sv-label-sm sv-mono">PX 서버 P002</text>
+        <rect x="440" y="110" width="120" height="38" rx="8" class="sv-box"/>
+        <text x="500" y="134" text-anchor="middle" class="sv-label-sm sv-mono">PX 서버 P003</text>
+        <rect x="620" y="110" width="120" height="38" rx="8" class="sv-box"/>
+        <text x="680" y="134" text-anchor="middle" class="sv-label-sm sv-mono">PX 서버 P004</text>
+        <path d="M 370 68 L 150 106" class="sv-line"/>
+        <path d="M 395 68 L 325 106" class="sv-line"/>
+        <path d="M 425 68 L 495 106" class="sv-line"/>
+        <path d="M 450 68 L 670 106" class="sv-line"/>
+      </g>
+
+      <!-- table granules -->
+      <text x="70" y="205" class="sv-label-sm">테이블</text>
+      <g data-active="1-1">
+        <rect x="120" y="185" width="680" height="34" rx="8" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+        <text x="460" y="207" text-anchor="middle" class="sv-label-sm">10억 행 · 연속된 블록들</text>
+      </g>
+      <g data-show="2">
+        <line x1="205" y1="185" x2="205" y2="219" class="sv-line"/>
+        <line x1="290" y1="185" x2="290" y2="219" class="sv-line"/>
+        <line x1="375" y1="185" x2="375" y2="219" class="sv-line"/>
+        <line x1="460" y1="185" x2="460" y2="219" class="sv-line"/>
+        <line x1="545" y1="185" x2="545" y2="219" class="sv-line"/>
+        <line x1="630" y1="185" x2="630" y2="219" class="sv-line"/>
+        <line x1="715" y1="185" x2="715" y2="219" class="sv-line"/>
+        <text x="460" y="240" text-anchor="middle" class="sv-label-sm">블록 범위 granule 8개로 분할</text>
+      </g>
+      <g data-show="3">
+        <rect x="120" y="185" width="85" height="34" fill="color-mix(in srgb, var(--ok) 22%, transparent)"/>
+        <rect x="290" y="185" width="85" height="34" fill="color-mix(in srgb, var(--purple) 22%, transparent)"/>
+        <rect x="460" y="185" width="85" height="34" fill="color-mix(in srgb, var(--warn) 22%, transparent)"/>
+        <rect x="630" y="185" width="85" height="34" fill="color-mix(in srgb, var(--accent) 22%, transparent)"/>
+        <path d="M 140 152 L 155 181" stroke="var(--ok)" stroke-width="2" class="flow-line" marker-end="url(#arr11b)"/>
+        <path d="M 320 152 L 330 181" stroke="var(--purple)" stroke-width="2" class="flow-line"/>
+        <path d="M 500 152 L 502 181" stroke="var(--warn)" stroke-width="2" class="flow-line"/>
+        <path d="M 680 152 L 672 181" stroke="var(--accent)" stroke-width="2" class="flow-line"/>
+        <text x="460" y="265" text-anchor="middle" class="sv-label-sm">4명이 동시에 스캔 — 끝낸 일꾼은 남은 granule을 가져감 (동적 분배)</text>
+      </g>
+      <g data-show="4">
+        <rect x="180" y="282" width="560" height="40" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="460" y="307" text-anchor="middle" class="sv-label" font-size="13">부분 결과를 QC로 취합 → 이론상 최대 1/DOP 시간, 대신 CPU·I/O를 4배 소비</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>병렬 힌트나 테이블 설정을 만난 QC가 <b>DOP=4</b>로 결정합니다. QC 자신은 일하지 않고 지휘만 합니다.</p>
+    <p>PX 서버 4개가 배정되고, 테이블은 <b>블록 범위 granule</b>들로 분할됩니다. granule 수는 보통 DOP보다 많게 잘립니다 — 균등 분배를 위해서입니다.</p>
+    <p>각 PX 서버가 granule을 하나씩 잡고 동시에 스캔합니다. 먼저 끝낸 서버는 <b>남은 granule을 가져가므로</b> 일부 구간이 무겁더라도 일꾼이 놀지 않습니다.</p>
+    <p>부분 결과(예: 부분 SUM)가 QC로 모여 최종 결과가 됩니다. 시간은 최대 1/DOP로 줄지만 <b>자원 소비 총량은 그대로(오히려 조정 비용만큼 증가)</b> — 병렬은 "공짜 속도"가 아닙니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="c">-- 문장 단위로 병렬 지시 (가장 안전한 사용법)</span>
+<span class="k">SELECT</span> <span class="c">/*+ PARALLEL(s 8) */</span> <span class="f">SUM</span>(amount)
+<span class="k">FROM</span>   sales s
+<span class="k">WHERE</span>  sale_date >= <span class="k">DATE</span> <span class="s">'2026-01-01'</span>;
+
+<span class="c">-- 실행계획에는 PX COORDINATOR / PX BLOCK ITERATOR 등이 나타난다</span></code></pre>
+
+<h2 id="s6">11.6 병렬의 비용 — 언제 쓰고 언제 참는가</h2>
+
+<p>병렬 처리는 <strong>한 쿼리가 시스템 자원을 독식하도록 허가</strong>하는 것입니다. DOP 8이면 CPU 코어 8개와 8배의 I/O 대역폭을 그 쿼리 하나가 씁니다. 야간 배치·DW 집계처럼 "이 쿼리가 지금 시스템의 주인"일 때는 훌륭하지만, 동시 사용자가 많은 OLTP 낮 시간대에 남용하면 전체 서비스가 함께 느려집니다.</p>
+
+<ul>
+  <li><strong>쓰기 좋은 곳</strong>: 대용량 풀스캔 집계, CTAS(<code>CREATE TABLE AS SELECT</code>), 인덱스 생성/재생성, 야간 배치.</li>
+  <li><strong>피할 곳</strong>: 소량 조회(병렬 준비 비용이 더 큼), 동시성 높은 OLTP 시간대, PX 서버 풀이 고갈될 만큼의 무분별한 테이블 단위 PARALLEL 설정.</li>
+  <li><strong>주의</strong>: PX 서버는 인스턴스 전체가 공유하는 유한한 풀입니다. 고갈되면 뒤에 온 쿼리는 낮은 DOP로 강등되거나 직렬로 실행됩니다.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">테이블 속성으로 PARALLEL을 박아두지 말 것</div>
+    <p><code>ALTER TABLE ... PARALLEL 8</code>처럼 테이블 속성으로 병렬도를 설정하면 <strong>그 테이블을 읽는 모든 쿼리</strong>가 병렬 후보가 됩니다. 낮 시간 OLTP 쿼리까지 PX 서버를 삼키는 사고의 단골 원인입니다. 병렬이 필요한 <strong>문장에만 힌트로</strong> 지정하는 것이 안전합니다.</p>
+  </div>
+</div>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">월별 Range 파티션 테이블에 <code>WHERE TO_CHAR(sale_date,'YYYYMM') = '202603'</code> 조건으로 조회했더니 매우 느립니다. 원인은?</div>
+  <div class="quiz-opts">
+    <button type="button">TO_CHAR는 병렬 처리가 불가능한 함수라서</button>
+    <button type="button" data-correct>파티션 키를 함수로 가공해 partition pruning이 불가능해졌고, 전체 파티션을 스캔했기 때문</button>
+    <button type="button">Range 파티션은 문자열 비교를 지원하지 않아서</button>
+    <button type="button">Global 인덱스가 UNUSABLE 상태가 되어서</button>
+  </div>
+  <div class="quiz-expl">✅ 옵티마이저는 <strong>가공되지 않은 파티션 키</strong>와 경계값을 비교해야 pruning할 수 있습니다. <code>sale_date &gt;= DATE '2026-03-01' AND sale_date &lt; DATE '2026-04-01'</code>처럼 컬럼을 그대로 두는 범위 조건으로 바꾸면 해당 월 파티션만 읽습니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">EXCHANGE PARTITION으로 1억 건을 운영 테이블에 넣는 작업이 순식간에 끝나는 이유는?</div>
+  <div class="quiz-opts">
+    <button type="button">병렬 PX 서버들이 데이터를 초고속으로 복사하기 때문</button>
+    <button type="button">redo 로깅을 건너뛰는 direct-path 쓰기를 사용하기 때문</button>
+    <button type="button" data-correct>데이터 이동 없이 딕셔너리에서 두 세그먼트의 소속(포인터)만 맞바꾸기 때문</button>
+  </div>
+  <div class="quiz-expl">✅ EXCHANGE는 임시 테이블의 세그먼트와 파티션의 세그먼트가 서로 "명찰"을 바꾸는 메타데이터 연산입니다. 데이터 블록은 제자리에 그대로 있으므로 데이터 양과 무관하게 빠릅니다. 적재 자체(임시 테이블 채우기)는 미리 서비스 밖에서 해두는 것이 이 패턴의 핵심입니다.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">원문으로 더 깊이</div>
+    <p>Oracle Database 19c 공식 문서: <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/vldbg/partition-concepts.html" target="_blank" rel="noopener">VLDB and Partitioning Guide — Partitioning Concepts</a>, <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/vldbg/parallel-exec-intro.html" target="_blank" rel="noopener">Introduction to Parallel Execution</a></p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch10.html"><span class="dir">← 이전</span><br><span class="title">10장. 옵티마이저와 실행계획</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+  <a class="next" href="ch12.html"><span class="dir">다음 →</span><br><span class="title">12장. AWR과 대기 이벤트</span></a>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

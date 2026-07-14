@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01. 이력(히스토리) 테이블 설계 — DB 설계 & 안티패턴 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="design/history">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a href="../or/index.html">🔴 Oracle</a>
+    <a class="on-design" href="index.html">📐 DB 설계</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">📐 DB 설계 & 안티패턴</div>
+  <a class="chap" href="index.html" data-page="design/"><span class="num">🏠</span> 설계 홈</a>
+  <div class="group-title">데이터 모델링</div>
+  <a class="chap" href="history.html" data-page="design/history"><span class="num">01</span> 이력(히스토리) 테이블 설계</a>
+</aside>
+
+<main class="content">
+
+<h1>01. 이력(히스토리) 테이블 설계 — 스냅샷 vs AS-IS/TO-BE</h1>
+<p class="lead">"변경 이력을 남겨주세요"라는 한 문장 뒤에는 서로 다른 세 가지 요구 — 감사(audit), 사용자 활동 내역, 시점 조회 — 가 숨어 있습니다. 스냅샷 방식과 AS-IS/TO-BE(변경분) 방식의 구조적 차이를 이해하고, <strong>용도별로 올바른 설계를 고르는 기준</strong>과 흔한 안티패턴을 정리합니다.</p>
+<div class="chapter-meta">
+  <span class="tag lv-mid">중급</span>
+  <span class="tag">⏱ 약 30분</span>
+  <span class="tag">🎬 애니메이션 2개</span>
+  <span class="tag">✍️ 퀴즈 3개</span>
+  <span class="tag">예제: PostgreSQL 문법</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 페이지의 구성</div>
+    <p>① 스냅샷 vs AS-IS/TO-BE 구조 비교 ② 실무 패턴 3가지(jsonb 하이브리드 · 유효기간/SCD2 · 도메인 이벤트) ③ "누가 보는 이력인가"에 따른 용도별 선택 기준 ④ 안티패턴 6선 ⑤ 설계 체크리스트. 예제는 PostgreSQL 문법이지만 개념은 모든 RDBMS에 통합니다.</p>
+  </div>
+</div>
+
+<div class="grid g3">
+  <div class="card"><h4>🥇 제1원칙</h4><p><strong>용도가 설계를 결정한다.</strong> 감사·사용자 노출·시점 조회는 요구가 다르다. 하나의 이력 테이블로 전부 해결하려는 순간 어느 용도에도 최적이 아니게 된다.</p></div>
+  <div class="card"><h4>🥈 제2원칙</h4><p>이력은 <strong>append-only</strong>. UPDATE/DELETE가 필요해지는 이력 설계는 어딘가 잘못된 것이다. 수정 가능한 이력은 증거가 아니다.</p></div>
+  <div class="card"><h4>🥉 제3원칙</h4><p><strong>보존 정책은 처음부터.</strong> 이력 테이블은 반드시 원본보다 빨리 커진다. 파티셔닝과 아카이브 계획 없이 시작하면 1~2년 뒤 운영 장애로 돌아온다.</p></div>
+</div>
+
+<h2 id="s1">1. 두 방식 — UPDATE 한 번이 어떻게 기록되는가</h2>
+
+<p>주문의 상태가 <code>PAID → SHIPPED</code>로 바뀌는 UPDATE 한 번을 두 방식이 각각 어떻게 기록하는지부터 보겠습니다. 구조 차이가 곧 강점/약점의 차이입니다.</p>
+
+<div class="anim" data-steps="5" data-title="같은 UPDATE 한 번 — 스냅샷 방식 vs AS-IS/TO-BE 방식" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 900 400">
+      <defs>
+        <marker id="arrH1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- 원본 테이블 -->
+      <text x="450" y="24" text-anchor="middle" class="sv-label" font-size="14">📋 원본 orders 테이블</text>
+      <rect x="255" y="34" width="390" height="34" rx="8" class="sv-box"/>
+      <g data-show="1-1">
+        <text x="450" y="56" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=1042 │ status=PAID │ amount=45000 │ addr=서울…</text>
+      </g>
+      <g data-show="2">
+        <text x="450" y="56" text-anchor="middle" class="sv-label sv-mono" font-size="12">id=1042 │ status=<tspan fill="var(--warn)" font-weight="700">SHIPPED</tspan> │ amount=45000 │ addr=서울…</text>
+      </g>
+
+      <!-- UPDATE 문 -->
+      <g data-show="2">
+        <rect x="285" y="86" width="330" height="30" rx="7" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+        <text x="450" y="106" text-anchor="middle" class="sv-label sv-mono" font-size="12">UPDATE orders SET status='SHIPPED' …</text>
+      </g>
+
+      <!-- A. 스냅샷 -->
+      <g data-show="3">
+        <path d="M 330 120 Q 240 150 210 172" class="sv-arrow flow-line" marker-end="url(#arrH1)"/>
+        <text x="210" y="166" text-anchor="middle" class="sv-label" font-size="14">🅰 스냅샷 — orders_history</text>
+        <rect x="30" y="178" width="360" height="30" rx="7" fill="var(--bg-inset)" stroke="var(--border)"/>
+        <text x="45" y="198" class="sv-label sv-mono" font-size="11">…│1042│PAID│45000│서울…│I│13:40</text>
+        <rect x="30" y="214" width="360" height="30" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.8" class="blink"/>
+        <text x="45" y="234" class="sv-label sv-mono" font-size="11">…│1042│SHIPPED│45000│서울…│U│14:02</text>
+        <text x="210" y="266" text-anchor="middle" class="sv-label-sm">행 전체를 통째로 복사 — 안 바뀐 amount·addr도 다시 저장</text>
+      </g>
+
+      <!-- B. AS-IS/TO-BE -->
+      <g data-show="4">
+        <path d="M 570 120 Q 660 150 690 172" class="sv-arrow flow-line" marker-end="url(#arrH1)"/>
+        <text x="690" y="166" text-anchor="middle" class="sv-label" font-size="14">🅱 AS-IS/TO-BE — change_log</text>
+        <rect x="510" y="178" width="360" height="30" rx="7" fill="color-mix(in srgb, var(--ok) 14%, transparent)" stroke="var(--ok)" stroke-width="1.8" class="blink"/>
+        <text x="525" y="198" class="sv-label sv-mono" font-size="11">1042│status│PAID → SHIPPED│14:02</text>
+        <text x="690" y="230" text-anchor="middle" class="sv-label-sm">바뀐 컬럼만 한 줄 — 그 자체가 diff</text>
+      </g>
+
+      <!-- 5. 각자의 강점 -->
+      <g data-show="5" class="rise">
+        <rect x="30" y="292" width="360" height="72" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="210" y="318" text-anchor="middle" class="sv-label" font-size="13">"14:00 시점 주문 상태 전체는?"</text>
+        <text x="210" y="342" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">→ 스냅샷 승리: 그 시점 행 하나만 읽으면 끝</text>
+        <rect x="510" y="292" width="360" height="72" rx="9" fill="color-mix(in srgb, var(--ok) 10%, transparent)" stroke="var(--ok)"/>
+        <text x="690" y="318" text-anchor="middle" class="sv-label" font-size="13">"오늘 누가 뭘 바꿨지?"</text>
+        <text x="690" y="342" text-anchor="middle" class="sv-label-sm" fill="var(--ok)">→ AS-IS/TO-BE 승리: 기록 자체가 변경 목록</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>주문 1042번이 결제 완료(<code>PAID</code>) 상태로 존재합니다. 이제 이 행에 UPDATE가 한 번 발생합니다.</p>
+    <p><code>UPDATE orders SET status='SHIPPED'</code> — 바뀐 것은 <b>status 컬럼 하나</b>뿐입니다. 이 변경을 두 방식이 각각 어떻게 남기는지 봅시다.</p>
+    <p><b>🅰 스냅샷 방식</b>은 변경 후(또는 전) <b>행 전체를 통째로 복사</b>해 이력 테이블에 추가합니다. 바뀌지 않은 amount, addr까지 전부 다시 저장됩니다.</p>
+    <p><b>🅱 AS-IS/TO-BE 방식</b>은 <b>바뀐 컬럼의 이전 값(AS-IS)과 이후 값(TO-BE)만</b> 기록합니다. 저장량은 훨씬 적지만, old/new를 비교해 diff를 뽑는 로직이 필요합니다.</p>
+    <p>강점이 정확히 반대입니다. <b>"그 시점의 전체 상태"</b>는 스냅샷이 행 하나로 답하고, <b>"무엇이 바뀌었나"</b>는 AS-IS/TO-BE가 기록 그 자체로 답합니다. 스냅샷에서 diff를 얻으려면 이전 행과 비교 연산이, delta에서 시점 복원을 하려면 변경분을 순서대로 재적용하는 작업이 필요합니다.</p>
+  </div>
+</div>
+
+<h3>1-1. 🅰 스냅샷 방식 (Full Row Snapshot)</h3>
+
+<pre><code><span class="c">-- 원본과 거의 동일한 구조 + 이력 메타데이터</span>
+<span class="k">CREATE TABLE</span> orders_history (
+    history_id   <span class="k">bigserial</span> <span class="k">PRIMARY KEY</span>,
+    order_id     <span class="k">bigint</span> <span class="k">NOT NULL</span>,     <span class="c">-- 원본 PK (FK는 걸지 않는다 — 안티패턴 ② 참고)</span>
+    status       <span class="k">text</span>,
+    amount       <span class="k">numeric</span>,
+    addr         <span class="k">text</span>,
+    <span class="c">-- … 원본 컬럼 전부 …</span>
+    operation    <span class="k">char</span>(<span class="n">1</span>) <span class="k">NOT NULL</span>,    <span class="c">-- I / U / D</span>
+    changed_by   <span class="k">bigint</span>,
+    changed_at   <span class="k">timestamptz</span> <span class="k">NOT NULL DEFAULT</span> <span class="f">now</span>()
+);
+
+<span class="c">-- "그 시점의 상태" 복원: 해당 시각 직전의 마지막 스냅샷 한 건</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders_history
+<span class="k">WHERE</span>  order_id = <span class="n">1042</span> <span class="k">AND</span> changed_at &lt;= <span class="s">'2026-07-14 14:00'</span>
+<span class="k">ORDER BY</span> changed_at <span class="k">DESC LIMIT</span> <span class="n">1</span>;</code></pre>
+
+<h3>1-2. 🅱 AS-IS/TO-BE 방식 (변경분 기록, Delta)</h3>
+
+<pre><code><span class="c">-- 컬럼 단위로 쪼개 기록하는 형태가 가장 흔하다</span>
+<span class="k">CREATE TABLE</span> orders_change_log (
+    log_id       <span class="k">bigserial</span> <span class="k">PRIMARY KEY</span>,
+    order_id     <span class="k">bigint</span> <span class="k">NOT NULL</span>,
+    column_name  <span class="k">text</span> <span class="k">NOT NULL</span>,       <span class="c">-- 바뀐 컬럼</span>
+    before_value <span class="k">text</span>,                 <span class="c">-- AS-IS (타입이 text로 뭉개지는 점에 주의)</span>
+    after_value  <span class="k">text</span>,                 <span class="c">-- TO-BE</span>
+    changed_by   <span class="k">bigint</span>,
+    changed_at   <span class="k">timestamptz</span> <span class="k">NOT NULL DEFAULT</span> <span class="f">now</span>()
+);
+
+<span class="c">-- "오늘 누가 뭘 바꿨나": 기록 자체가 답</span>
+<span class="k">SELECT</span> changed_at, changed_by, column_name, before_value, after_value
+<span class="k">FROM</span>   orders_change_log
+<span class="k">WHERE</span>  order_id = <span class="n">1042</span>
+<span class="k">ORDER BY</span> changed_at;</code></pre>
+
+<h3>1-3. 트레이드오프 한눈에</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>관점</th><th>🅰 스냅샷</th><th>🅱 AS-IS/TO-BE</th></tr></thead>
+  <tbody>
+    <tr><td>특정 시점 상태 복원</td><td><strong>매우 쉬움</strong> — 그 시점 행 하나 조회</td><td>어려움 — 변경분을 순서대로 재적용</td></tr>
+    <tr><td>"뭐가 바뀌었나" 조회</td><td>어려움 — 이전 행과 컬럼별 비교 필요</td><td><strong>매우 쉬움</strong> — 기록 자체가 diff</td></tr>
+    <tr><td>저장 공간</td><td>낭비 큼 — 한 컬럼 바뀌어도 전체 복사</td><td>효율적 — 바뀐 것만 저장</td></tr>
+    <tr><td>스키마 변경 대응</td><td>원본 컬럼 추가 시 이력 테이블도 동시 변경</td><td>유연 — 컬럼명이 데이터라서 영향 없음</td></tr>
+    <tr><td>타입 안정성</td><td>원본과 동일한 타입 유지</td><td>before/after가 text/jsonb — 타입 정보 유실</td></tr>
+    <tr><td>기록 로직</td><td>단순 — 행 복사 INSERT</td><td>복잡 — old/new 비교해 diff 추출</td></tr>
+    <tr><td>감사(audit) 신뢰성</td><td><strong>높음</strong> — 그 시점의 완전한 증거</td><td>diff 추출 로직에 버그 있으면 기록 누락 위험</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">한 줄 요약</div>
+    <p><strong>스냅샷은 "그때 상태가 뭐였나"에 강하고, AS-IS/TO-BE는 "누가 뭘 바꿨나"에 강합니다.</strong> 어느 질문을 더 자주 받게 될지가 선택의 출발점입니다.</p>
+  </div>
+</div>
+
+<h2 id="s2">2. 실무 패턴 3가지</h2>
+
+<h3>2-1. 하이브리드 — jsonb 스냅샷 + 변경 컬럼 목록 (감사 로그의 사실상 표준)</h3>
+
+<p>PostgreSQL에서 감사 로그 용도로 가장 널리 쓰이는 패턴입니다. 행 전체를 <code>jsonb</code>로 스냅샷 뜨면서(old/new 둘 다), 바뀐 컬럼 목록도 함께 저장합니다. <strong>두 방식의 장점을 모두</strong> 가져가고, 트리거 하나로 모든 테이블에 범용 적용됩니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> audit_log (
+    id           <span class="k">bigserial</span> <span class="k">PRIMARY KEY</span>,
+    table_name   <span class="k">text</span> <span class="k">NOT NULL</span>,
+    record_id    <span class="k">bigint</span> <span class="k">NOT NULL</span>,
+    operation    <span class="k">text</span> <span class="k">NOT NULL</span>,          <span class="c">-- INSERT / UPDATE / DELETE</span>
+    old_data     <span class="k">jsonb</span>,                  <span class="c">-- AS-IS 행 전체</span>
+    new_data     <span class="k">jsonb</span>,                  <span class="c">-- TO-BE 행 전체</span>
+    changed_cols <span class="k">text</span>[],                 <span class="c">-- 바뀐 컬럼만 표시</span>
+    changed_by   <span class="k">bigint</span>,
+    changed_at   <span class="k">timestamptz</span> <span class="k">NOT NULL DEFAULT</span> <span class="f">now</span>()
+) <span class="k">PARTITION BY RANGE</span> (changed_at);     <span class="c">-- 보존 정책은 처음부터! (제3원칙)</span>
+
+<span class="c">-- 범용 감사 트리거 — 어떤 테이블에든 그대로 부착 가능</span>
+<span class="k">CREATE OR REPLACE FUNCTION</span> <span class="f">fn_audit</span>() <span class="k">RETURNS</span> trigger <span class="k">AS</span> $$
+<span class="k">BEGIN</span>
+  <span class="k">INSERT INTO</span> audit_log
+        (table_name, record_id, operation, old_data, new_data, changed_cols, changed_by)
+  <span class="k">SELECT</span> TG_TABLE_NAME,
+         <span class="k">COALESCE</span>(NEW.id, OLD.id),
+         TG_OP,
+         <span class="f">to_jsonb</span>(OLD),
+         <span class="f">to_jsonb</span>(NEW),
+         <span class="k">CASE WHEN</span> TG_OP = <span class="s">'UPDATE'</span> <span class="k">THEN</span>
+           (<span class="k">SELECT</span> <span class="f">array_agg</span>(key) <span class="k">FROM</span> <span class="f">jsonb_each</span>(<span class="f">to_jsonb</span>(NEW)) n
+             <span class="k">WHERE</span> n.value <span class="k">IS DISTINCT FROM</span> <span class="f">to_jsonb</span>(OLD) -&gt; n.key)
+         <span class="k">END</span>,
+         <span class="f">nullif</span>(<span class="f">current_setting</span>(<span class="s">'app.user_id'</span>, <span class="k">true</span>), <span class="s">''</span>)::<span class="k">bigint</span>;
+  <span class="k">RETURN NULL</span>;   <span class="c">-- AFTER 트리거</span>
+<span class="k">END</span> $$ <span class="k">LANGUAGE</span> plpgsql;
+
+<span class="k">CREATE TRIGGER</span> trg_orders_audit
+<span class="k">AFTER INSERT OR UPDATE OR DELETE ON</span> orders
+<span class="k">FOR EACH ROW EXECUTE FUNCTION</span> <span class="f">fn_audit</span>();</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">"누가"를 트리거에 전달하는 법 — set_config 패턴</div>
+    <p>트리거는 DB 세션만 알 뿐 앱의 로그인 사용자를 모릅니다. 트랜잭션 시작 직후 앱에서 <code>SELECT set_config('app.user_id', '42', true)</code>를 실행하면(세 번째 인자 <code>true</code> = 트랜잭션 한정) 트리거가 <code>current_setting('app.user_id', true)</code>로 읽을 수 있습니다. 위 예제가 이 패턴입니다.</p>
+  </div>
+</div>
+
+<h3>2-2. 유효기간 방식 — SCD Type 2, "시점 조회"의 왕</h3>
+
+<p>요금·환율·계약 조건처럼 <strong>"3월 15일 기준 가격"을 정확히 재현</strong>해야 하는 데이터는 별도 이력 테이블보다 본 테이블에 유효기간을 두는 편이 낫습니다. 변경 시 기존 행의 기간을 닫고 새 행을 추가합니다 — 데이터 웨어하우스에서 말하는 SCD(Slowly Changing Dimension) Type 2와 같은 구조입니다.</p>
+
+<div class="anim" data-steps="5" data-title="유효기간(SCD Type 2) — 가격 인상 한 번의 처리" data-interval="3000">
+  <div class="anim-stage">
+    <svg viewBox="0 0 900 380">
+      <defs>
+        <marker id="arrH2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 z" fill="var(--purple)"/>
+        </marker>
+      </defs>
+
+      <text x="450" y="26" text-anchor="middle" class="sv-label" font-size="14">📋 product_price — UPDATE 없이 "기간을 닫고, 새 행을 연다"</text>
+
+      <!-- 기존 행 -->
+      <rect x="180" y="44" width="540" height="34" rx="8" class="sv-box"/>
+      <g data-show="1-2">
+        <text x="450" y="66" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">상품 77 │ price=15,000 │ valid: [3/1 ~ <tspan fill="var(--ok)" font-weight="700">∞</tspan>)</text>
+      </g>
+      <g data-show="3">
+        <text x="450" y="66" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">상품 77 │ price=15,000 │ valid: [3/1 ~ <tspan fill="var(--danger)" font-weight="700">4/1</tspan>)  ← 닫힘</text>
+      </g>
+
+      <!-- 인상 요청 -->
+      <g data-show="2">
+        <rect x="300" y="96" width="300" height="30" rx="7" fill="color-mix(in srgb, var(--warn) 12%, transparent)" stroke="var(--warn)" stroke-width="1.4"/>
+        <text x="450" y="116" text-anchor="middle" class="sv-label sv-mono" font-size="12">📈 4/1부터 18,000원으로 인상!</text>
+      </g>
+
+      <!-- 새 행 -->
+      <g data-show="3">
+        <path d="M 450 130 L 450 152" class="sv-arrow flow-line" marker-end="url(#arrH2)"/>
+        <rect x="180" y="158" width="540" height="34" rx="8" fill="color-mix(in srgb, var(--purple) 12%, transparent)" stroke="var(--purple)" stroke-width="1.8" class="blink"/>
+        <text x="450" y="180" text-anchor="middle" class="sv-label sv-mono" font-size="12.5">상품 77 │ price=18,000 │ valid: [4/1 ~ ∞)  ← 새 행 INSERT</text>
+      </g>
+
+      <!-- 시점 조회 -->
+      <g data-show="4">
+        <rect x="70" y="222" width="360" height="56" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+        <text x="250" y="245" text-anchor="middle" class="sv-label sv-mono" font-size="12">WHERE valid_during @&gt; '3/15'</text>
+        <text x="250" y="266" text-anchor="middle" class="sv-label-sm" fill="var(--accent)">"3월 15일 가격은?" → 15,000원 행에 정확히 명중 🎯</text>
+        <path d="M 330 220 Q 400 120 420 82" class="sv-arrow flow-line" marker-end="url(#arrH2)"/>
+      </g>
+
+      <!-- EXCLUDE 제약 -->
+      <g data-show="5" class="rise">
+        <rect x="470" y="222" width="360" height="56" rx="9" fill="color-mix(in srgb, var(--danger) 8%, transparent)" stroke="var(--danger)"/>
+        <text x="650" y="245" text-anchor="middle" class="sv-label sv-mono" font-size="12">기간 겹치는 행 INSERT 시도 → ❌ 거부</text>
+        <text x="650" y="266" text-anchor="middle" class="sv-label-sm" fill="var(--danger)">EXCLUDE 제약이 "겹치는 가격 2개"를 DB 레벨에서 차단</text>
+      </g>
+
+      <g data-show="5">
+        <text x="450" y="330" text-anchor="middle" class="sv-label-sm">현재가 조회는 valid_during @&gt; now() — 항상 정확히 한 행만 유효하다는 것을 DB가 보증</text>
+      </g>
+    </svg>
+  </div>
+  <div class="anim-caption-src" hidden>
+    <p>상품 77의 가격 행입니다. 유효기간의 끝이 열려 있으면(<code>∞</code>) "현재 유효한 가격"이라는 뜻입니다.</p>
+    <p>4월 1일부터 18,000원으로 인상이 결정됐습니다. 여기서 <b>UPDATE로 값을 덮어쓰면 과거가 사라집니다</b> — SCD Type 2는 다르게 움직입니다.</p>
+    <p>기존 행의 유효기간을 <code>[3/1 ~ 4/1)</code>로 <b>닫고</b>, 새 가격의 행을 <code>[4/1 ~ ∞)</code>로 <b>추가</b>합니다. 값을 지우는 일은 없습니다.</p>
+    <p>이제 "3월 15일 기준 가격"은 범위 포함 연산자 하나(<code>@&gt;</code>)로 끝납니다. 변경분 재적용도, 스냅샷 탐색도 필요 없이 <b>시점 조회가 일반 조회만큼 쉬워집니다</b>.</p>
+    <p>PostgreSQL이라면 <code>EXCLUDE USING gist</code> 제약으로 <b>같은 상품의 기간 겹침을 DB 레벨에서 차단</b>할 수 있습니다. "같은 날짜에 유효한 가격이 2개"라는 데이터 오염이 원천적으로 불가능해집니다.</p>
+  </div>
+</div>
+
+<pre><code><span class="k">CREATE EXTENSION IF NOT EXISTS</span> btree_gist;  <span class="c">-- 등호(=)를 GiST에서 쓰기 위해</span>
+
+<span class="k">CREATE TABLE</span> product_price (
+    product_id   <span class="k">bigint</span> <span class="k">NOT NULL</span>,
+    price        <span class="k">numeric</span> <span class="k">NOT NULL</span>,
+    valid_during <span class="k">tstzrange</span> <span class="k">NOT NULL</span>,
+    <span class="c">-- 같은 상품의 유효기간 겹침을 DB가 차단</span>
+    <span class="k">EXCLUDE USING</span> gist (product_id <span class="k">WITH</span> =, valid_during <span class="k">WITH</span> &amp;&amp;)
+);
+
+<span class="c">-- 시점 조회: "3월 15일에 유효했던 가격"</span>
+<span class="k">SELECT</span> price <span class="k">FROM</span> product_price
+<span class="k">WHERE</span>  product_id = <span class="n">77</span> <span class="k">AND</span> valid_during @&gt; <span class="s">'2026-03-15'</span>::<span class="k">timestamptz</span>;
+
+<span class="c">-- 현재가 조회</span>
+<span class="k">SELECT</span> price <span class="k">FROM</span> product_price
+<span class="k">WHERE</span>  product_id = <span class="n">77</span> <span class="k">AND</span> valid_during @&gt; <span class="f">now</span>();</code></pre>
+
+<div class="callout warn">
+  <span class="ico">⚠️</span>
+  <div>
+    <div class="callout-title">유효기간 방식의 비용</div>
+    <p>현재 데이터 조회에 <strong>항상 기간 조건이 붙고</strong>, 이 테이블을 참조하는 FK 설계가 복잡해집니다(과거 행도 같은 테이블에 있으므로). "시점 조회가 핵심 요구인 데이터"에만 쓰고, 일반 엔터티 전체에 남발하지 마세요.</p>
+  </div>
+</div>
+
+<h3>2-3. 도메인 이벤트 방식 — 사용자에게 보여줄 이력</h3>
+
+<p>상태를 저장하는 대신 <strong>"발생한 사건"</strong>(주문 생성됨, 배송지 변경됨, 환불 요청됨)을 append-only로 쌓는 방식입니다. 감사 로그를 그대로 화면에 뿌리면 내부 컬럼명이 노출되고 문구 가공도 어렵기 때문에, 사용자 노출용 이력은 이렇게 따로 쌓는 경우가 많습니다.</p>
+
+<pre><code><span class="k">CREATE TABLE</span> order_events (
+    event_id   <span class="k">bigserial</span> <span class="k">PRIMARY KEY</span>,
+    order_id   <span class="k">bigint</span> <span class="k">NOT NULL</span>,
+    event_type <span class="k">text</span> <span class="k">NOT NULL</span>,     <span class="c">-- ORDER_PLACED / ADDRESS_CHANGED / REFUND_REQUESTED …</span>
+    actor_id   <span class="k">bigint</span>,
+    payload    <span class="k">jsonb</span>,             <span class="c">-- 화면 문구에 필요한 값만: {"from":"서울…","to":"부산…"}</span>
+    created_at <span class="k">timestamptz</span> <span class="k">NOT NULL DEFAULT</span> <span class="f">now</span>()
+);
+
+<span class="c">-- "홍길동님이 배송지를 서울…에서 부산…으로 변경했습니다" — payload를 템플릿에 바인딩</span>
+<span class="k">SELECT</span> event_type, actor_id, payload, created_at
+<span class="k">FROM</span>   order_events <span class="k">WHERE</span> order_id = <span class="n">1042</span> <span class="k">ORDER BY</span> created_at;</code></pre>
+
+<div class="callout info">
+  <span class="ico">📌</span>
+  <div>
+    <div class="callout-title">모든 컬럼을 기록할 필요가 없다</div>
+    <p>도메인 이벤트는 감사 로그와 달리 <strong>사용자에게 의미 있는 변경만 골라서</strong> 애플리케이션 레벨에서 기록합니다. 완전성은 트리거 기반 감사 로그가 담당하고, 이 테이블은 읽기 편한 이야기를 담당합니다 — 역할 분담입니다.</p>
+  </div>
+</div>
+
+<h2 id="s3">3. 누가 보는 이력인가 — 용도별 선택 기준</h2>
+
+<p>"이력 테이블 어떻게 짜요?"에 대한 정답이 하나가 아닌 이유는, <strong>보는 사람과 목적에 따라 요구 자체가 다르기 때문</strong>입니다.</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h4>🕵️ 관리자용 / 감사(Audit)</h4>
+    <p><strong>요구</strong>: 누락 없이 전부, 조작 불가능하게, 증거 수준으로. 조회는 드묾(사고 났을 때만).</p>
+    <p><strong>추천</strong>: 트리거 + jsonb 하이브리드(2-1). 앱 코드가 아닌 <strong>DB 트리거에서 기록</strong>해야 직접 SQL 수정 같은 우회 경로까지 잡힙니다. 이력 테이블의 UPDATE/DELETE 권한은 회수.</p>
+  </div>
+  <div class="card">
+    <h4>🙋 사용자 노출용 활동 내역</h4>
+    <p><strong>요구</strong>: "배송지를 A에서 B로 변경" — 사람이 읽는 문장. 조회가 잦고 빨라야 함.</p>
+    <p><strong>추천</strong>: 도메인 이벤트(2-3) 또는 앱 레벨 AS-IS/TO-BE. 의미 있는 변경만 선별 기록. <strong>감사 로그와 분리</strong>하는 것이 핵심.</p>
+  </div>
+  <div class="card">
+    <h4>📅 시점 조회 핵심 데이터</h4>
+    <p><strong>요구</strong>: "3월 15일 기준 이 상품 가격"을 정확히 재현. 요금·환율·계약·조직도.</p>
+    <p><strong>추천</strong>: 유효기간/SCD Type 2(2-2). PostgreSQL이면 range 타입 + EXCLUDE 제약으로 겹침까지 차단.</p>
+  </div>
+  <div class="card">
+    <h4>📊 통계 / 분석</h4>
+    <p><strong>요구</strong>: 추세 분석, 대량 집계. 운영 DB 부하 없이.</p>
+    <p><strong>추천</strong>: 일 단위 배치 스냅샷 또는 CDC(Debezium 등)로 웨어하우스·ClickHouse에 적재. <strong>운영 DB에 분석용 이력을 무한 적립하지 않는 것</strong>이 핵심.</p>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>상황</th><th>추천 패턴</th><th>이유</th></tr></thead>
+  <tbody>
+    <tr><td>감사/컴플라이언스, "증거"가 필요</td><td>트리거 + jsonb 스냅샷(old/new)</td><td>완전성·우회 불가·스키마 변경에 강함</td></tr>
+    <tr><td>사용자에게 보여줄 변경 내역 UI</td><td>도메인 이벤트 / 앱 레벨 AS-IS·TO-BE</td><td>읽기 좋은 문장, 빠른 조회, 선별 기록</td></tr>
+    <tr><td>특정 시점 값 재현이 핵심</td><td>유효기간(SCD Type 2) + range 타입</td><td>시점 조회가 일반 조회만큼 쉬움</td></tr>
+    <tr><td>요구가 아직 불명확</td><td>jsonb 하이브리드(2-1)</td><td>old/new 전체 + changed_cols를 다 보유 — 어느 요구가 와도 대응</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">실무에서 가장 후회가 적은 구성 — 이원화</div>
+    <p><strong>"감사 로그는 트리거로 무조건 전부(하이브리드), 사용자 노출용 이력은 필요한 것만 앱에서 따로"</strong> — 두 테이블을 분리하는 구성이 가장 흔하고 확장에도 강합니다. 하나의 이력 테이블로 감사·UI·시점조회를 전부 해결하려는 시도가 바로 아래 안티패턴 ①입니다.</p>
+  </div>
+</div>
+
+<h2 id="s4">4. 안티패턴 6선</h2>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">① 만능 이력 테이블 — 하나로 모든 용도 해결하기</div>
+    <p>감사도, 사용자 화면도, 시점 조회도 한 테이블로 처리하면: 감사엔 완전성이 부족하고, 화면엔 내부 컬럼명이 노출되고, 시점 조회는 느립니다. <strong>처방</strong>: 용도별 분리(3장). 최소한 감사용과 사용자 노출용은 나누세요.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">② 이력 테이블에 원본 FK + ON DELETE CASCADE</div>
+    <p>원본 행이 삭제되면 이력까지 연쇄 삭제 — <strong>"삭제됐다"는 사실을 기록해야 할 이력이 삭제와 함께 증발</strong>합니다. 감사 목적이라면 치명적입니다. <strong>처방</strong>: 이력 테이블에는 원본 ID를 일반 컬럼으로만 저장하고 FK를 걸지 않습니다. DELETE 자체를 이력 행(operation='D')으로 남기세요.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">③ 감사 기록을 애플리케이션 코드에서만 남기기</div>
+    <p>운영 중 psql로 직접 실행한 UPDATE, 배치 스크립트, 다른 서비스의 접근은 전부 기록에서 빠집니다. 감사 로그의 존재 이유가 무너집니다. <strong>처방</strong>: 감사 목적이면 트리거(또는 pgaudit·CDC 등 DB 레벨 수단). 앱 레벨 기록은 사용자 노출용 이력에만.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">④ 이력 테이블에 인덱스 잔뜩 걸기</div>
+    <p>이력 테이블은 쓰기 99% 워크로드입니다. 트리거로 기록한다면 인덱스 유지 비용이 <strong>원본 테이블의 모든 트랜잭션을 느리게</strong> 만듭니다. <strong>처방</strong>: <code>(record_id, changed_at)</code> 정도만. 분석용 조회는 복제본이나 웨어하우스에서.</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">⑤ 보존 정책 없이 무한 적립</div>
+    <p>이력 테이블은 원본보다 몇 배 빠르게 자랍니다. 2년 뒤 수억 행에서 "오래된 이력 DELETE"를 시도하면 dead tuple 폭증과 VACUUM 지옥이 기다립니다. <strong>처방</strong>: 처음부터 <code>changed_at</code> 기준 RANGE 파티셔닝 — 만료 이력 정리가 <code>DROP PARTITION</code> 한 방으로 끝납니다. (<a href="../pg/ch12.html">PostgreSQL 12장 파티셔닝</a> 참고)</p>
+  </div>
+</div>
+
+<div class="callout danger">
+  <span class="ico">❌</span>
+  <div>
+    <div class="callout-title">⑥ delta만 쌓고 시점 복원 요구 받기 (그리고 그 반대)</div>
+    <p>AS-IS/TO-BE만 쌓았는데 "장애 직전 상태로 복원해 달라"는 요구가 오면, 수만 건의 변경분을 순서대로 재적용해야 하고 diff 추출 로직에 버그가 하나라도 있었다면 복원 결과를 신뢰할 수 없습니다. 반대로 스냅샷만 쌓으면 "누가 뭘 바꿨나" 리포트마다 전 행 비교 연산이 필요합니다. <strong>처방</strong>: 어느 질문을 받게 될지 불확실하면 jsonb 하이브리드(2-1)로 둘 다 확보.</p>
+  </div>
+</div>
+
+<h2 id="s5">5. 설계 체크리스트</h2>
+
+<ul>
+  <li><strong>용도 정의</strong> — 이 이력은 누가, 어떤 질문에 답하려고 보는가? (감사 / 사용자 화면 / 시점 조회 / 분석)</li>
+  <li><strong>기록 주체</strong> — 감사면 DB 트리거, 사용자 노출용이면 앱 레벨. <code>set_config</code>로 앱 컨텍스트(사용자 ID)를 트리거에 전달.</li>
+  <li><strong>append-only 보장</strong> — 이력 테이블의 UPDATE/DELETE 권한 회수. PK는 별도 surrogate key.</li>
+  <li><strong>원본 FK 금지</strong> — 원본 삭제 후에도 이력은 남아야 한다. 원본 ID는 일반 컬럼으로.</li>
+  <li><strong>인덱스 최소화</strong> — <code>(record_id, changed_at)</code> 수준만. 쓰기 성능이 우선.</li>
+  <li><strong>트랜잭션 일관성</strong> — 이력 기록은 원본 변경과 같은 트랜잭션에서. (트리거는 자동 보장)</li>
+  <li><strong>보존 정책 + 파티셔닝</strong> — <code>changed_at</code> RANGE 파티셔닝, 보존 기간 경과분은 DROP PARTITION.</li>
+  <li><strong>스키마 변경 시나리오</strong> — 원본에 컬럼이 추가되면 이력은 어떻게 되는가? (jsonb 방식은 자동 흡수)</li>
+</ul>
+
+<h2 id="quiz">✍️ 이해도 체크</h2>
+
+<div class="quiz">
+  <div class="quiz-q">컴플라이언스 요구로 "모든 데이터 변경을 빠짐없이" 기록해야 합니다. 기록 주체로 가장 적절한 것은?</div>
+  <div class="quiz-opts">
+    <button type="button">서비스 레이어에서 변경 API가 호출될 때마다 기록</button>
+    <button type="button" data-correct>DB 트리거에서 기록 — 직접 SQL·배치·타 서비스의 변경까지 포착</button>
+    <button type="button">하루 한 번 배치로 전체 테이블을 비교해 기록</button>
+    <button type="button">ORM의 dirty checking 훅에서 기록</button>
+  </div>
+  <div class="quiz-expl">✅ 앱 레벨 기록(서비스 레이어·ORM 훅)은 그 코드 경로를 거치지 않는 변경 — 운영 중 직접 실행한 SQL, 배치 스크립트, 다른 애플리케이션 — 을 전부 놓칩니다. 배치 비교는 하루 안의 중간 변경들이 사라집니다. 완전성이 요구되는 감사는 DB 레벨(트리거, pgaudit, CDC)이 답입니다. 앱 컨텍스트(사용자 ID)는 <code>set_config</code> 패턴으로 전달합니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">"장애 발생 직전인 어제 14:00 시점의 주문 데이터 전체 상태"를 자주 복원해야 하는 시스템입니다. 유리한 이력 방식은?</div>
+  <div class="quiz-opts">
+    <button type="button">AS-IS/TO-BE 컬럼 단위 변경 로그 — 저장 공간이 효율적이므로</button>
+    <button type="button" data-correct>스냅샷 방식 — 해당 시각 직전의 마지막 스냅샷 한 건만 읽으면 되므로</button>
+    <button type="button">둘은 정보량이 같으므로 어느 쪽이든 무방하다</button>
+  </div>
+  <div class="quiz-expl">✅ 시점 복원은 스냅샷의 홈그라운드입니다 — <code>changed_at &lt;= '14:00' ORDER BY changed_at DESC LIMIT 1</code> 한 번이면 끝. AS-IS/TO-BE는 초기 상태에서 변경분을 순서대로 전부 재적용해야 하고, diff 추출 로직에 버그가 있었다면 복원 결과 자체를 신뢰할 수 없습니다. "정보량이 같다"도 함정: delta 방식은 기록 시점의 추출 로직이 완벽했을 때만 정보가 보존됩니다.</div>
+</div>
+
+<div class="quiz">
+  <div class="quiz-q">다음 이력 테이블 DDL에서 <strong>가장 심각한</strong> 문제는? <code>CREATE TABLE orders_history (…, order_id bigint REFERENCES orders(id) ON DELETE CASCADE, …)</code></div>
+  <div class="quiz-opts">
+    <button type="button">bigint 대신 uuid를 써야 한다</button>
+    <button type="button">REFERENCES에 인덱스가 자동 생성되지 않는다</button>
+    <button type="button" data-correct>원본 주문이 삭제되면 그 주문의 이력 전체가 함께 증발한다</button>
+    <button type="button">history 테이블에는 PK를 만들 수 없다</button>
+  </div>
+  <div class="quiz-expl">✅ <code>ON DELETE CASCADE</code>가 붙은 FK 때문에 원본 행 삭제 시 이력도 연쇄 삭제됩니다. "누가 언제 삭제했나"를 증언해야 할 이력이 삭제와 동시에 사라지는 것 — 감사 목적에 치명적인 안티패턴 ②입니다. 이력 테이블에는 원본 ID를 일반 컬럼으로만 저장하고, DELETE 자체를 이력 행(operation='D')으로 남기세요.</div>
+</div>
+
+<div class="callout info">
+  <span class="ico">📚</span>
+  <div>
+    <div class="callout-title">함께 읽기</div>
+    <p>이력 테이블 운영의 짝꿍인 파티셔닝은 <a href="../pg/ch12.html">PostgreSQL 12장</a>, 트리거가 만드는 dead tuple과 VACUUM은 <a href="../pg/ch08.html">8장</a>, 분석용 이력 적재 대상으로서의 컬럼 지향 DB는 <a href="../ch/index.html">ClickHouse 가이드</a>를 참고하세요.</p>
+  </div>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html"><span class="dir">← 이전</span><br><span class="title">설계 홈</span></a>
+  <button class="done-btn" type="button">이 장 완료로 표시</button>
+</nav>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>

@@ -116,6 +116,7 @@ a:hover { text-decoration: underline; }
 .topbar .db-switch a.on-ch { color: #1f2328; background: var(--ch); }
 .topbar .db-switch a.on-es { color: #fff; background: var(--es); }
 .topbar .db-switch a.on-or { color: #fff; background: var(--or); }
+.topbar .db-switch a.on-design { color: #fff; background: var(--purple); }
 .topbar .spacer { flex: 1; }
 .topbar button {
   background: none;

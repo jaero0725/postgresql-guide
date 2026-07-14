@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DB 설계 & 안티패턴 — 설계 홈 | DB Study</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script defer src="../assets/app.js"></script>
+</head>
+<body data-page="design/">
+
+<header class="topbar">
+  <button id="nav-toggle" type="button">☰</button>
+  <a class="brand" href="../index.html"><span class="logo">🗄️</span> DB Study</a>
+  <nav class="db-switch">
+    <a href="../pg/index.html">🐘 PostgreSQL</a>
+    <a href="../ch/index.html">⚡ ClickHouse</a>
+    <a href="../es/index.html">🔍 Elasticsearch</a>
+    <a href="../or/index.html">🔴 Oracle</a>
+    <a class="on-design" href="index.html">📐 DB 설계</a>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme-toggle" type="button" title="테마 전환">🌓</button>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="group-title">📐 DB 설계 & 안티패턴</div>
+  <a class="chap" href="index.html" data-page="design/"><span class="num">🏠</span> 설계 홈</a>
+  <div class="group-title">데이터 모델링</div>
+  <a class="chap" href="history.html" data-page="design/history"><span class="num">01</span> 이력(히스토리) 테이블 설계</a>
+</aside>
+
+<main class="content">
+
+<h1>📐 DB 설계 & 안티패턴</h1>
+<p class="lead">특정 DB의 내부 구조가 아니라, <strong>어떤 DB를 쓰든 마주치는 설계 문제</strong>를 다루는 섹션입니다. "이렇게 짜면 됩니다"보다 <strong>왜 그 선택인지, 반대 선택은 언제 옳은지</strong> — 트레이드오프와 흔한 안티패턴 중심으로 정리합니다. 예제 문법은 PostgreSQL을 기준으로 합니다.</p>
+<div class="chapter-meta">
+  <span class="tag">📚 설계 주제 시리즈</span>
+  <span class="tag">🚫 안티패턴 중심</span>
+  <span class="tag">✅ 완료: <span data-progress-of="design/history">0</span> / 1</span>
+</div>
+
+<div class="callout info">
+  <span class="ico">🧭</span>
+  <div>
+    <div class="callout-title">이 섹션의 관점</div>
+    <p>설계 질문에는 보통 유일한 정답이 없습니다. 대신 <strong>"이 상황에서는 이 선택이 낫다"는 판단 기준</strong>은 존재합니다. 각 주제는 ① 선택지의 구조적 차이 ② 상황별 선택 기준 ③ 실무에서 반복되는 안티패턴 순서로 구성됩니다.</p>
+  </div>
+</div>
+
+<h2 id="topics">주제 한눈에 보기</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h4><a href="history.html">01. 이력(히스토리) 테이블 설계</a></h4>
+    <p>스냅샷 vs AS-IS/TO-BE — 구조 차이와 트레이드오프. jsonb 하이브리드·SCD Type 2·도메인 이벤트 3대 패턴, "누가 보는 이력인가"에 따른 선택 기준, 안티패턴 6선.</p>
+    <div class="chapter-meta"><span class="tag lv-mid">중급</span><span class="tag">🎬 2</span><span class="tag">✍️ 3</span></div>
+  </div>
+  <div class="card">
+    <h4>02. (예정)</h4>
+    <p>Soft Delete vs Hard Delete, EAV의 유혹, 다형 연관(polymorphic association), UUID vs 시퀀셜 PK 등 후속 주제를 준비 중입니다.</p>
+    <div class="chapter-meta"><span class="tag">준비 중</span></div>
+  </div>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div>
+    <div class="callout-title">학습 진도는 자동으로 저장됩니다</div>
+    <p>각 페이지 하단의 "이 장 완료로 표시" 버튼을 누르면 사이드바에 ✓ 표시가 남습니다(브라우저 로컬 저장).</p>
+  </div>
+</div>
+
+</main>
+</div>
+
+<footer class="site-footer">
+  DB Study — PostgreSQL · ClickHouse · Elasticsearch · Oracle 시각화 학습 가이드
+</footer>
+
+</body>
+</html>
